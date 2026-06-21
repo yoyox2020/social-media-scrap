@@ -1,0 +1,19 @@
+# AI/ML dependencies — diinstall di Dockerfile.worker-ai
+# Tidak dimasukkan ke pyproject.toml karena ukuran besar (>3GB)
+
+# PyTorch — CPU-only untuk portabilitas; ganti dengan cu121 untuk GPU
+--index-url https://download.pytorch.org/whl/cpu
+torch==2.3.1
+
+# NLP Models
+--extra-index-url https://pypi.org/simple
+transformers==4.45.2
+sentence-transformers==3.1.1
+accelerate==0.34.0
+tokenizers==0.20.3
+
+# GLiNER for NER
+gliner==0.2.9
+
+# Utility
+numpy>=1.24.0

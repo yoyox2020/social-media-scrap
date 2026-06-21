@@ -1,0 +1,31 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# System dependencies untuk ML (libgomp, dll dari torch)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install poetry==1.8.0
+RUN poetry config virtualenvs.create false
+
+# Install base dependencies dulu (tanpa ML)
+COPY pyproject.toml poetry.lock* ./
+RUN poetry install --no-dev --no-interaction --no-ansi
+
+# Install ML dependencies terpisah (torch CPU + transformers + gliner)
+COPY requirements-ai.txt ./
+RUN pip install -r requirements-ai.txt
+
+COPY . .
+
+# Mount point untuk model cache (HuggingFace + GLiNER)
+VOLUME ["/app/models_cache"]
+
+CMD ["celery", "-A", "app.workers.celery_app", "worker", \
+     "--loglevel=info", \
+     "--queues=ai,celery", \
+     "--concurrency=1"]
