@@ -1,0 +1,5 @@
+# Report generation dependencies
+# Ditambah ke pyproject.toml sebagai regular deps (tidak berat seperti torch)
+reportlab==4.2.5
+python-docx==1.1.2
+Pillow>=10.4.0

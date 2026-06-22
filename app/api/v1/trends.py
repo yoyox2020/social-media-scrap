@@ -1,9 +1,13 @@
 import uuid
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.domain.posts.models import Post
+from app.domain.sentiments.models import Sentiment
 from app.domain.users.models import User
+from app.infrastructure.cache.redis_cache import cache_get, cache_set
 from app.infrastructure.database.connection import get_db
 from app.services.auth.dependencies import get_current_user
 from app.shared.utils import build_success_response
@@ -19,10 +23,12 @@ async def get_keyword_trends(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Volume post per periode waktu untuk satu keyword.
-    Dihitung langsung dari tabel posts (real-time).
-    """
+    """Volume post per periode waktu untuk satu keyword. Cache 5 menit."""
+    cache_key = f"trends:keyword:{keyword_id}:{period}:{platform or 'all'}"
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return build_success_response(cached)
+
     from app.services.agents.schemas import AgentContext
     from app.services.agents.trend_agent import TrendAgent
 
@@ -33,6 +39,7 @@ async def get_keyword_trends(
         platform=platform,
     )
     result = await agent.run(context)
+    await cache_set(cache_key, result.data, ex=300)
     return build_success_response(result.data)
 
 
@@ -43,10 +50,11 @@ async def get_sentiment_trends(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Tren sentimen (positive/negative/neutral count) per periode."""
-    from sqlalchemy import func, select, text
-    from app.domain.posts.models import Post
-    from app.domain.sentiments.models import Sentiment
+    """Tren sentimen (positive/negative/neutral count) per periode. Cache 5 menit."""
+    cache_key = f"trends:sentiment:{keyword_id}:{period}"
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return build_success_response(cached)
 
     stmt = (
         select(
@@ -72,11 +80,13 @@ async def get_sentiment_trends(
             trend[key] = {"period": key, "positive": 0, "negative": 0, "neutral": 0}
         trend[key][row.label] = row.count
 
-    return build_success_response({
+    data = {
         "keyword_id": str(keyword_id),
         "period": period,
         "trend": list(trend.values()),
-    })
+    }
+    await cache_set(cache_key, data, ex=300)
+    return build_success_response(data)
 
 
 @router.get("/platforms/{keyword_id}", response_model=dict)
@@ -86,9 +96,6 @@ async def get_platform_breakdown(
     db: AsyncSession = Depends(get_db),
 ):
     """Jumlah post per platform untuk satu keyword."""
-    from sqlalchemy import func, select
-    from app.domain.posts.models import Post
-
     result = await db.execute(
         select(Post.platform, func.count().label("count"))
         .where(Post.keyword_id == keyword_id)

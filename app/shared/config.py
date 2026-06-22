@@ -53,9 +53,20 @@ class Settings(BaseSettings):
     ollama_model_name: str = "qwen3:8b"
     ollama_timeout: int = 120
 
+    # Reports
+    report_output_dir: str = "/app/reports"
+
+    # Rate Limiting
+    rate_limit_agents_max_requests: int = 10
+    rate_limit_agents_window_seconds: int = 60
+
     # Logging
     log_level: str = "INFO"
     log_format: str = "json"
 
 
 settings = Settings()
+
+
+def get_settings() -> Settings:
+    return settings

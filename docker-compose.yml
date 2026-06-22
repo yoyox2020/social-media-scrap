@@ -94,6 +94,7 @@ services:
       REDIS_URL: redis://redis:6379
       ELASTICSEARCH_URL: http://elasticsearch:9200
       OLLAMA_BASE_URL: http://ollama:11434
+      REPORT_OUTPUT_DIR: /app/reports
     depends_on:
       postgres:
         condition: service_healthy
@@ -101,10 +102,11 @@ services:
         condition: service_healthy
     volumes:
       - ./app:/app/app
+      - reports_data:/app/reports
     networks:
       - social_intel_net
 
-  # Worker — untuk collector + processing tasks (tanpa ML deps)
+  # Worker — untuk collector, processing, report tasks (tanpa ML deps)
   worker:
     build:
       context: .
@@ -118,10 +120,11 @@ services:
       REDIS_URL: redis://redis:6379
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
+      REPORT_OUTPUT_DIR: /app/reports
     command: >
       celery -A app.workers.celery_app worker
       --loglevel=info
-      --queues=collector,processing,celery
+      --queues=collector,processing,reports,celery
       --concurrency=4
     depends_on:
       postgres:
@@ -130,6 +133,37 @@ services:
         condition: service_healthy
     volumes:
       - ./app:/app/app
+      - reports_data:/app/reports
+    networks:
+      - social_intel_net
+
+  # Beat — Celery Beat scheduler untuk periodic tasks (daily/weekly reports)
+  worker-beat:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.worker
+    container_name: social_intel_worker_beat
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-social_intelligence}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-social_intelligence_db}
+      REDIS_URL: redis://redis:6379
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      REPORT_OUTPUT_DIR: /app/reports
+    command: >
+      celery -A app.workers.celery_app beat
+      --loglevel=info
+      --scheduler celery.beat:PersistentScheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+      - reports_data:/app/reports
     networks:
       - social_intel_net
 
@@ -172,6 +206,7 @@ volumes:
   elasticsearch_data:
   ollama_data:
   models_cache:
+  reports_data:
 
 networks:
   social_intel_net:

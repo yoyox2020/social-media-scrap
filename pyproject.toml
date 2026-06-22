@@ -25,6 +25,9 @@ elasticsearch = {extras = ["async"], version = "^8.11.0"}
 structlog = "^24.0.0"
 tenacity = "^8.0.0"
 python-dotenv = "^1.0.0"
+reportlab = "^4.2.0"
+python-docx = "^1.1.0"
+Pillow = ">=10.4.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"

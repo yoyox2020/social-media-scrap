@@ -27,6 +27,12 @@ class KeywordRepository:
         )
         return list(result.scalars().all())
 
+    async def list_all_active(self) -> list[Keyword]:
+        result = await self.db.execute(
+            select(Keyword).where(Keyword.is_active == True)  # noqa: E712
+        )
+        return list(result.scalars().all())
+
     async def create(self, keyword: Keyword) -> Keyword:
         self.db.add(keyword)
         await self.db.flush()

@@ -119,9 +119,19 @@ class PostRepository:
         embedding: list[float],
         keyword_id: uuid.UUID | None = None,
         limit: int = 10,
+        ef_search: int = 40,
     ) -> list[Post]:
-        """Semantic search menggunakan pgvector cosine distance (<=>)."""
-        from pgvector.sqlalchemy import Vector
+        """
+        Semantic search menggunakan pgvector cosine distance (<=>).
+        Menggunakan HNSW index (migration 004) untuk ANN search yang cepat.
+
+        ef_search: trade-off kecepatan vs akurasi (default 40, max 200)
+        """
+        from sqlalchemy import text
+
+        # Set ef_search per session untuk kontrol akurasi HNSW
+        await self.db.execute(text(f"SET LOCAL hnsw.ef_search = {ef_search}"))
+
         stmt = (
             select(Post)
             .where(Post.embedding.is_not(None))

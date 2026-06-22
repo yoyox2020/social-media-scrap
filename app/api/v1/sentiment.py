@@ -75,11 +75,18 @@ async def get_sentiment_summary(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Distribusi sentimen (positive/negative/neutral) untuk satu keyword."""
+    """Distribusi sentimen (positive/negative/neutral) untuk satu keyword. Cache 5 menit."""
+    from app.infrastructure.cache.redis_cache import cache_get, cache_set
+
+    cache_key = f"sentiment:summary:{keyword_id}"
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return build_success_response(cached)
+
     repo = SentimentRepository(db)
     distribution = await repo.count_by_label_for_keyword(keyword_id)
     total = sum(distribution.values())
-    return build_success_response({
+    data = {
         "keyword_id": str(keyword_id),
         "total_analyzed": total,
         "distribution": distribution,
@@ -87,4 +94,6 @@ async def get_sentiment_summary(
             label: round(count / total * 100, 1) if total > 0 else 0
             for label, count in distribution.items()
         },
-    })
+    }
+    await cache_set(cache_key, data, ex=300)
+    return build_success_response(data)
