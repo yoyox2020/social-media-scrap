@@ -15,7 +15,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import and_, desc, select
+from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.comments.models import Comment
@@ -23,6 +23,7 @@ from app.domain.keywords.models import Keyword
 from app.domain.posts.models import Post
 from app.domain.trending.models import TrendingTopic
 from app.domain.users.models import User
+from app.domain.youtube_analysis.models import LexiconAnalysis
 from app.infrastructure.database.connection import get_db
 from app.services.auth.dependencies import get_current_user
 from app.services.youtube.pipeline_service import (
@@ -34,12 +35,260 @@ from app.services.youtube.pipeline_service import (
     get_wordcloud_data,
 )
 from app.services.youtube.schemas import (
+    SmartSearchRequest,
     TrendingFetchRequest,
     YouTubeCollectRequest,
 )
 from app.shared.utils import build_success_response
 
 router = APIRouter(prefix="/youtube", tags=["youtube"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEARCH (live dari EnsembleData, tidak disimpan ke DB)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/search", response_model=dict)
+async def search_youtube(
+    q: str = Query(..., min_length=1, max_length=200, description="Kata kunci pencarian"),
+    depth: int = Query(default=1, ge=1, le=5, description="Jumlah halaman hasil (~20 video per halaman)"),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Cari video YouTube berdasarkan kata kunci secara langsung (live search).
+
+    Hasil TIDAK disimpan ke DB — ini hanya proxy ke EnsembleData YouTube search.
+    Gunakan POST /youtube/collect jika ingin menyimpan hasil ke DB dan analisis komentar.
+
+    - q     : kata kunci pencarian (wajib)
+    - depth : jumlah halaman (1 = ~20 video, max 5 = ~100 video)
+    """
+    from app.integrations.ensemble_data.client import EnsembleDataClient
+    from app.integrations.youtube.connector import YouTubeConnector
+
+    async with EnsembleDataClient() as client:
+        connector = YouTubeConnector(client)
+        raw = await connector.search_by_keyword(keyword=q, depth=depth)
+
+    videos = connector.extract_posts(raw)
+
+    items = []
+    for v in videos:
+        video_id = v.get("videoId", "")
+        title_runs = v.get("title", {}).get("runs", [])
+        title = title_runs[0].get("text", "") if title_runs else v.get("title", "")
+
+        channel_runs = (
+            v.get("longBylineText", {}).get("runs", [])
+            or v.get("ownerText", {}).get("runs", [])
+        )
+        channel = channel_runs[0].get("text", "") if channel_runs else ""
+
+        view_count = (
+            v.get("viewCountText", {}).get("simpleText", "")
+            or v.get("viewCountText", {}).get("runs", [{}])[0].get("text", "")
+        )
+
+        published = (
+            v.get("publishedTimeText", {}).get("simpleText", "")
+            or v.get("publishedTimeText", "")
+        )
+
+        duration = v.get("lengthText", {}).get("simpleText", "")
+
+        thumbnail_list = v.get("thumbnail", {}).get("thumbnails", [])
+        thumbnail = thumbnail_list[-1].get("url", "") if thumbnail_list else ""
+
+        items.append({
+            "video_id": video_id,
+            "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else "",
+            "title": title,
+            "channel": channel,
+            "view_count": view_count,
+            "published": published,
+            "duration": duration,
+            "thumbnail_url": thumbnail,
+        })
+
+    return build_success_response({
+        "query": q,
+        "depth": depth,
+        "total": len(items),
+        "note": "Hasil tidak disimpan ke DB. Gunakan POST /youtube/collect untuk simpan & analisis.",
+        "items": items,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SMART SEARCH — cek DB dulu, auto-crawl jika belum ada
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/smart-search", response_model=dict)
+async def smart_search_youtube(
+    body: SmartSearchRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Smart search YouTube berdasarkan kata kunci.
+
+    **Behaviour otomatis:**
+    - Jika data sudah ada di DB → langsung kembalikan videos + komentar + sentimen
+    - Jika data belum ada → buat keyword, jalankan pipeline crawl otomatis di background,
+      kembalikan status `crawling` beserta `poll_url` untuk cek progres
+    - `force_refresh=true` → crawl ulang meski data sudah ada (tampilkan data lama sambil refresh)
+
+    **Status response:**
+    - `ready`      → data ada, langsung bisa dipakai
+    - `crawling`   → pipeline baru dimulai, cek `poll_url` beberapa menit lagi
+    - `refreshing` → data lama ditampilkan, pipeline refresh berjalan di background
+    - `error`      → tidak ada project aktif di DB
+    """
+    from app.services.youtube.pipeline_service import smart_search_youtube as _smart_search
+
+    result = await _smart_search(
+        db=db,
+        q=body.q,
+        max_pages=body.max_pages,
+        max_comments_per_video=body.max_comments_per_video,
+        max_comment_pages=body.max_comment_pages,
+        force_refresh=body.force_refresh,
+    )
+    return build_success_response(result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET DATA — ambil hasil pencarian dari DB by kata kunci
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/smart-search", response_model=dict)
+async def get_search_result(
+    q: str = Query(..., min_length=1, max_length=200, description="Kata kunci yang dicari"),
+    limit_videos: int = Query(default=20, ge=1, le=100, description="Jumlah video yang dikembalikan"),
+    limit_comments: int = Query(default=20, ge=1, le=200, description="Jumlah sample komentar"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Ambil data hasil pencarian dari database berdasarkan kata kunci.
+
+    - Jika keyword ditemukan di DB → return videos + komentar + sentimen langsung
+    - Jika belum ada → return 404 dengan saran gunakan POST /smart-search untuk crawl
+
+    Gunakan POST /smart-search untuk crawl pertama kali.
+    Gunakan GET /smart-search untuk ambil data yang sudah ada.
+    """
+    from collections import Counter as _Counter
+
+    keyword = await db.scalar(
+        select(Keyword).where(
+            func.lower(Keyword.keyword) == q.strip().lower()
+        ).limit(1)
+    )
+
+    if not keyword:
+        return build_success_response({
+            "status": "not_found",
+            "query": q,
+            "message": "Keyword belum ada di database. Gunakan POST /api/v1/youtube/smart-search untuk crawl data baru.",
+            "post_endpoint": "POST /api/v1/youtube/smart-search",
+            "body_example": {"q": q},
+        })
+
+    # Hitung total
+    total_videos = (await db.scalar(
+        select(func.count(Post.id)).where(
+            Post.keyword_id == keyword.id, Post.platform == "youtube"
+        )
+    )) or 0
+
+    if total_videos == 0:
+        return build_success_response({
+            "status": "empty",
+            "query": q,
+            "keyword_id": str(keyword.id),
+            "message": "Keyword ada di DB tapi belum ada data video. Gunakan POST /smart-search untuk crawl.",
+        })
+
+    # Videos
+    posts = list((await db.scalars(
+        select(Post)
+        .where(Post.keyword_id == keyword.id, Post.platform == "youtube")
+        .order_by(Post.collected_at.desc())
+        .limit(limit_videos)
+    )).all())
+
+    videos = []
+    for p in posts:
+        meta = p.metadata_ or {}
+        videos.append({
+            "id": str(p.id),
+            "video_id": p.external_id,
+            "url": p.url or f"https://youtube.com/watch?v={p.external_id}",
+            "title": p.content,
+            "channel": p.author,
+            "view_count": meta.get("views", meta.get("view_count", 0)),
+            "thumbnail_url": meta.get("thumbnail", meta.get("thumbnail_url", "")),
+            "collected_at": p.collected_at.isoformat() if p.collected_at else None,
+        })
+
+    # Komentar + sentimen
+    rows = (await db.execute(
+        select(Comment, LexiconAnalysis, Post)
+        .join(Post, Comment.post_id == Post.id)
+        .outerjoin(LexiconAnalysis, LexiconAnalysis.comment_id == Comment.id)
+        .where(Post.keyword_id == keyword.id)
+        .order_by(Comment.created_at.desc())
+        .limit(limit_comments)
+    )).all()
+
+    comments = [
+        {
+            "id": str(comment.id),
+            "content": comment.content,
+            "author": comment.author,
+            "sentiment": analysis.label if analysis else None,
+            "score": round(analysis.score, 3) if analysis else None,
+            "video_url": post.url,
+        }
+        for comment, analysis, post in rows
+    ]
+
+    # Distribusi sentimen
+    label_rows = list((await db.scalars(
+        select(LexiconAnalysis.label).where(LexiconAnalysis.keyword_id == keyword.id)
+    )).all())
+    counter = _Counter(label_rows)
+    total_analyzed = sum(counter.values())
+
+    total_comments = (await db.scalar(
+        select(func.count(Comment.id))
+        .join(Post, Comment.post_id == Post.id)
+        .where(Post.keyword_id == keyword.id)
+    )) or 0
+
+    sentiment = {
+        lbl: {
+            "count": counter.get(lbl, 0),
+            "percentage": round(counter.get(lbl, 0) / total_analyzed * 100, 1) if total_analyzed else 0.0,
+        }
+        for lbl in ["positif", "negatif", "netral"]
+    }
+
+    return build_success_response({
+        "status": "ready",
+        "query": q,
+        "keyword_id": str(keyword.id),
+        "stats": {
+            "total_videos": total_videos,
+            "total_comments": total_comments,
+            "total_analyzed": total_analyzed,
+            "coverage_pct": round(total_analyzed / total_comments * 100, 1) if total_comments else 0.0,
+        },
+        "sentiment": {**sentiment, "dominant": counter.most_common(1)[0][0] if counter else "netral"},
+        "videos": videos,
+        "comments": comments,
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────

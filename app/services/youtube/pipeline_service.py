@@ -571,6 +571,231 @@ async def get_keyword_pipeline_status(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SMART SEARCH — cek DB dulu, auto-crawl jika belum ada
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def smart_search_youtube(
+    db: AsyncSession,
+    q: str,
+    max_pages: int = 2,
+    max_comments_per_video: int = 50,
+    max_comment_pages: int = 2,
+    force_refresh: bool = False,
+) -> dict:
+    """
+    Smart search YouTube — satu call, langsung dapat hasil:
+
+    1. Jika keyword + data sudah ada di DB → kembalikan langsung (instant)
+    2. Jika keyword baru / force_refresh → crawl synchronous mini:
+         a. Fetch video (1 page ~20 video) → simpan ke DB
+         b. Collect komentar untuk 3 video teratas → simpan + analisis sentimen
+         c. Return hasilnya langsung ke user
+         d. Queue Celery untuk crawl lebih dalam di background (semua halaman)
+    3. force_refresh=True → tampilkan data lama + crawl ulang
+    """
+    from app.domain.projects.models import Project
+    from app.workers.youtube_worker import collect_youtube_pipeline_task
+
+    q_clean = q.strip()
+
+    # ── 1. Cek keyword di DB (case-insensitive) ───────────────────────────────
+    existing_kw = await db.scalar(
+        select(Keyword).where(
+            func.lower(Keyword.keyword) == q_clean.lower()
+        ).limit(1)
+    )
+
+    if existing_kw:
+        video_count = (await db.scalar(
+            select(func.count(Post.id)).where(
+                Post.keyword_id == existing_kw.id,
+                Post.platform == "youtube",
+            )
+        )) or 0
+
+        if video_count > 0 and not force_refresh:
+            # Data sudah ada → return langsung
+            return await _build_smart_search_result(db, existing_kw)
+
+        if video_count > 0 and force_refresh:
+            # Data lama ada, crawl ulang di background, return data lama
+            task = collect_youtube_pipeline_task.delay(
+                str(existing_kw.id),
+                max_pages=max_pages,
+                max_comments_per_video=max_comments_per_video,
+                max_comment_pages=max_comment_pages,
+            )
+            result = await _build_smart_search_result(db, existing_kw)
+            result["status"] = "refreshing"
+            result["message"] = "Data lama ditampilkan. Pipeline crawl terbaru berjalan di background."
+            result["job_id"] = task.id
+            return result
+
+        kw_id = existing_kw.id
+        kw = existing_kw
+    else:
+        # ── 2. Keyword baru → buat record ─────────────────────────────────────
+        project_id = await db.scalar(
+            select(Project.id).where(Project.is_active == True).limit(1)  # noqa: E712
+        )
+        if not project_id:
+            return {
+                "status": "error",
+                "message": "Tidak ada project aktif. Buat project dulu via API /api/v1/projects.",
+            }
+
+        kw = Keyword(project_id=project_id, keyword=q_clean, is_active=True)
+        db.add(kw)
+        await db.flush()
+        kw_id = kw.id           # simpan ID sebelum commit meng-expire object
+        await db.commit()
+
+    # ── 3. Crawl synchronous mini (langsung dalam request, tidak via Celery) ──
+    #    a. Fetch + simpan video (1 halaman = ~20 video)
+    from app.repositories.keyword_repository import KeywordRepository
+    from app.services.collector.service import CollectorService
+
+    kw_repo = KeywordRepository(db)
+    svc = CollectorService(kw_repo)
+    collection_result = await svc.collect_for_platform(
+        keyword_id=kw_id,
+        platform="youtube",
+        max_pages=1,        # 1 halaman dulu untuk respon cepat (~20 video)
+    )
+
+    #    b. Ambil video yang baru tersimpan, collect komentar untuk 3 video pertama
+    db.expire_all()             # synchronous — bukan await
+    fresh_posts = list((await db.scalars(
+        select(Post)
+        .where(Post.keyword_id == kw_id, Post.platform == "youtube")
+        .order_by(Post.collected_at.desc())
+        .limit(3)           # hanya 3 video agar respon tidak terlalu lama
+    )).all())
+
+    for post in fresh_posts:
+        try:
+            await collect_comments_for_video(
+                db=db,
+                post_id=post.id,
+                keyword_id=kw_id,
+                max_comments=20,    # 20 komentar per video untuk respon cepat
+                max_pages=1,
+            )
+        except Exception:
+            pass  # lanjut ke video berikutnya jika satu gagal
+
+    #    c. Queue Celery untuk crawl lebih dalam di background
+    task = collect_youtube_pipeline_task.delay(
+        str(kw_id),
+        max_pages=max_pages,
+        max_comments_per_video=max_comments_per_video,
+        max_comment_pages=max_comment_pages,
+    )
+
+    #    d. Build result — ambil keyword object fresh dari DB
+    db.expire_all()             # synchronous
+    kw_fresh = await db.get(Keyword, kw_id)
+    result = await _build_smart_search_result(db, kw_fresh)
+    result["status"] = "ready"
+    result["message"] = (
+        f"Berhasil crawl {collection_result.new_posts} video baru. "
+        f"Pipeline lanjutkan crawl lebih dalam di background (job_id: {task.id})."
+    )
+    result["background_job_id"] = task.id
+    result["poll_url"] = f"/api/v1/youtube/status?keyword_id={kw_id}"
+    return result
+
+
+async def _build_smart_search_result(db: AsyncSession, keyword: Keyword) -> dict:
+    """Bangun response lengkap dari data DB yang sudah ada."""
+    # Videos (terbaru 20)
+    posts = list((await db.scalars(
+        select(Post)
+        .where(Post.keyword_id == keyword.id, Post.platform == "youtube")
+        .order_by(Post.collected_at.desc())
+        .limit(20)
+    )).all())
+
+    videos = []
+    for p in posts:
+        meta = p.metadata_ or {}
+        videos.append({
+            "id": str(p.id),
+            "video_id": p.external_id,
+            "url": p.url or f"https://youtube.com/watch?v={p.external_id}",
+            "title": p.content,
+            "channel": p.author,
+            "view_count": meta.get("views", meta.get("view_count", 0)),
+            "thumbnail_url": meta.get("thumbnail", meta.get("thumbnail_url", "")),
+            "collected_at": p.collected_at.isoformat() if p.collected_at else None,
+        })
+
+    # Sample komentar + sentimen (20 terbaru)
+    rows = (await db.execute(
+        select(Comment, LexiconAnalysis)
+        .join(Post, Comment.post_id == Post.id)
+        .outerjoin(LexiconAnalysis, LexiconAnalysis.comment_id == Comment.id)
+        .where(Post.keyword_id == keyword.id)
+        .order_by(Comment.created_at.desc())
+        .limit(20)
+    )).all()
+
+    sample_comments = [
+        {
+            "id": str(comment.id),
+            "content": comment.content,
+            "author": comment.author,
+            "sentiment": analysis.label if analysis else None,
+            "score": round(analysis.score, 3) if analysis else None,
+            "created_at": comment.created_at.isoformat() if comment.created_at else None,
+        }
+        for comment, analysis in rows
+    ]
+
+    # Distribusi sentimen
+    label_rows = list((await db.scalars(
+        select(LexiconAnalysis.label).where(LexiconAnalysis.keyword_id == keyword.id)
+    )).all())
+    counter = Counter(label_rows)
+    total_analyzed = sum(counter.values())
+
+    total_videos = (await db.scalar(
+        select(func.count(Post.id)).where(
+            Post.keyword_id == keyword.id, Post.platform == "youtube"
+        )
+    )) or 0
+
+    total_comments = (await db.scalar(
+        select(func.count(Comment.id))
+        .join(Post, Comment.post_id == Post.id)
+        .where(Post.keyword_id == keyword.id)
+    )) or 0
+
+    sentiment = {
+        lbl: {
+            "count": counter.get(lbl, 0),
+            "percentage": round(counter.get(lbl, 0) / total_analyzed * 100, 1) if total_analyzed else 0.0,
+        }
+        for lbl in ["positif", "negatif", "netral"]
+    }
+
+    return {
+        "status": "ready",
+        "keyword_id": str(keyword.id),
+        "keyword": keyword.keyword,
+        "stats": {
+            "total_videos": total_videos,
+            "total_comments": total_comments,
+            "total_analyzed": total_analyzed,
+            "coverage_pct": round(total_analyzed / total_comments * 100, 1) if total_comments else 0.0,
+        },
+        "sentiment": {**sentiment, "dominant": counter.most_common(1)[0][0] if counter else "netral"},
+        "videos": videos,
+        "sample_comments": sample_comments,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 

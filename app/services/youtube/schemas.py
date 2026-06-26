@@ -18,6 +18,14 @@ class YouTubeCollectRequest(BaseModel):
     max_comments_per_video: int = Field(default=100, ge=10, le=500)
 
 
+class SmartSearchRequest(BaseModel):
+    q: str = Field(..., min_length=1, max_length=200, description="Kata kunci pencarian YouTube")
+    max_pages: int = Field(default=2, ge=1, le=5, description="Jumlah halaman video (~20 per halaman)")
+    max_comments_per_video: int = Field(default=50, ge=10, le=200, description="Maks komentar per video")
+    max_comment_pages: int = Field(default=2, ge=1, le=5, description="Maks halaman komentar per video")
+    force_refresh: bool = Field(default=False, description="Paksa crawl ulang meski data sudah ada di DB")
+
+
 class TrendingFetchRequest(BaseModel):
     geo: str = Field(default="ID", max_length=10)
     period: str = Field(default="24h", pattern="^(4h|24h|48h|7d)$")
