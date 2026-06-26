@@ -18,6 +18,7 @@ Token didapat dari `POST /api/v1/auth/login`
 - [Trigger Manual via Swagger](#trigger-manual-via-swagger)
 - [Trigger Manual via PowerShell](#trigger-manual-via-powershell)
 - [Cara Lihat Data Hasil](#cara-lihat-data-hasil)
+- [Referensi Keyword ID](#referensi-keyword-id)
 - [Daftar Endpoint YouTube](#daftar-endpoint-youtube)
 - [Penjelasan Tiap Endpoint](#penjelasan-tiap-endpoint)
 - [Masalah yang Ditemukan & Fix](#masalah-yang-ditemukan--fix)
@@ -301,6 +302,63 @@ Invoke-RestMethod -Uri "http://localhost:8000/api/v1/youtube/comments?keyword_id
 
 ```powershell
 Invoke-RestMethod -Uri "http://localhost:8000/api/v1/youtube/wordcloud?keyword_id=714d037b-5d47-4694-b76c-fd39ebb41bb3&sentiment=positif&top_n=20" -Headers @{ Authorization = "Bearer $TOKEN" } | ConvertTo-Json -Depth 5
+```
+
+---
+
+## Referensi Keyword ID
+
+`keyword_id` yang dipakai di endpoint YouTube analytics **bukan** diambil dari hasil `/youtube/trending`, melainkan dari tabel `keywords` yang dibuat otomatis oleh Celery Beat setiap jam saat fetch Google Trends.
+
+### Dari mana keyword_id berasal?
+
+```
+POST /youtube/trending/fetch  (atau Celery Beat tiap jam)
+  → ambil Google Trends
+  → simpan ke trending_topics  ← punya ID sendiri (tidak dipakai untuk analytics)
+  → buat record di tabel keywords  ← inilah yang menghasilkan keyword_id
+```
+
+### Cara lihat keyword_id yang tersedia
+
+**Via database langsung:**
+```bash
+docker exec social_intel_postgres psql -U social_intelligence -d social_intelligence_db \
+  -c "SELECT id, keyword, created_at FROM keywords ORDER BY created_at DESC LIMIT 20;"
+```
+
+**Via API:**
+```powershell
+$TOKEN = (Invoke-RestMethod -Method POST -Uri "http://localhost:8000/api/v1/auth/login" `
+  -ContentType "application/json" `
+  -Body '{"email":"yahyamatoristmik@gmail.com","password":"Admin1234!"}').data.access_token
+
+Invoke-RestMethod -Uri "http://localhost:8000/api/v1/keywords/" `
+  -Headers @{ Authorization = "Bearer $TOKEN" } | ConvertTo-Json -Depth 5
+```
+
+### Daftar keyword_id aktif (per 26 Juni 2026)
+
+| keyword_id | Keyword | Video | Komentar |
+|---|---|---|---|
+| `714d037b-5d47-4694-b76c-fd39ebb41bb3` | tantri kotak | 34 | 342 |
+| `76758a0f-ab46-4583-b415-ddfe6595df7b` | fifa world cup games | 39 | 0 |
+| `6dd1fa3f-d06f-471b-a03f-522a35501575` | paraguay vs | — | — |
+| `14bbba6c-dc17-4850-8596-630392f64b22` | ao tanaka | 23 | 0 |
+| `c20c1f80-a5d2-4069-8810-309b81f5528d` | antonio conte | — | — |
+| `1b293942-2f88-4790-9d9c-960da727b09e` | spanyol vs uruguay | — | — |
+
+> Keyword baru otomatis ditambahkan setiap jam. Cek ulang via API atau DB untuk daftar terbaru.
+
+### Cara pakai keyword_id
+
+```
+GET /api/v1/youtube/status?keyword_id=714d037b-5d47-4694-b76c-fd39ebb41bb3
+GET /api/v1/youtube/sentiment/distribution?keyword_id=714d037b-5d47-4694-b76c-fd39ebb41bb3
+GET /api/v1/youtube/sentiment/table?keyword_id=714d037b-5d47-4694-b76c-fd39ebb41bb3
+GET /api/v1/youtube/wordcloud?keyword_id=714d037b-5d47-4694-b76c-fd39ebb41bb3
+GET /api/v1/youtube/videos?keyword_id=714d037b-5d47-4694-b76c-fd39ebb41bb3
+GET /api/v1/youtube/comments?keyword_id=714d037b-5d47-4694-b76c-fd39ebb41bb3
 ```
 
 ---
