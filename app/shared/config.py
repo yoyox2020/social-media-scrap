@@ -24,8 +24,8 @@ class Settings(BaseSettings):
     # JWT
     jwt_secret_key: str = "change-me-in-production"
     jwt_algorithm: str = "HS256"
-    jwt_access_token_expire_minutes: int = 30
-    jwt_refresh_token_expire_days: int = 7
+    jwt_access_token_expire_minutes: int = 43200  # 30 days
+    jwt_refresh_token_expire_days: int = 30
 
     # EnsembleData API
     ensemble_data_base_url: str = "https://ensembledata.com/apis"
@@ -55,6 +55,15 @@ class Settings(BaseSettings):
 
     # Reports
     report_output_dir: str = "/app/reports"
+
+    # YouTube Pipeline
+    youtube_default_project_id: str = ""        # auto-detect jika kosong
+    youtube_trending_geo: str = "ID"
+    youtube_trending_period: str = "24h"
+    youtube_trending_limit: int = 10
+    youtube_max_pages_per_keyword: int = 2
+    youtube_max_comment_pages: int = 3
+    youtube_max_comments_per_video: int = 100
 
     # Rate Limiting
     rate_limit_agents_max_requests: int = 10

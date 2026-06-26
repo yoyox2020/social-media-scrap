@@ -76,7 +76,9 @@ class CollectorService:
 
                 for page in range(max_pages):
                     try:
-                        raw = await _fetch_page(connector_instance, platform, keyword.keyword, cursor)
+                        raw = await _fetch_page(
+                            connector_instance, platform, keyword.keyword, cursor, max_pages
+                        )
                         items = connector_instance.extract_posts(raw)
 
                         if not items:
@@ -130,12 +132,14 @@ def _get_connector(platform: str):
     return connector
 
 
-async def _fetch_page(connector, platform: str, keyword: str, cursor) -> dict:
+async def _fetch_page(connector, platform: str, keyword: str, cursor, max_pages: int = 5) -> dict:
     """Ambil satu halaman data dari connector yang sesuai."""
     if platform == "tiktok":
         return await connector.search_by_keyword(keyword, cursor=cursor or 0)
     elif platform == "youtube":
-        return await connector.search_by_keyword(keyword, next_page_token=cursor)
+        # YouTube menggunakan depth (jumlah halaman per call) bukan cursor.
+        # Kita set depth=max_pages agar satu call = semua halaman yang diinginkan.
+        return await connector.search_by_keyword(keyword, depth=max_pages)
     elif platform == "instagram":
         return await connector.search(keyword)
     elif platform == "reddit":

@@ -62,20 +62,21 @@ class InstagramEndpoints:
 
 
 # ── YouTube ───────────────────────────────────────────────────────────────────
+# Paths berdasarkan EnsembleData docs resmi (https://ensembledata.com/apis)
 class YouTubeEndpoints:
-    KEYWORD_SEARCH = Endpoint("/yt/keyword/search", description="Search video by keyword")
-    CATEGORIES_FEATURED = Endpoint("/yt/categories/featured", description="Kategori unggulan")
-    HASHTAG_SEARCH = Endpoint("/yt/hashtag/search", description="Search by hashtag")
-    CHANNEL_INFO_DETAILED = Endpoint("/yt/channel/info-detailed", description="Detail channel")
-    CHANNEL_VIDEOS = Endpoint("/yt/channel/videos", description="Video dari channel")
-    CHANNEL_SHORTS = Endpoint("/yt/channel/shorts", description="Shorts dari channel")
-    CHANNEL_STREAMS = Endpoint("/yt/channel/streams", description="Live streams channel")
-    VIDEO_DETAILS = Endpoint("/yt/video/details", description="Detail video/short")
-    CHANNEL_SUBSCRIBER_COUNT = Endpoint("/yt/channel/subscriber-count", description="Jumlah subscriber")
-    CHANNEL_USERNAME_TO_ID = Endpoint("/yt/channel/username-to-id", description="Konversi username ke ID")
-    CHANNEL_ID_TO_USERNAME = Endpoint("/yt/channel/id-to-username", description="Konversi ID ke username")
-    MUSIC_ID_TO_SHORTS = Endpoint("/yt/music/id-to-shorts", description="Shorts dari music ID")
-    VIDEO_COMMENTS = Endpoint("/yt/video/comments", description="Komentar video")
+    KEYWORD_SEARCH = Endpoint("/youtube/search", description="Search video by keyword (param: keyword, depth)")
+    HASHTAG_SEARCH = Endpoint("/youtube/hashtag/search", description="Search by hashtag (param: name, depth, only_shorts)")
+    FEATURED_CATEGORIES = Endpoint("/youtube/search/featured-categories", description="Kategori unggulan (param: name)")
+    CHANNEL_INFO_DETAILED = Endpoint("/youtube/channel/detailed-info", description="Detail channel (param: browseId)")
+    CHANNEL_VIDEOS = Endpoint("/youtube/channel/videos", description="Video dari channel (param: browseId)")
+    CHANNEL_SHORTS = Endpoint("/youtube/channel/shorts", description="Shorts dari channel (param: browseId)")
+    CHANNEL_STREAMS = Endpoint("/youtube/channel/streams", description="Live streams channel (param: browseId)")
+    VIDEO_DETAILS = Endpoint("/youtube/video/details", description="Detail video (param: id)")
+    CHANNEL_FOLLOWERS = Endpoint("/youtube/channel/followers", description="Jumlah subscriber (param: browseId)")
+    CHANNEL_USERNAME_TO_ID = Endpoint("/youtube/channel/username-to-id", description="Konversi username ke browseId")
+    CHANNEL_ID_TO_NAME = Endpoint("/youtube/channel/id-to-name", description="Konversi browseId ke username (param: browseId)")
+    MUSIC_ID_TO_SHORTS = Endpoint("/youtube/music/id-to-shorts", description="Shorts dari music ID")
+    VIDEO_COMMENTS = Endpoint("/youtube/video/comments", description="Komentar video (param: id, cursor)")
 
 
 # ── Reddit ────────────────────────────────────────────────────────────────────

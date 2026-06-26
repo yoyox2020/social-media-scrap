@@ -2,20 +2,31 @@
 
 from pathlib import Path
 
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.shared import Inches, Pt, RGBColor
-from docx.util import Cm
+try:
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.util import Cm
+    _DOCX_AVAILABLE = True
+except ImportError:
+    _DOCX_AVAILABLE = False
+    Document = None  # type: ignore
+    WD_ALIGN_PARAGRAPH = None  # type: ignore
+    qn = None  # type: ignore
+    Inches = Pt = RGBColor = Cm = None  # type: ignore
 
 from app.services.reports.schemas import ReportData
 
-# Warna tema
-COLOR_PRIMARY = RGBColor(0x1e, 0x3a, 0x5f)
-COLOR_POSITIVE = RGBColor(0x27, 0xae, 0x60)
-COLOR_NEGATIVE = RGBColor(0xe7, 0x4c, 0x3c)
-COLOR_NEUTRAL = RGBColor(0x95, 0xa5, 0xa6)
-COLOR_ACCENT = RGBColor(0x2e, 0x86, 0xde)
+# Warna tema — hanya dibuat jika python-docx tersedia
+if _DOCX_AVAILABLE:
+    COLOR_PRIMARY = RGBColor(0x1e, 0x3a, 0x5f)
+    COLOR_POSITIVE = RGBColor(0x27, 0xae, 0x60)
+    COLOR_NEGATIVE = RGBColor(0xe7, 0x4c, 0x3c)
+    COLOR_NEUTRAL = RGBColor(0x95, 0xa5, 0xa6)
+    COLOR_ACCENT = RGBColor(0x2e, 0x86, 0xde)
+else:
+    COLOR_PRIMARY = COLOR_POSITIVE = COLOR_NEGATIVE = COLOR_NEUTRAL = COLOR_ACCENT = None
 
 
 def _set_cell_bg(cell, hex_color: str) -> None:

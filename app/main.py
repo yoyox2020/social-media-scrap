@@ -18,6 +18,21 @@ from app.api.v1 import (
     topics,
     trends,
 )
+# Import semua domain models agar SQLAlchemy mapper bisa resolve relationship
+import app.domain.users.models  # noqa: F401
+import app.domain.projects.models  # noqa: F401
+import app.domain.keywords.models  # noqa: F401
+import app.domain.posts.models  # noqa: F401
+import app.domain.comments.models  # noqa: F401
+import app.domain.sentiments.models  # noqa: F401
+import app.domain.entities.models  # noqa: F401
+import app.domain.topics.models  # noqa: F401
+import app.domain.trends.models  # noqa: F401
+import app.domain.reports.models  # noqa: F401
+import app.domain.trending.models  # noqa: F401
+import app.domain.youtube_analysis.models  # noqa: F401
+
+from app.api.v1.youtube.router import router as youtube_router
 from app.infrastructure.database.connection import engine
 from app.infrastructure.logging.logger import get_logger, setup_logging
 from app.infrastructure.middleware.request_id import RequestIDMiddleware
@@ -145,3 +160,4 @@ app.include_router(trends.router, prefix=API_PREFIX)
 app.include_router(search.router, prefix=API_PREFIX)
 app.include_router(agents.router, prefix=API_PREFIX)
 app.include_router(reports.router, prefix=API_PREFIX)
+app.include_router(youtube_router, prefix=API_PREFIX)

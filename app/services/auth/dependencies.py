@@ -10,7 +10,7 @@ from app.repositories.user_repository import UserRepository
 from app.services.auth.service import AuthService
 from app.shared.exceptions import ForbiddenError, UnauthorizedError
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token", auto_error=False)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 

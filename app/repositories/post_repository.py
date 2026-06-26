@@ -77,11 +77,11 @@ class PostRepository:
             }
             for p in posts
         ]
-        stmt = insert(Post).values(rows).on_conflict_do_nothing(
+        # Gunakan Post.__table__ bukan Post (ORM class) untuk bypass pgvector type
+        # yang menyebabkan '_bulk_update_tuples' error di SQLAlchemy 2.0.x
+        stmt = insert(Post.__table__).values(rows).on_conflict_do_nothing(
             index_elements=["external_id", "platform"]
         )
-        # on_conflict_do_nothing requires unique constraint on (external_id, platform)
-        # Migration 002 akan menambah constraint ini
         result = await self.db.execute(stmt)
         await self.db.flush()
         return result.rowcount

@@ -1,6 +1,20 @@
 from celery import Celery
 from celery.schedules import crontab
 
+# Import semua domain models agar SQLAlchemy mapper bisa resolve relationship
+import app.domain.users.models  # noqa: F401
+import app.domain.projects.models  # noqa: F401
+import app.domain.keywords.models  # noqa: F401
+import app.domain.posts.models  # noqa: F401
+import app.domain.comments.models  # noqa: F401
+import app.domain.sentiments.models  # noqa: F401
+import app.domain.entities.models  # noqa: F401
+import app.domain.topics.models  # noqa: F401
+import app.domain.trends.models  # noqa: F401
+import app.domain.reports.models  # noqa: F401
+import app.domain.trending.models  # noqa: F401
+import app.domain.youtube_analysis.models  # noqa: F401
+
 from app.shared.config import settings
 
 celery_app = Celery(
@@ -16,6 +30,7 @@ celery_app = Celery(
         "app.workers.embedding_worker",
         "app.workers.report_worker",
         "app.workers.scheduled_tasks",
+        "app.workers.youtube_worker",
     ],
 )
 
@@ -38,6 +53,20 @@ celery_app.conf.update(
             "schedule": crontab(hour=9, minute=0, day_of_week=1),
             "kwargs": {"period": "week"},
             "options": {"queue": "reports"},
+        },
+        # YouTube: fetch trending Indonesia setiap 1 jam
+        # project_id kosong → task otomatis pilih project pertama dari DB
+        "youtube-trending-every-1h": {
+            "task": "workers.youtube.fetch_trending",
+            "schedule": crontab(minute=0, hour="0,6,12,18"),   # setiap jam tepat (:00)
+            "kwargs": {
+                "project_id": "",    # kosong = auto-detect dari DB
+                "geo": "ID",
+                "period": "24h",
+                "limit": 10,
+                "max_pages_per_keyword": 2,
+            },
+            "options": {"queue": "default"},
         },
     },
 )

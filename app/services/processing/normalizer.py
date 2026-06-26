@@ -82,33 +82,64 @@ class YouTubeNormalizer:
         return [self._to_post(item, keyword_id) for item in items if self._get_video_id(item)]
 
     def _get_video_id(self, item: dict) -> str:
-        return item.get("video_id") or item.get("videoId") or item.get("id", {}).get("videoId", "")
+        # videoRenderer dari /youtube/search
+        return item.get("videoId") or item.get("video_id") or ""
+
+    @staticmethod
+    def _runs_to_text(obj: dict | None) -> str:
+        """Ambil teks dari format {runs: [{text: ...}]} milik YouTube."""
+        if not obj:
+            return ""
+        runs = obj.get("runs") or []
+        return "".join(r.get("text", "") for r in runs)
 
     def _to_post(self, item: dict, keyword_id: uuid.UUID) -> Post:
+        """
+        Parse videoRenderer dari /youtube/search.
+
+        Struktur kunci:
+          videoId, title.runs, ownerText.runs, viewCountText.simpleText,
+          publishedTimeText.simpleText, thumbnail.thumbnails, descriptionSnippet.runs
+        """
         video_id = self._get_video_id(item)
-        snippet = item.get("snippet") or {}
-        statistics = item.get("statistics") or {}
-        channel = item.get("channel_name") or snippet.get("channelTitle", "")
+
+        title = self._runs_to_text(item.get("title"))
+        channel = self._runs_to_text(item.get("ownerText") or item.get("shortBylineText"))
+
+        views_raw = (item.get("viewCountText") or {}).get("simpleText", "0 views")
+        views = _safe_int("".join(c for c in views_raw if c.isdigit()))
+
+        thumbs = (item.get("thumbnail") or {}).get("thumbnails", [])
+        thumb_url = thumbs[-1].get("url", "") if thumbs else ""
+
+        desc_runs = (
+            item.get("descriptionSnippet")
+            or item.get("detailedMetadataSnippets", [{}])[0].get("snippetText")
+            or {}
+        )
+        description = self._runs_to_text(desc_runs if isinstance(desc_runs, dict) else {})
+
+        published_text = (item.get("publishedTimeText") or {}).get("simpleText", "")
 
         return Post(
             id=uuid.uuid4(),
             keyword_id=keyword_id,
             external_id=video_id,
             platform=self.PLATFORM,
-            content=item.get("title") or snippet.get("title", ""),
+            content=title,
             author=channel,
             url=f"https://www.youtube.com/watch?v={video_id}" if video_id else None,
             metadata_={
-                "views": _safe_int(item.get("view_count") or statistics.get("viewCount")),
-                "likes": _safe_int(item.get("like_count") or statistics.get("likeCount")),
-                "comments": _safe_int(item.get("comment_count") or statistics.get("commentCount")),
-                "description": item.get("description") or snippet.get("description", ""),
-                "channel_id": item.get("channel_id") or snippet.get("channelId", ""),
+                "views": views,
+                "likes": 0,
+                "comments": 0,
+                "description": description,
+                "thumbnail": thumb_url,
+                "published_text": published_text,
+                "duration": (item.get("lengthText") or {}).get("simpleText", ""),
             },
             raw_data=item,
-            published_at=_utc_from_iso(
-                item.get("published_at") or item.get("publishedAt") or snippet.get("publishedAt")
-            ),
+            published_at=None,   # YouTube search hanya berikan "10 months ago", bukan ISO
             collected_at=datetime.now(timezone.utc),
         )
 

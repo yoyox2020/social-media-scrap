@@ -1,0 +1,623 @@
+"""
+YouTube Pipeline Service.
+
+Orchestrasi penuh:
+  trending → keywords → videos → comments (semua halaman) → lexicon sentiment → analytics
+"""
+from __future__ import annotations
+
+import uuid
+from collections import Counter
+from datetime import date, datetime, timezone
+
+from sqlalchemy import extract, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.domain.comments.models import Comment
+from app.domain.keywords.models import Keyword
+from app.domain.posts.models import Post
+from app.domain.trending.models import TrendingTopic
+from app.domain.youtube_analysis.models import LexiconAnalysis
+from app.integrations.ensemble_data.client import EnsembleDataClient
+from app.integrations.google_trends.connector import TrendingResult, fetch_trending
+from app.integrations.youtube.connector import YouTubeConnector
+from app.services.youtube.schemas import (
+    CommentCollectionResult,
+    DashboardResponse,
+    DashboardSummary,
+    KeywordPipelineStatus,
+    KeywordSentimentSummary,
+    SentimentDistributionItem,
+    SentimentDistributionResponse,
+    SentimentTableResponse,
+    SentimentTableRow,
+    TrendingFetchRequest,
+    TrendingFetchResponse,
+    TrendingItemResponse,
+    WordCloudItem,
+    WordCloudResponse,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRENDING
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def fetch_and_store_trending(
+    db: AsyncSession,
+    request: TrendingFetchRequest,
+) -> TrendingFetchResponse:
+    """
+    Ambil trending dari Google Trends, simpan ke DB, buat Keyword record,
+    dan (opsional) queue Celery pipeline per keyword.
+    """
+    result: TrendingResult = fetch_trending(
+        geo=request.geo,
+        period=request.period,
+        limit=request.limit,
+    )
+
+    for item in result.items:
+        db.add(TrendingTopic(
+            rank=item.rank,
+            title=item.title,
+            traffic=item.traffic,
+            description=item.description,
+            geo=item.geo,
+            period=item.period,
+            published_at=item.published_at,
+            fetched_at=result.fetched_at,
+        ))
+
+    await db.flush()
+
+    keywords_created = 0
+    keyword_ids: list[uuid.UUID] = []
+
+    for item in result.items:
+        existing = await db.scalar(
+            select(Keyword).where(
+                Keyword.project_id == request.project_id,
+                Keyword.keyword == item.title,
+            )
+        )
+        if existing:
+            keyword_ids.append(existing.id)
+        else:
+            kw = Keyword(
+                project_id=request.project_id,
+                keyword=item.title,
+                is_active=True,
+            )
+            db.add(kw)
+            await db.flush()
+            keyword_ids.append(kw.id)
+            keywords_created += 1
+
+    await db.commit()
+
+    jobs_queued = 0
+    if request.auto_collect and keyword_ids:
+        from app.workers.youtube_worker import collect_youtube_pipeline_task
+
+        for kw_id in keyword_ids:
+            collect_youtube_pipeline_task.delay(
+                str(kw_id),
+                max_pages=request.max_pages_per_keyword,
+            )
+            jobs_queued += 1
+
+    return TrendingFetchResponse(
+        geo=result.geo,
+        period=result.period,
+        fetched_at=result.fetched_at,
+        items=[
+            TrendingItemResponse(
+                rank=i.rank,
+                title=i.title,
+                traffic=i.traffic,
+                description=i.description,
+                published_at=i.published_at,
+            )
+            for i in result.items
+        ],
+        keywords_created=keywords_created,
+        jobs_queued=jobs_queued,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMENT COLLECTION  (dengan pagination cursor)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def collect_comments_for_video(
+    db: AsyncSession,
+    post_id: uuid.UUID,
+    keyword_id: uuid.UUID,
+    max_comments: int = 100,
+    max_pages: int = 3,
+) -> CommentCollectionResult:
+    """
+    Ambil semua halaman komentar untuk satu video, simpan ke DB,
+    jalankan lexicon sentiment per komentar baru.
+
+    Menggunakan cursor loop — setiap halaman ~20 komentar.
+    """
+    post = await db.get(Post, post_id)
+    if not post:
+        return CommentCollectionResult(
+            video_external_id="",
+            comments_fetched=0,
+            comments_new=0,
+            comments_analyzed=0,
+            errors=["Post tidak ditemukan"],
+        )
+
+    video_id = post.external_id
+    result = CommentCollectionResult(video_external_id=video_id)
+
+    existing_ids_result = await db.scalars(
+        select(Comment.external_id).where(Comment.post_id == post_id)
+    )
+    existing_ids: set[str] = set(existing_ids_result.all())
+
+    try:
+        async with EnsembleDataClient() as client:
+            connector = YouTubeConnector(client)
+            cursor: str = ""
+            all_raw_comments: list[dict] = []
+
+            for _page in range(max_pages):
+                raw = await connector.get_video_comments(video_id, cursor=cursor)
+                page_comments = connector.extract_comments(raw)
+
+                if not page_comments:
+                    break
+
+                all_raw_comments.extend(page_comments)
+                result.comments_fetched += len(page_comments)
+
+                # Ambil cursor untuk halaman berikutnya
+                next_cursor = connector.extract_cursor(raw)
+                if not next_cursor:
+                    break
+                cursor = next_cursor
+
+                # Berhenti jika sudah melebihi max_comments
+                if result.comments_fetched >= max_comments:
+                    break
+
+        # Simpan komentar baru (deduplication via external_id)
+        new_comments: list[Comment] = []
+        for raw_c in all_raw_comments[:max_comments]:
+            ext_id = _get_comment_id(raw_c)
+            if not ext_id or ext_id in existing_ids:
+                continue
+
+            toolbar = raw_c.get("toolbar") or {}
+            comment = Comment(
+                post_id=post_id,
+                external_id=ext_id,
+                content=_get_comment_text(raw_c),
+                author=_get_comment_author(raw_c),
+                published_at=None,
+                metadata_={
+                    "like_count": _parse_count(toolbar.get("likeCountNotliked", "0")),
+                    "reply_count": _parse_count(toolbar.get("replyCount", "0")),
+                    "published_time": (raw_c.get("properties") or {}).get("publishedTime", ""),
+                    "is_pinned": bool((raw_c.get("commentViewModel") or {}).get("pinnedText")),
+                },
+            )
+            db.add(comment)
+            new_comments.append(comment)
+            existing_ids.add(ext_id)
+
+        await db.flush()
+        result.comments_new = len(new_comments)
+
+        # Lexicon sentiment
+        analyzed = await _analyze_comments_lexicon(db, new_comments, keyword_id)
+        result.comments_analyzed = analyzed
+
+        await db.commit()
+
+    except Exception as exc:
+        result.errors.append(str(exc))
+        await db.rollback()
+
+    return result
+
+
+async def _analyze_comments_lexicon(
+    db: AsyncSession,
+    comments: list[Comment],
+    keyword_id: uuid.UUID,
+) -> int:
+    from app.ai.lexicon.service import analyze
+
+    count = 0
+    for comment in comments:
+        if not comment.content:
+            continue
+        res = analyze(comment.content)
+        db.add(LexiconAnalysis(
+            comment_id=comment.id,
+            keyword_id=keyword_id,
+            matched_positive=res.matched_positive,
+            matched_negative=res.matched_negative,
+            removed_stopwords=res.removed_stopwords,
+            score=res.score,
+            label=res.label,
+        ))
+        count += 1
+
+    await db.flush()
+    return count
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANALYTICS
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_sentiment_distribution(
+    db: AsyncSession,
+    keyword_id: uuid.UUID,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> SentimentDistributionResponse:
+    keyword = await db.get(Keyword, keyword_id)
+    if not keyword:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError("Keyword", str(keyword_id))
+
+    q = select(LexiconAnalysis.label).where(LexiconAnalysis.keyword_id == keyword_id)
+    q = _apply_date_filter(q, LexiconAnalysis.created_at, date_from, date_to)
+    rows = await db.execute(q)
+    labels = [r[0] for r in rows.all()]
+    total = len(labels)
+    counter = Counter(labels)
+
+    return SentimentDistributionResponse(
+        keyword_id=keyword_id,
+        keyword_text=keyword.keyword,
+        total_comments=total,
+        distribution=[
+            SentimentDistributionItem(
+                label=lbl,
+                count=counter.get(lbl, 0),
+                percentage=round(counter.get(lbl, 0) / total * 100, 2) if total else 0.0,
+            )
+            for lbl in ["positif", "negatif", "netral"]
+        ],
+    )
+
+
+async def get_sentiment_table(
+    db: AsyncSession,
+    keyword_id: uuid.UUID,
+    label_filter: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    hour: int | None = None,
+) -> SentimentTableResponse:
+    keyword = await db.get(Keyword, keyword_id)
+    if not keyword:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError("Keyword", str(keyword_id))
+
+    base = (
+        select(LexiconAnalysis, Comment, Post)
+        .join(Comment, LexiconAnalysis.comment_id == Comment.id)
+        .join(Post, Comment.post_id == Post.id)
+        .where(LexiconAnalysis.keyword_id == keyword_id)
+    )
+    if label_filter:
+        base = base.where(LexiconAnalysis.label == label_filter)
+    base = _apply_date_filter(base, LexiconAnalysis.created_at, date_from, date_to, hour)
+
+    count_q = select(func.count()).select_from(base.subquery())
+    total = (await db.scalar(count_q)) or 0
+
+    rows_result = await db.execute(base.offset(offset).limit(limit))
+    rows = [
+        SentimentTableRow(
+            comment_id=comment.id,
+            comment_text=comment.content,
+            author=comment.author,
+            video_url=post.url,
+            matched_positive=analysis.matched_positive or [],
+            matched_negative=analysis.matched_negative or [],
+            removed_stopwords=analysis.removed_stopwords or [],
+            score=analysis.score,
+            label=analysis.label,
+            analyzed_at=analysis.created_at,
+        )
+        for analysis, comment, post in rows_result.all()
+    ]
+
+    return SentimentTableResponse(
+        keyword_id=keyword_id,
+        keyword_text=keyword.keyword,
+        total=total,
+        rows=rows,
+    )
+
+
+async def get_wordcloud_data(
+    db: AsyncSession,
+    keyword_id: uuid.UUID,
+    sentiment_filter: str | None = None,
+    top_n: int = 100,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> WordCloudResponse:
+    q = select(Comment.content).join(
+        LexiconAnalysis, LexiconAnalysis.comment_id == Comment.id
+    ).where(LexiconAnalysis.keyword_id == keyword_id)
+
+    if sentiment_filter:
+        q = q.where(LexiconAnalysis.label == sentiment_filter)
+    q = _apply_date_filter(q, LexiconAnalysis.created_at, date_from, date_to)
+
+    result = await db.scalars(q)
+    from app.ai.lexicon.service import _stopwords, _tokenize
+
+    stop_set = _stopwords()
+    word_counter: Counter = Counter()
+
+    for text in result.all():
+        if not text:
+            continue
+        for token in _tokenize(text):
+            if token not in stop_set and len(token) > 2:
+                word_counter[token] += 1
+
+    return WordCloudResponse(
+        keyword_id=keyword_id,
+        sentiment_filter=sentiment_filter,
+        words=[WordCloudItem(word=w, count=c) for w, c in word_counter.most_common(top_n)],
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DASHBOARD SUMMARY
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_dashboard_summary(
+    db: AsyncSession,
+    project_id: uuid.UUID | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> DashboardResponse:
+    """
+    Agregasi lengkap untuk dashboard:
+      - total trending, keyword, video, komentar, analisis
+      - distribusi sentimen global
+      - per-keyword sentiment summary
+      - recent trending topics
+    """
+    today = date.today()
+    filter_date_from = date_from or today
+    filter_date_to = date_to or today
+
+    # ── 1. Summary counts ─────────────────────────────────────────────────────
+    trending_q = select(func.count(TrendingTopic.id))
+    trending_q = _apply_date_filter(trending_q, TrendingTopic.fetched_at, filter_date_from, filter_date_to)
+    total_trending_today = (await db.scalar(trending_q)) or 0
+
+    kw_q = select(func.count(Keyword.id))
+    if project_id:
+        kw_q = kw_q.where(Keyword.project_id == project_id)
+    total_keywords = (await db.scalar(kw_q)) or 0
+
+    post_q = select(func.count(Post.id)).where(Post.platform == "youtube")
+    if project_id:
+        post_q = post_q.join(Keyword, Post.keyword_id == Keyword.id).where(
+            Keyword.project_id == project_id
+        )
+    total_videos = (await db.scalar(post_q)) or 0
+
+    comment_q = select(func.count(Comment.id)).join(
+        Post, Comment.post_id == Post.id
+    ).where(Post.platform == "youtube")
+    if project_id:
+        comment_q = comment_q.join(Keyword, Post.keyword_id == Keyword.id).where(
+            Keyword.project_id == project_id
+        )
+    total_comments = (await db.scalar(comment_q)) or 0
+
+    analyzed_q = select(func.count(LexiconAnalysis.id))
+    if project_id:
+        analyzed_q = analyzed_q.join(
+            Keyword, LexiconAnalysis.keyword_id == Keyword.id
+        ).where(Keyword.project_id == project_id)
+    total_analyzed = (await db.scalar(analyzed_q)) or 0
+
+    # ── 2. Global sentiment distribution ─────────────────────────────────────
+    label_q = select(LexiconAnalysis.label)
+    if project_id:
+        label_q = label_q.join(
+            Keyword, LexiconAnalysis.keyword_id == Keyword.id
+        ).where(Keyword.project_id == project_id)
+
+    label_rows = await db.scalars(label_q)
+    label_counter = Counter(label_rows.all())
+    label_total = sum(label_counter.values())
+
+    sentiment_overview = [
+        SentimentDistributionItem(
+            label=lbl,
+            count=label_counter.get(lbl, 0),
+            percentage=round(label_counter.get(lbl, 0) / label_total * 100, 2) if label_total else 0.0,
+        )
+        for lbl in ["positif", "negatif", "netral"]
+    ]
+
+    # ── 3. Per-keyword sentiment summary ─────────────────────────────────────
+    kw_list_q = select(Keyword)
+    if project_id:
+        kw_list_q = kw_list_q.where(Keyword.project_id == project_id)
+    kw_list_q = kw_list_q.order_by(Keyword.created_at.desc()).limit(20)
+
+    keywords = list((await db.scalars(kw_list_q)).all())
+
+    kw_summaries: list[KeywordSentimentSummary] = []
+    for kw in keywords:
+        kw_labels = await db.scalars(
+            select(LexiconAnalysis.label).where(LexiconAnalysis.keyword_id == kw.id)
+        )
+        kw_counter = Counter(kw_labels.all())
+        kw_total = sum(kw_counter.values())
+
+        vid_count = (await db.scalar(
+            select(func.count(Post.id)).where(
+                Post.keyword_id == kw.id, Post.platform == "youtube"
+            )
+        )) or 0
+
+        kw_summaries.append(KeywordSentimentSummary(
+            keyword_id=kw.id,
+            keyword_text=kw.keyword,
+            total_videos=vid_count,
+            total_comments=kw_total,
+            positif=kw_counter.get("positif", 0),
+            negatif=kw_counter.get("negatif", 0),
+            netral=kw_counter.get("netral", 0),
+            dominant_sentiment=kw_counter.most_common(1)[0][0] if kw_counter else "netral",
+        ))
+
+    # ── 4. Recent trending ────────────────────────────────────────────────────
+    recent_trending = list((await db.scalars(
+        select(TrendingTopic)
+        .order_by(TrendingTopic.fetched_at.desc())
+        .limit(10)
+    )).all())
+
+    return DashboardResponse(
+        summary=DashboardSummary(
+            total_trending_today=total_trending_today,
+            total_keywords=total_keywords,
+            total_videos=total_videos,
+            total_comments=total_comments,
+            total_analyzed=total_analyzed,
+            last_updated=datetime.now(timezone.utc),
+        ),
+        sentiment_overview=sentiment_overview,
+        keyword_summaries=kw_summaries,
+        recent_trending=[
+            TrendingItemResponse(
+                rank=t.rank,
+                title=t.title,
+                traffic=t.traffic or "",
+                description=t.description or "",
+                published_at=t.published_at,
+            )
+            for t in recent_trending
+        ],
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PIPELINE STATUS PER KEYWORD
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_keyword_pipeline_status(
+    db: AsyncSession,
+    keyword_id: uuid.UUID,
+) -> KeywordPipelineStatus:
+    """Progress pipeline untuk satu keyword: videos → comments → analyzed."""
+    keyword = await db.get(Keyword, keyword_id)
+    if not keyword:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError("Keyword", str(keyword_id))
+
+    total_videos = (await db.scalar(
+        select(func.count(Post.id)).where(
+            Post.keyword_id == keyword_id, Post.platform == "youtube"
+        )
+    )) or 0
+
+    total_comments = (await db.scalar(
+        select(func.count(Comment.id))
+        .join(Post, Comment.post_id == Post.id)
+        .where(Post.keyword_id == keyword_id)
+    )) or 0
+
+    total_analyzed = (await db.scalar(
+        select(func.count(LexiconAnalysis.id)).where(
+            LexiconAnalysis.keyword_id == keyword_id
+        )
+    )) or 0
+
+    label_rows = await db.scalars(
+        select(LexiconAnalysis.label).where(LexiconAnalysis.keyword_id == keyword_id)
+    )
+    counter = Counter(label_rows.all())
+
+    return KeywordPipelineStatus(
+        keyword_id=keyword_id,
+        keyword_text=keyword.keyword,
+        is_active=keyword.is_active,
+        total_videos=total_videos,
+        total_comments=total_comments,
+        total_analyzed=total_analyzed,
+        coverage_pct=round(total_analyzed / total_comments * 100, 1) if total_comments else 0.0,
+        positif=counter.get("positif", 0),
+        negatif=counter.get("negatif", 0),
+        netral=counter.get("netral", 0),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _apply_date_filter(query, col, date_from: date | None, date_to: date | None, hour: int | None = None):
+    """Terapkan filter tanggal/jam ke query. Data tidak pernah dihapus — gunakan filter ini."""
+    if date_from:
+        query = query.where(col >= datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc))
+    if date_to:
+        end = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59, tzinfo=timezone.utc)
+        query = query.where(col <= end)
+    if hour is not None:
+        query = query.where(extract("hour", col) == hour)
+    return query
+
+
+def _get_comment_id(c: dict) -> str:
+    props = c.get("properties") or {}
+    return props.get("commentId") or c.get("commentId") or c.get("id") or ""
+
+
+def _get_comment_text(c: dict) -> str | None:
+    props = c.get("properties") or {}
+    content = props.get("content") or {}
+    if isinstance(content, dict):
+        text = content.get("content") or "".join(
+            r.get("text", "") for r in content.get("runs", [])
+        )
+        if text:
+            return text
+    return props.get("text") or c.get("text") or None
+
+
+def _get_comment_author(c: dict) -> str | None:
+    author = c.get("author") or {}
+    return author.get("displayName") or author.get("channelId") or None
+
+
+def _parse_count(raw: str) -> int:
+    """Parse '260K' → 260000, '1.2M' → 1200000, '123' → 123."""
+    if not raw:
+        return 0
+    raw = str(raw).strip().replace(",", "")
+    try:
+        if raw.endswith("K"):
+            return int(float(raw[:-1]) * 1_000)
+        if raw.endswith("M"):
+            return int(float(raw[:-1]) * 1_000_000)
+        return int(float(raw))
+    except (ValueError, AttributeError):
+        return 0
