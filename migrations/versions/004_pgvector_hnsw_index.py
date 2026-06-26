@@ -28,8 +28,9 @@ def upgrade() -> None:
     # HNSW index untuk posts.embedding — dipakai semantic search di SearchAgent
     # m=16, ef_construction=64 adalah nilai default yang seimbang antara
     # build speed vs query recall (~98% recall pada dataset umum)
+    # Note: tidak pakai CONCURRENTLY agar bisa jalan di dalam transaction Alembic
     op.execute("""
-        CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_posts_embedding_hnsw
+        CREATE INDEX IF NOT EXISTS ix_posts_embedding_hnsw
         ON posts
         USING hnsw (embedding vector_cosine_ops)
         WITH (m = 16, ef_construction = 64)
@@ -37,7 +38,7 @@ def upgrade() -> None:
 
     # HNSW index untuk comments.embedding
     op.execute("""
-        CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_comments_embedding_hnsw
+        CREATE INDEX IF NOT EXISTS ix_comments_embedding_hnsw
         ON comments
         USING hnsw (embedding vector_cosine_ops)
         WITH (m = 16, ef_construction = 64)
