@@ -635,14 +635,30 @@ async def smart_search_youtube(
         kw = existing_kw
     else:
         # ── 2. Keyword baru → buat record ─────────────────────────────────────
+        from app.domain.projects.models import Project as ProjectModel
+        from app.domain.users.models import User as UserModel
+
         project_id = await db.scalar(
             select(Project.id).where(Project.is_active == True).limit(1)  # noqa: E712
         )
         if not project_id:
-            return {
-                "status": "error",
-                "message": "Tidak ada project aktif. Buat project dulu via API /api/v1/projects.",
-            }
+            # Auto-buat project default jika belum ada
+            first_user = await db.scalar(select(UserModel.id).limit(1))
+            if not first_user:
+                return {
+                    "status": "error",
+                    "message": "Tidak ada user di database. Daftar dulu via /api/v1/auth/register.",
+                }
+            default_project = ProjectModel(
+                user_id=first_user,
+                name="Default Project",
+                description="Auto-created project untuk YouTube Intelligence",
+                is_active=True,
+            )
+            db.add(default_project)
+            await db.flush()
+            project_id = default_project.id
+            await db.commit()
 
         kw = Keyword(project_id=project_id, keyword=q_clean, is_active=True)
         db.add(kw)
