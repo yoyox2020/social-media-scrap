@@ -1,19 +1,8 @@
 """
 Universal Topic-Based Search API.
 
-Mencari data berdasarkan kombinasi topik dan kata kunci,
-dikelompokkan per topik. Berlaku untuk semua platform (YouTube, TikTok, Instagram, News).
-
-Contoh pemanggilan:
-    POST /api/v1/search/topics
-    {
-        "topics": [
-            {"name": "jawa timur", "keywords": ["polisi ditembak preman", "kasus suap bupati surabaya"]},
-            {"name": "jawa tengah", "keywords": ["hamengkubuwono", "ojon jogja"]}
-        ],
-        "platforms": ["youtube"],
-        "auto_crawl": true
-    }
+Topik dan keyword-nya disimpan ke DB sehingga bisa ditampilkan di dashboard.
+Setiap topik bisa punya banyak keyword, dan satu keyword bisa masuk banyak topik.
 """
 
 import uuid
@@ -21,11 +10,12 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.keywords.models import Keyword
 from app.domain.posts.models import Post
+from app.domain.search_topics.models import SearchTopic, SearchTopicKeyword
 from app.domain.users.models import User
 from app.infrastructure.database.connection import get_db
 from app.infrastructure.logging.logger import get_logger
@@ -41,18 +31,20 @@ logger = get_logger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TopicItem(BaseModel):
-    name: str = Field(..., description="Nama topik / lokasi, contoh: 'jawa timur'")
+    name: str = Field(..., description="Nama topik, contoh: 'jawa timur'")
     keywords: list[str] = Field(..., min_length=1, description="Kata kunci terkait topik ini")
+    description: str | None = Field(default=None)
 
 
 class TopicSearchRequest(BaseModel):
-    topics: list[TopicItem] = Field(..., min_length=1, description="Daftar topik beserta kata kuncinya")
+    topics: list[TopicItem] = Field(..., min_length=1)
     platforms: list[str] = Field(default=["youtube"], description="Platform: youtube, tiktok, instagram, news")
-    limit_per_keyword: int = Field(default=10, ge=1, le=100, description="Maks hasil per kata kunci")
-    include_sentiment: bool = Field(default=True, description="Sertakan ringkasan sentimen")
-    include_comments: bool = Field(default=False, description="Sertakan sample komentar")
-    auto_crawl: bool = Field(default=True, description="Crawl otomatis jika data belum ada di DB")
-    scheduled_hour: int | None = Field(default=None, ge=0, le=23, description="Jam crawl harian otomatis (WIB) jika auto_crawl=true dan data kosong")
+    limit_per_keyword: int = Field(default=10, ge=1, le=100)
+    include_sentiment: bool = Field(default=True)
+    include_comments: bool = Field(default=False)
+    auto_crawl: bool = Field(default=True, description="Crawl otomatis jika data belum ada")
+    scheduled_hour: int | None = Field(default=None, ge=0, le=23, description="Jam crawl harian otomatis (0-23)")
+    save_topic: bool = Field(default=True, description="Simpan konfigurasi topik ke DB untuk dashboard")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,43 +52,27 @@ class TopicSearchRequest(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _find_keyword(db: AsyncSession, q: str) -> Keyword | None:
-    """Cari keyword di DB: exact → LIKE → all-words."""
     q_clean = q.strip().lower()
-
     kw = await db.scalar(select(Keyword).where(func.lower(Keyword.keyword) == q_clean).limit(1))
     if kw:
         return kw
-
     kw = await db.scalar(select(Keyword).where(func.lower(Keyword.keyword).like(f"%{q_clean}%")).limit(1))
     if kw:
         return kw
-
     words = q_clean.split()
     if len(words) > 1:
         from sqlalchemy import and_
         conditions = [func.lower(Keyword.keyword).contains(w) for w in words]
         kw = await db.scalar(select(Keyword).where(and_(*conditions)).limit(1))
-
     return kw
 
 
-async def _get_posts(
-    db: AsyncSession,
-    keyword_id: uuid.UUID,
-    platforms: list[str],
-    limit: int,
-) -> list[dict]:
-    """Ambil posts dari DB untuk keyword tertentu."""
+async def _get_posts(db: AsyncSession, keyword_id: uuid.UUID, platforms: list[str], limit: int) -> list[dict]:
     filters = [Post.keyword_id == keyword_id]
     if platforms:
         filters.append(Post.platform.in_(platforms))
-
-    from sqlalchemy import cast, BigInteger
     rows = (await db.scalars(
-        select(Post)
-        .where(*filters)
-        .order_by(Post.collected_at.desc())
-        .limit(limit)
+        select(Post).where(*filters).order_by(Post.collected_at.desc()).limit(limit)
     )).all()
 
     results = []
@@ -107,7 +83,6 @@ async def _get_posts(
             view_count = int(str(raw_views).replace(",", "").split()[0]) if raw_views else 0
         except (ValueError, IndexError):
             view_count = 0
-
         results.append({
             "id": str(p.id),
             "platform": p.platform,
@@ -119,13 +94,10 @@ async def _get_posts(
             "collected_at": p.collected_at.isoformat() if p.collected_at else None,
             "thumbnail_url": meta.get("thumbnail", meta.get("thumbnail_url", "")),
         })
-
     return results
 
 
 async def _get_sentiment_summary(db: AsyncSession, keyword_id: uuid.UUID) -> dict:
-    """Hitung ringkasan sentimen untuk keyword."""
-    from sqlalchemy import case
     from app.domain.youtube_analysis.models import LexiconAnalysis
     from app.domain.comments.models import Comment
 
@@ -136,14 +108,12 @@ async def _get_sentiment_summary(db: AsyncSession, keyword_id: uuid.UUID) -> dic
         .where(Post.keyword_id == keyword_id)
         .group_by(LexiconAnalysis.label)
     )
-
     summary = {"positif": 0, "negatif": 0, "netral": 0}
     total = 0
     for label, count in rows.all():
         if label in summary:
             summary[label] = count
             total += count
-
     if total > 0:
         dominant = max(summary, key=summary.get)
         return {
@@ -156,53 +126,21 @@ async def _get_sentiment_summary(db: AsyncSession, keyword_id: uuid.UUID) -> dic
     return {"total_analyzed": 0}
 
 
-async def _get_sample_comments(db: AsyncSession, keyword_id: uuid.UUID, limit: int = 5) -> list[dict]:
-    """Ambil sample komentar untuk keyword."""
-    from app.domain.comments.models import Comment
-
-    rows = (await db.scalars(
-        select(Comment)
-        .join(Post, Comment.post_id == Post.id)
-        .where(Post.keyword_id == keyword_id)
-        .order_by(Comment.published_at.desc().nullslast())
-        .limit(limit)
-    )).all()
-
-    return [
-        {
-            "author": c.author,
-            "content": c.content,
-            "published_at": c.published_at.isoformat() if c.published_at else None,
-        }
-        for c in rows
-    ]
-
-
 async def _queue_crawl(db: AsyncSession, keyword_text: str, platforms: list[str]) -> dict:
-    """Buat keyword di DB dan queue crawl via Celery."""
     from app.domain.projects.models import Project
-
-    # Ambil project pertama
     project = await db.scalar(select(Project).limit(1))
     if not project:
         return {"status": "error", "message": "Tidak ada project di DB"}
 
-    # Buat keyword jika belum ada
     kw = Keyword(project_id=project.id, keyword=keyword_text, is_active=True)
     db.add(kw)
     await db.flush()
     await db.refresh(kw)
 
-    # Queue Celery task untuk YouTube
     if "youtube" in platforms:
         from app.workers.youtube_worker import collect_youtube_pipeline_task
         collect_youtube_pipeline_task.apply_async(
-            kwargs={
-                "keyword_id": str(kw.id),
-                "max_pages": 2,
-                "max_comment_pages": 2,
-                "max_comments_per_video": 50,
-            },
+            kwargs={"keyword_id": str(kw.id), "max_pages": 2, "max_comment_pages": 2, "max_comments_per_video": 50},
             queue="default",
         )
 
@@ -214,22 +152,55 @@ async def _queue_crawl(db: AsyncSession, keyword_text: str, platforms: list[str]
     }
 
 
-def _add_scheduled_crawl(keyword_text: str, hour: int, platforms: list[str]):
-    """Tambah jadwal crawl harian via Celery beat (dynamic schedule)."""
-    from app.workers.celery_app import celery_app
+async def _save_topic(
+    db: AsyncSession,
+    topic_name: str,
+    description: str | None,
+    keyword_objects: list[tuple[str, Keyword]],
+    platforms: list[str],
+    scheduled_hour: int | None,
+    auto_crawl: bool,
+) -> SearchTopic:
+    """Simpan atau update topik ke DB. Jika nama sudah ada, update keyword-nya."""
+    from sqlalchemy.orm import selectinload
+    existing = await db.scalar(
+        select(SearchTopic)
+        .options(selectinload(SearchTopic.topic_keywords))
+        .where(func.lower(SearchTopic.name) == topic_name.strip().lower()).limit(1)
+    )
 
-    task_name = f"scheduled-topic-{keyword_text.replace(' ', '-')[:40]}"
-    celery_app.conf.beat_schedule[task_name] = {
-        "task": "workers.youtube.run_pipeline",
-        "schedule": __import__("celery.schedules", fromlist=["crontab"]).crontab(hour=hour, minute=0),
-        "kwargs": {"keyword_text": keyword_text},
-        "options": {"queue": "default"},
-    }
-    logger.info("scheduled_crawl_added", keyword=keyword_text, hour=hour)
+    if existing:
+        # Update platforms dan scheduled_hour jika berubah
+        existing.platforms = platforms
+        existing.scheduled_hour = scheduled_hour
+        existing.auto_crawl = auto_crawl
+        existing.updated_at = datetime.now(timezone.utc)
+        topic = existing
+    else:
+        topic = SearchTopic(
+            name=topic_name.strip().title(),
+            description=description,
+            platforms=platforms,
+            scheduled_hour=scheduled_hour,
+            auto_crawl=auto_crawl,
+        )
+        db.add(topic)
+        await db.flush()
+
+    # Ambil keyword_id yang sudah terhubung
+    existing_kw_ids = {stk.keyword_id for stk in topic.topic_keywords}
+
+    # Tambah keyword baru yang belum terhubung
+    for kw_text, kw_obj in keyword_objects:
+        if kw_obj and kw_obj.id not in existing_kw_ids:
+            link = SearchTopicKeyword(topic_id=topic.id, keyword_id=kw_obj.id, keyword_text=kw_text)
+            db.add(link)
+
+    return topic
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENDPOINT UTAMA
+# ENDPOINT: Cari + Simpan Topik
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/topics", response_model=dict)
@@ -240,31 +211,15 @@ async def search_by_topics(
 ):
     """
     Cari data berdasarkan topik + kata kunci, dikelompokkan per topik.
+    Jika `save_topic=true` (default), topik dan keyword-nya disimpan ke DB untuk dashboard.
 
     **Alur:**
-    - Untuk setiap topik → cari setiap kata kunci di DB (LIKE match)
-    - Jika ditemukan → kembalikan posts + sentimen + komentar (opsional)
-    - Jika tidak ditemukan + `auto_crawl=true` → buat keyword + queue crawl otomatis
-    - Jika `scheduled_hour` diisi → tambah jadwal crawl harian
-
-    **Platform yang didukung:**
-    - `youtube` — sudah aktif
-    - `tiktok`, `instagram`, `news` — akan aktif saat connector tersedia
-
-    **Contoh request:**
-    ```json
-    {
-        "topics": [
-            {"name": "jawa timur", "keywords": ["polisi ditembak preman", "kasus suap bupati"]},
-            {"name": "jawa tengah", "keywords": ["hamengkubuwono", "ojon jogja"]}
-        ],
-        "platforms": ["youtube"],
-        "auto_crawl": true,
-        "include_sentiment": true
-    }
-    ```
+    - Cari setiap keyword di DB (LIKE match)
+    - Jika ada data → kembalikan posts + sentimen
+    - Jika belum ada + auto_crawl=true → buat keyword + crawl otomatis
+    - Topik disimpan ke DB → tampil di `GET /search/topics/list`
     """
-    logger.info("topic_search_start", topics=[t.name for t in body.topics], user=str(current_user.id))
+    logger.info("topic_search", topics=[t.name for t in body.topics], user=str(current_user.id))
 
     topic_results = []
     crawling_keywords = []
@@ -272,153 +227,237 @@ async def search_by_topics(
     for topic in body.topics:
         keyword_results = []
         topic_total_posts = 0
+        keyword_objects: list[tuple[str, Keyword | None]] = []
 
         for kw_text in topic.keywords:
-            # Cari keyword di DB
             keyword = await _find_keyword(db, kw_text)
+            kw_result: dict = {
+                "keyword": kw_text,
+                "keyword_id": str(keyword.id) if keyword else None,
+                "status": "not_found",
+                "total": 0,
+                "posts": [],
+            }
 
             if keyword:
-                # Ambil posts
                 posts = await _get_posts(db, keyword.id, body.platforms, body.limit_per_keyword)
                 total = len(posts)
                 topic_total_posts += total
-
-                kw_result: dict = {
-                    "keyword": kw_text,
-                    "keyword_id": str(keyword.id),
-                    "status": "found" if total > 0 else "empty",
-                    "total": total,
-                    "platforms": body.platforms,
-                    "posts": posts,
-                }
+                kw_result.update({"status": "found" if total > 0 else "empty", "total": total, "posts": posts})
 
                 if body.include_sentiment and total > 0:
                     kw_result["sentiment"] = await _get_sentiment_summary(db, keyword.id)
-
-                if body.include_comments and total > 0:
-                    kw_result["sample_comments"] = await _get_sample_comments(db, keyword.id)
 
                 if total == 0 and body.auto_crawl:
                     crawl_info = await _queue_crawl(db, kw_text, body.platforms)
                     kw_result["crawl"] = crawl_info
                     crawling_keywords.append(kw_text)
+                    # Refresh keyword object setelah crawl buat keyword baru
+                    keyword = await _find_keyword(db, kw_text)
 
             else:
-                # Keyword tidak ada di DB sama sekali
-                kw_result = {
-                    "keyword": kw_text,
-                    "keyword_id": None,
-                    "status": "not_found",
-                    "total": 0,
-                    "platforms": body.platforms,
-                    "posts": [],
-                }
-
                 if body.auto_crawl:
                     crawl_info = await _queue_crawl(db, kw_text, body.platforms)
-                    kw_result["crawl"] = crawl_info
-                    kw_result["status"] = "crawling"
+                    kw_result.update({"status": "crawling", "crawl": crawl_info})
                     crawling_keywords.append(kw_text)
+                    keyword = await _find_keyword(db, kw_text)
 
-                    if body.scheduled_hour is not None:
-                        _add_scheduled_crawl(kw_text, body.scheduled_hour, body.platforms)
-
+            keyword_objects.append((kw_text, keyword))
             keyword_results.append(kw_result)
 
+        # Simpan topik ke DB
+        if body.save_topic:
+            saved_topic = await _save_topic(
+                db=db,
+                topic_name=topic.name,
+                description=topic.description,
+                keyword_objects=keyword_objects,
+                platforms=body.platforms,
+                scheduled_hour=body.scheduled_hour,
+                auto_crawl=body.auto_crawl,
+            )
+            topic_id = str(saved_topic.id)
+        else:
+            topic_id = None
+
         topic_results.append({
-            "topic": topic.name,
-            "keywords_searched": topic.keywords,
+            "topic_id": topic_id,
+            "topic": topic.name.title(),
+            "keywords": topic.keywords,
             "total_posts": topic_total_posts,
-            "keyword_details": keyword_results,
+            "status_per_keyword": {kd["keyword"]: kd["status"] for kd in keyword_results},
+            "sentiment_per_keyword": {
+                kd["keyword"]: kd.get("sentiment")
+                for kd in keyword_results if kd.get("sentiment")
+            },
+            "results": [p for kd in keyword_results for p in kd.get("posts", [])],
+            "crawling": [kd["keyword"] for kd in keyword_results if kd["status"] in ("crawling",)],
         })
 
     await db.commit()
 
-    # Format output terstruktur per topik
-    formatted = []
-    for t in topic_results:
-        posts_all = []
-        for kd in t["keyword_details"]:
-            for p in kd.get("posts", []):
-                p["_keyword"] = kd["keyword"]
-                posts_all.append(p)
-
-        formatted.append({
-            "topic": t["topic"].title(),
-            "total_posts": t["total_posts"],
-            "keywords": t["keywords_searched"],
-            "status_per_keyword": {
-                kd["keyword"]: kd["status"] for kd in t["keyword_details"]
-            },
-            "sentiment_per_keyword": {
-                kd["keyword"]: kd.get("sentiment")
-                for kd in t["keyword_details"]
-                if kd.get("sentiment")
-            },
-            "results": posts_all,
-            "crawling": [
-                kd["keyword"] for kd in t["keyword_details"]
-                if kd["status"] in ("crawling", "not_found") and body.auto_crawl
-            ],
-        })
-
-    summary_status = "ready"
+    overall = "ready"
     if crawling_keywords:
-        summary_status = "partial" if any(t["total_posts"] > 0 for t in topic_results) else "crawling"
-
-    logger.info("topic_search_done", topics=[t["topic"] for t in topic_results], crawling=crawling_keywords)
+        overall = "partial" if any(t["total_posts"] > 0 for t in topic_results) else "crawling"
 
     return build_success_response({
-        "status": summary_status,
+        "status": overall,
         "platforms": body.platforms,
         "total_topics": len(topic_results),
         "crawling_keywords": crawling_keywords,
-        "note": "Keyword dengan status 'crawling' sedang diproses di background. Panggil ulang dalam beberapa menit." if crawling_keywords else None,
-        "topics": formatted,
+        "note": "Keyword dengan status 'crawling' sedang diproses di background." if crawling_keywords else None,
+        "topics": topic_results,
     })
 
 
-@router.get("/topics", response_model=dict)
-async def get_topic_search(
-    topics: str = Query(..., description="Topik dipisah koma, contoh: jawa timur,jawa tengah"),
-    keywords: str = Query(..., description="Kata kunci per topik dipisah | antar topik dan , antar kata kunci. Contoh: polisi,suap|hamengku,jogja"),
-    platforms: str = Query(default="youtube", description="Platform dipisah koma: youtube,tiktok"),
-    limit: int = Query(default=10, ge=1, le=100),
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: List Semua Topik (Dashboard)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/topics/list", response_model=dict)
+async def list_saved_topics(
+    is_active: bool = Query(default=True, description="Filter topik aktif saja"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Daftar semua topik yang tersimpan di DB — untuk ditampilkan di dashboard.
+    Setiap topik menampilkan keyword-keyword yang terkait beserta statistik singkat.
+    """
+    from sqlalchemy.orm import selectinload
+    q = select(SearchTopic).options(selectinload(SearchTopic.topic_keywords))
+    if is_active:
+        q = q.where(SearchTopic.is_active == True)
+    q = q.order_by(SearchTopic.created_at.desc()).offset(offset).limit(limit)
+
+    topics = (await db.scalars(q)).all()
+    total_count = await db.scalar(select(func.count(SearchTopic.id)).where(SearchTopic.is_active == is_active))
+
+    items = []
+    for topic in topics:
+        # Hitung statistik per topik
+        keyword_ids = [stk.keyword_id for stk in topic.topic_keywords]
+
+        total_posts = 0
+        total_comments = 0
+        if keyword_ids:
+            total_posts = (await db.scalar(
+                select(func.count(Post.id)).where(
+                    Post.keyword_id.in_(keyword_ids),
+                    Post.platform.in_(topic.platforms),
+                )
+            )) or 0
+
+            from app.domain.comments.models import Comment
+            total_comments = (await db.scalar(
+                select(func.count(Comment.id))
+                .join(Post, Comment.post_id == Post.id)
+                .where(Post.keyword_id.in_(keyword_ids))
+            )) or 0
+
+        items.append({
+            "topic_id": str(topic.id),
+            "name": topic.name,
+            "description": topic.description,
+            "platforms": topic.platforms,
+            "keywords": [stk.keyword_text for stk in topic.topic_keywords],
+            "total_keywords": len(topic.topic_keywords),
+            "total_posts": total_posts,
+            "total_comments": total_comments,
+            "scheduled_hour": topic.scheduled_hour,
+            "auto_crawl": topic.auto_crawl,
+            "is_active": topic.is_active,
+            "created_at": topic.created_at.isoformat(),
+            "updated_at": topic.updated_at.isoformat(),
+        })
+
+    return build_success_response({
+        "total": total_count,
+        "offset": offset,
+        "items": items,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: Detail Satu Topik
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/topics/{topic_id}", response_model=dict)
+async def get_topic_detail(
+    topic_id: uuid.UUID,
+    limit_per_keyword: int = Query(default=10, ge=1, le=100),
     include_sentiment: bool = Query(default=True),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Versi GET dari topic search — untuk akses mudah via URL/browser.
-
-    Contoh:
-    ```
-    GET /api/v1/search/topics?topics=jawa timur,jawa tengah&keywords=polisi,suap|hamengku,jogja
-    ```
-
-    Format parameter `keywords`: pisah `|` antar topik, pisah `,` antar kata kunci dalam satu topik.
-    Urutan harus sesuai dengan urutan `topics`.
+    Detail satu topik: semua keyword + data posts + sentimen.
+    Dipanggil saat user klik topik di dashboard.
     """
-    topic_list = [t.strip() for t in topics.split(",") if t.strip()]
-    keyword_groups = [
-        [k.strip() for k in group.split(",") if k.strip()]
-        for group in keywords.split("|")
-    ]
-    platform_list = [p.strip() for p in platforms.split(",") if p.strip()]
-
-    # Pad keyword_groups jika kurang dari jumlah topik
-    while len(keyword_groups) < len(topic_list):
-        keyword_groups.append([topic_list[len(keyword_groups)]])
-
-    body = TopicSearchRequest(
-        topics=[
-            TopicItem(name=name, keywords=kws)
-            for name, kws in zip(topic_list, keyword_groups)
-        ],
-        platforms=platform_list,
-        limit_per_keyword=limit,
-        include_sentiment=include_sentiment,
-        auto_crawl=False,  # GET tidak auto-crawl
+    from sqlalchemy.orm import selectinload
+    topic = await db.scalar(
+        select(SearchTopic)
+        .options(selectinload(SearchTopic.topic_keywords))
+        .where(SearchTopic.id == topic_id)
     )
+    if not topic:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError(f"Topik {topic_id} tidak ditemukan")
 
-    return await search_by_topics(body, current_user, db)
+    keyword_details = []
+    for stk in topic.topic_keywords:
+        keyword = await db.scalar(select(Keyword).where(Keyword.id == stk.keyword_id))
+        if not keyword:
+            continue
+
+        posts = await _get_posts(db, keyword.id, topic.platforms, limit_per_keyword)
+        detail: dict = {
+            "keyword": stk.keyword_text,
+            "keyword_id": str(keyword.id),
+            "total_posts": len(posts),
+            "posts": posts,
+        }
+        if include_sentiment and posts:
+            detail["sentiment"] = await _get_sentiment_summary(db, keyword.id)
+
+        keyword_details.append(detail)
+
+    return build_success_response({
+        "topic_id": str(topic.id),
+        "name": topic.name,
+        "description": topic.description,
+        "platforms": topic.platforms,
+        "total_keywords": len(keyword_details),
+        "total_posts": sum(k["total_posts"] for k in keyword_details),
+        "keyword_details": keyword_details,
+        "scheduled_hour": topic.scheduled_hour,
+        "created_at": topic.created_at.isoformat(),
+        "updated_at": topic.updated_at.isoformat(),
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: Hapus / Nonaktifkan Topik
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.delete("/topics/{topic_id}", response_model=dict)
+async def delete_topic(
+    topic_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Nonaktifkan topik (soft delete — data tidak hilang)."""
+    topic = await db.scalar(
+        select(SearchTopic).where(SearchTopic.id == topic_id)
+    )
+    if not topic:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError(f"Topik {topic_id} tidak ditemukan")
+
+    topic.is_active = False
+    topic.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    return build_success_response({"message": f"Topik '{topic.name}' dinonaktifkan"})
