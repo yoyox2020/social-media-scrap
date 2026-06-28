@@ -72,6 +72,17 @@ async def search_youtube(
 
     videos = connector.extract_posts(raw)
 
+    from app.services.processing.normalizer import _parse_relative_time
+    import re as _re
+
+    def _parse_views(raw: str) -> int:
+        if not raw:
+            return 0
+        digits = _re.sub(r"[^\d]", "", raw)
+        return int(digits) if digits else 0
+
+    now_utc = datetime.now(timezone.utc)
+
     items = []
     for v in videos:
         video_id = v.get("videoId", "")
@@ -84,15 +95,16 @@ async def search_youtube(
         )
         channel = channel_runs[0].get("text", "") if channel_runs else ""
 
-        view_count = (
+        view_count_raw = (
             v.get("viewCountText", {}).get("simpleText", "")
             or v.get("viewCountText", {}).get("runs", [{}])[0].get("text", "")
         )
 
-        published = (
+        published_text = (
             v.get("publishedTimeText", {}).get("simpleText", "")
             or v.get("publishedTimeText", "")
         )
+        published_at = _parse_relative_time(published_text, reference=now_utc)
 
         duration = v.get("lengthText", {}).get("simpleText", "")
 
@@ -104,8 +116,9 @@ async def search_youtube(
             "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else "",
             "title": title,
             "channel": channel,
-            "view_count": view_count,
-            "published": published,
+            "view_count": _parse_views(view_count_raw),
+            "published_at": published_at.isoformat() if published_at else None,
+            "published_text": published_text,
             "duration": duration,
             "thumbnail_url": thumbnail,
         })
@@ -237,14 +250,20 @@ async def get_search_result(
     videos = []
     for p in posts:
         meta = p.metadata_ or {}
+        raw_views = meta.get("views", meta.get("view_count", 0))
+        try:
+            view_count = int(str(raw_views).replace(",", "").split()[0]) if raw_views else 0
+        except (ValueError, IndexError):
+            view_count = 0
         videos.append({
             "id": str(p.id),
             "video_id": p.external_id,
             "url": p.url or f"https://youtube.com/watch?v={p.external_id}",
             "title": p.content,
             "channel": p.author,
-            "view_count": meta.get("views", meta.get("view_count", 0)),
+            "view_count": view_count,
             "thumbnail_url": meta.get("thumbnail", meta.get("thumbnail_url", "")),
+            "published_at": p.published_at.isoformat() if p.published_at else None,
             "collected_at": p.collected_at.isoformat() if p.collected_at else None,
         })
 
