@@ -414,9 +414,10 @@ async def list_trending(
 @router.get("/videos", response_model=dict)
 async def list_videos(
     keyword_id: uuid.UUID | None = Query(default=None, description="Filter per keyword"),
-    date_from: date | None = Query(default=None, description="Filter dari tanggal collect (YYYY-MM-DD)"),
-    date_to: date | None = Query(default=None, description="Filter sampai tanggal collect"),
+    date_from: date | None = Query(default=None, description="Filter dari tanggal publish video (YYYY-MM-DD)"),
+    date_to: date | None = Query(default=None, description="Filter sampai tanggal publish video"),
     hour: int | None = Query(default=None, ge=0, le=23, description="Filter jam collect (UTC)"),
+    sort_by: str = Query(default="views", description="Urutan: views (terviral), newest (terbaru), oldest (terlama)"),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     current_user: User = Depends(get_current_user),
@@ -447,14 +448,20 @@ async def list_videos(
         filters.append("p.keyword_id = :keyword_id")
         params["keyword_id"] = str(keyword_id)
     if date_from:
-        filters.append("p.collected_at >= :date_from")
+        filters.append("p.published_at >= :date_from")
         params["date_from"] = datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc)
     if date_to:
         params["date_to"] = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59, tzinfo=timezone.utc)
-        filters.append("p.collected_at <= :date_to")
+        filters.append("p.published_at <= :date_to")
     if hour is not None:
         filters.append("EXTRACT(hour FROM p.collected_at) = :hour")
         params["hour"] = hour
+
+    order_clause = {
+        "views":  "(p.metadata->>'views')::bigint DESC NULLS LAST",
+        "newest": "p.published_at DESC NULLS LAST",
+        "oldest": "p.published_at ASC NULLS LAST",
+    }.get(sort_by, "(p.metadata->>'views')::bigint DESC NULLS LAST")
 
     where_clause = " AND ".join(filters)
     sql = text(f"""
@@ -472,7 +479,7 @@ async def list_videos(
         FROM posts p
         LEFT JOIN keywords k ON p.keyword_id = k.id
         WHERE {where_clause}
-        ORDER BY p.collected_at DESC
+        ORDER BY {order_clause}
         OFFSET :offset LIMIT :limit
     """)
 
@@ -507,6 +514,68 @@ async def list_videos(
         "total": len(items),
         "offset": offset,
         "note": "url berisi link YouTube. File video tidak disimpan di server.",
+        "items": items,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOP VIRAL VIDEOS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/videos/viral", response_model=dict)
+async def viral_videos(
+    limit: int = Query(default=20, ge=1, le=100, description="Jumlah video teratas"),
+    keyword_id: uuid.UUID | None = Query(default=None, description="Filter per keyword (opsional)"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Top N video YouTube dengan views terbanyak dari semua data yang tersimpan di DB.
+    Default menampilkan 20 video paling viral lintas semua keyword.
+    """
+    from sqlalchemy import text
+
+    filters = ["p.platform = 'youtube'", "p.metadata->>'views' IS NOT NULL"]
+    params: dict = {"limit": limit}
+
+    if keyword_id:
+        filters.append("p.keyword_id = :keyword_id")
+        params["keyword_id"] = str(keyword_id)
+
+    where_clause = " AND ".join(filters)
+    sql = text(f"""
+        SELECT
+            p.id, p.external_id, p.content, p.author, p.url,
+            p.published_at, p.metadata, k.keyword,
+            (p.metadata->>'views')::bigint AS view_count
+        FROM posts p
+        LEFT JOIN keywords k ON p.keyword_id = k.id
+        WHERE {where_clause}
+        ORDER BY (p.metadata->>'views')::bigint DESC NULLS LAST
+        LIMIT :limit
+    """)
+
+    rows = (await db.execute(sql, params)).mappings().all()
+
+    items = [
+        {
+            "rank": i + 1,
+            "video_id": r["external_id"],
+            "url": r["url"] or f"https://youtube.com/watch?v={r['external_id']}",
+            "title": r["content"],
+            "channel": r["author"],
+            "view_count": r["view_count"] or 0,
+            "thumbnail_url": (r["metadata"] or {}).get("thumbnail", ""),
+            "duration": (r["metadata"] or {}).get("duration", ""),
+            "published_at": r["published_at"].isoformat() if r["published_at"] else None,
+            "keyword": r["keyword"],
+        }
+        for i, r in enumerate(rows)
+    ]
+
+    return build_success_response({
+        "total": len(items),
+        "note": "Diurutkan berdasarkan view count tertinggi dari semua data di DB",
         "items": items,
     })
 
