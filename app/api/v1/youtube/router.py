@@ -180,11 +180,27 @@ async def get_search_result(
     """
     from collections import Counter as _Counter
 
+    q_clean = q.strip().lower()
+    # Cari: exact match dulu, lalu stored keyword yang mengandung query, lalu query yang mengandung stored keyword
     keyword = await db.scalar(
         select(Keyword).where(
-            func.lower(Keyword.keyword) == q.strip().lower()
+            func.lower(Keyword.keyword) == q_clean
         ).limit(1)
     )
+    if not keyword:
+        keyword = await db.scalar(
+            select(Keyword).where(
+                func.lower(Keyword.keyword).like(f"%{q_clean}%")
+            ).limit(1)
+        )
+    if not keyword:
+        # Cari keyword yang kata-katanya semua ada dalam query
+        words = q_clean.split()
+        from sqlalchemy import and_
+        conditions = [func.lower(Keyword.keyword).contains(w) for w in words]
+        keyword = await db.scalar(
+            select(Keyword).where(and_(*conditions)).limit(1)
+        )
 
     if not keyword:
         return build_success_response({
