@@ -15,6 +15,7 @@ from app.api.v1 import (
     reports,
     search,
     sentiment,
+    topic_search,
     topics,
     trends,
 )
@@ -163,6 +164,7 @@ app.include_router(topics.router, prefix=API_PREFIX)
 app.include_router(entities.router, prefix=API_PREFIX)
 app.include_router(trends.router, prefix=API_PREFIX)
 app.include_router(search.router, prefix=API_PREFIX)
+app.include_router(topic_search.router, prefix=API_PREFIX)
 app.include_router(agents.router, prefix=API_PREFIX)
 app.include_router(reports.router, prefix=API_PREFIX)
 app.include_router(youtube_router, prefix=API_PREFIX)
