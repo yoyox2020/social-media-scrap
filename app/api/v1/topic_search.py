@@ -249,11 +249,22 @@ async def search_by_topics(
                     kw_result["sentiment"] = await _get_sentiment_summary(db, keyword.id)
 
                 if total == 0 and body.auto_crawl:
-                    crawl_info = await _queue_crawl(db, kw_text, body.platforms)
+                    # Keyword sudah ada, langsung queue crawl dengan ID yang existing
+                    if "youtube" in body.platforms:
+                        from app.workers.youtube_worker import collect_youtube_pipeline_task
+                        collect_youtube_pipeline_task.apply_async(
+                            kwargs={"keyword_id": str(keyword.id), "max_pages": 2, "max_comment_pages": 2, "max_comments_per_video": 50},
+                            queue="default",
+                        )
+                    crawl_info = {
+                        "status": "crawling",
+                        "keyword_id": str(keyword.id),
+                        "message": f"Keyword '{kw_text}' sudah ada, crawl dimulai di background",
+                        "poll_url": f"/api/v1/youtube/status?keyword_id={keyword.id}",
+                    }
                     kw_result["crawl"] = crawl_info
+                    kw_result["status"] = "crawling"
                     crawling_keywords.append(kw_text)
-                    # Refresh keyword object setelah crawl buat keyword baru
-                    keyword = await _find_keyword(db, kw_text)
 
             else:
                 if body.auto_crawl:
