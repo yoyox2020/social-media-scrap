@@ -181,7 +181,6 @@ async def _get_sample_comments(db: AsyncSession, keyword_id: uuid.UUID, limit: i
 async def _queue_crawl(db: AsyncSession, keyword_text: str, platforms: list[str]) -> dict:
     """Buat keyword di DB dan queue crawl via Celery."""
     from app.domain.projects.models import Project
-    from app.workers.youtube_worker import run_youtube_pipeline
 
     # Ambil project pertama
     project = await db.scalar(select(Project).limit(1))
@@ -196,7 +195,8 @@ async def _queue_crawl(db: AsyncSession, keyword_text: str, platforms: list[str]
 
     # Queue Celery task untuk YouTube
     if "youtube" in platforms:
-        run_youtube_pipeline.apply_async(
+        from app.workers.youtube_worker import collect_youtube_pipeline_task
+        collect_youtube_pipeline_task.apply_async(
             kwargs={
                 "keyword_id": str(kw.id),
                 "max_pages": 2,
