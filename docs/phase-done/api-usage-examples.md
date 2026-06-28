@@ -504,3 +504,23 @@ curl "http://localhost:8000/api/v1/youtube/wordcloud?keyword_id=$KEYWORD_ID&sent
 | EnsembleData limit habis | Error 495, coba lagi esok hari |
 | FIFA/video live | Komentar sering dinonaktifkan, 0 comment normal |
 | `published_at` komentar | Dihitung dari `published_time` (misal "2 years ago") relatif terhadap waktu dikumpulkan |
+
+
+1. Token Swagger — Tidak Hilang Saat Refresh
+Ditambah persistAuthorization: True di main.py:57. Cara pakainya:
+
+Buka http://localhost:8000/docs
+Klik tombol Authorize (kanan atas)
+Isi: Bearer eyJhbGci... (paste token dari login)
+Klik Authorize → Close
+Token tersimpan di localStorage browser — tidak hilang meski halaman di-refresh
+
+2. Contoh API Per Topik — api-by-topic.md
+Topik	Skenario
+Isu Sosial/Politik	Demo DPRD, banjir → cari sentimen publik, filter komentar per tanggal kejadian
+Brand/Artis	Tantri Kotak → sentimen penggemar, word cloud, perbandingan antar artis
+Kuliner/Produk	Nasi goreng, tongseng → komentar terbaru, crawl ulang dengan force_refresh
+Trending Real-time	Fetch Google Trends Indonesia → auto crawl → cek sentimen tiap topik
+Dashboard & Laporan	Ringkasan semua data sekaligus
+Filter Waktu	Komentar sebelum/sesudah event, komentar pukul prime time, video tahun tertentu
+Bonus: Cara buat API Key permanen (tidak expired, cocok untuk integrasi sistem lain).
