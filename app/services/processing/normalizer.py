@@ -4,11 +4,38 @@ Normalizer: konversi raw response EnsembleData → model Post.
 Setiap platform punya struktur JSON yang berbeda. Normalizer
 mengekstrak field yang relevan dan menyimpan raw_data secara utuh.
 """
+import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.domain.posts.models import Post
+
+
+def _parse_relative_time(text: str, reference: datetime | None = None) -> datetime | None:
+    """
+    Konversi relative time YouTube ('3 months ago', 'Streamed 1 year ago') → datetime UTC.
+    reference: titik waktu acuan (default: now). Untuk backfill, gunakan collected_at.
+    """
+    if not text:
+        return None
+    now = reference or datetime.now(timezone.utc)
+    t = text.strip().lower()
+
+    _UNITS = {
+        "second": lambda n: timedelta(seconds=n),
+        "minute": lambda n: timedelta(minutes=n),
+        "hour":   lambda n: timedelta(hours=n),
+        "day":    lambda n: timedelta(days=n),
+        "week":   lambda n: timedelta(weeks=n),
+        "month":  lambda n: timedelta(days=n * 30),
+        "year":   lambda n: timedelta(days=n * 365),
+    }
+    m = re.search(r"(\d+)\s+(second|minute|hour|day|week|month|year)", t)
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    return now - _UNITS[unit](n)
 
 
 def _utc_from_timestamp(ts: Any) -> datetime | None:
@@ -120,6 +147,7 @@ class YouTubeNormalizer:
         description = self._runs_to_text(desc_runs if isinstance(desc_runs, dict) else {})
 
         published_text = (item.get("publishedTimeText") or {}).get("simpleText", "")
+        collected = datetime.now(timezone.utc)
 
         return Post(
             id=uuid.uuid4(),
@@ -139,8 +167,8 @@ class YouTubeNormalizer:
                 "duration": (item.get("lengthText") or {}).get("simpleText", ""),
             },
             raw_data=item,
-            published_at=None,   # YouTube search hanya berikan "10 months ago", bukan ISO
-            collected_at=datetime.now(timezone.utc),
+            published_at=_parse_relative_time(published_text, reference=collected),
+            collected_at=collected,
         )
 
 
