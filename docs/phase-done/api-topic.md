@@ -126,16 +126,20 @@ User kirim POST dengan daftar topik + keyword
 │       │       - LIKE match:  "pendakwah oki" LIKE "%pendakwah oki setiana dewi%"
 │       │       - Word match:  semua kata dalam query ada di keyword tersimpan
 │       │
-│       ├── [2a] Keyword DITEMUKAN:
+│       ├── [2a] Keyword DITEMUKAN + video ada:
 │       │       → Ambil posts dari DB
 │       │       → Hitung sentimen (jika include_sentiment=true)
 │       │       → Status: "found"
 │       │
-│       └── [2b] Keyword TIDAK DITEMUKAN + auto_crawl=true:
+│       ├── [2b] Keyword DITEMUKAN + video 0 + auto_crawl=true:
+│       │       → Pakai keyword_id yang existing (tidak duplikat)
+│       │       → Queue Celery crawl langsung dengan ID yang sama
+│       │       → Status: "crawling"
+│       │
+│       └── [2c] Keyword TIDAK DITEMUKAN + auto_crawl=true:
 │               → Buat keyword baru di tabel keywords
 │               → Queue Celery task crawl YouTube di background
 │               → Status: "crawling"
-│               → (jika scheduled_hour diisi) Tambah jadwal crawl harian
 │
 ├── [3] save_topic=true:
 │       → Cek apakah nama topik sudah ada di search_topics
@@ -429,6 +433,52 @@ curl -X DELETE "http://187.77.125.10:8000/api/v1/search/topics/<topic_id>" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
+### Auto Crawl — keyword belum ada, crawl otomatis
+
+```bash
+curl -X POST http://187.77.125.10:8000/api/v1/search/topics \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "topics": [
+      {
+        "name": "jawa timur",
+        "keywords": ["banjir surabaya 2026", "demo buruh jatim"]
+      }
+    ],
+    "platforms": ["youtube"],
+    "auto_crawl": true,
+    "save_topic": true
+  }'
+```
+
+Response saat keyword belum ada (crawl berjalan di background):
+```json
+{
+  "status": "crawling",
+  "crawling_keywords": ["banjir surabaya 2026", "demo buruh jatim"],
+  "note": "Keyword dengan status 'crawling' sedang diproses di background.",
+  "topics": [
+    {
+      "topic": "Jawa Timur",
+      "topic_id": "uuid-tersimpan...",
+      "total_posts": 0,
+      "crawling": ["banjir surabaya 2026", "demo buruh jatim"]
+    }
+  ]
+}
+```
+
+Tunggu 1-3 menit, lalu panggil endpoint yang sama → data sudah muncul.
+
+### Cek status crawl (opsional, sambil menunggu)
+
+```bash
+# keyword_id diambil dari response crawl di atas
+curl "http://187.77.125.10:8000/api/v1/youtube/status?keyword_id=<keyword_id>" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
 ### One-liner lengkap: login + buat topik + lihat list
 
 ```bash
@@ -666,8 +716,27 @@ Saat connector platform baru selesai, tidak perlu ubah endpoint topic search. Cu
 | Kondisi | Perilaku |
 |---------|----------|
 | Topik nama sama di-POST ulang | Update (tidak duplikat) |
-| Keyword tidak ada di DB + `auto_crawl: true` | Keyword dibuat + crawl berjalan di background |
+| Keyword tidak ada di DB + `auto_crawl: true` | Keyword baru dibuat → crawl berjalan di background |
+| Keyword ada di DB tapi video 0 + `auto_crawl: true` | Pakai keyword_id existing → crawl ulang (tidak duplikat) |
+| Keyword ada di DB + video sudah ada | Langsung kembalikan data, tidak crawl ulang |
 | `scheduled_hour: 7` | Crawl otomatis setiap hari jam 07:00 WIB |
 | Keyword dicari dengan LIKE | `"pendakwah oki"` akan cocok dengan `"pendakwah oki setiana dewi"` |
 | `save_topic: false` | Cari saja, tidak simpan ke DB |
 | `DELETE /topics/{id}` | Soft delete — topik hanya dinonaktifkan, data posts tidak hilang |
+
+### Perilaku Auto Crawl
+
+```
+POST /search/topics
+│
+├── Keyword tidak ada di DB + auto_crawl: true
+│   → Buat keyword baru → queue Celery crawl ✅
+│
+├── Keyword ada di DB, video 0 + auto_crawl: true
+│   → Pakai keyword_id existing (tidak duplikat) → queue Celery crawl ✅
+│
+└── Keyword ada di DB, video sudah ada
+    → Langsung kembalikan data, tidak crawl ulang ✅
+```
+
+Crawl berjalan di background. Tunggu 1-3 menit lalu panggil endpoint yang sama — data sudah muncul.
