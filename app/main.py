@@ -61,6 +61,11 @@ app = FastAPI(
     lifespan=lifespan,
     docs_url="/docs" if settings.app_debug else None,
     redoc_url="/redoc" if settings.app_debug else None,
+    swagger_ui_parameters={
+        "persistAuthorization": True,   # token tersimpan di localStorage, tidak hilang saat refresh
+        "displayRequestDuration": True, # tampilkan durasi request
+        "tryItOutEnabled": True,        # tombol "Try it out" aktif by default
+    },
 )
 
 app.add_middleware(RequestIDMiddleware)
