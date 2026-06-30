@@ -35,6 +35,7 @@ class DateSearchRequest(BaseModel):
     limit: int = Field(default=20, ge=1, le=200)
     offset: int = Field(default=0, ge=0)
     include_sentiment: bool = Field(default=True, description="Sertakan distribusi sentimen & breakdown per hari")
+    auto_crawl: bool = Field(default=True, description="Jika data belum ada di DB, crawl otomatis dari YouTube (butuh q)")
 
     @model_validator(mode="after")
     def validate_dates(self) -> "DateSearchRequest":

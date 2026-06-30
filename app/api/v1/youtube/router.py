@@ -627,75 +627,161 @@ async def date_range_search_post(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Cari video YouTube dari DB berdasarkan **rentang tanggal publish** video (versi POST).
+    Cari video YouTube berdasarkan **rentang tanggal publish** + keyword (versi POST).
 
-    Body JSON:
+    **Behaviour otomatis (`auto_crawl: true`, default):**
+    - Data sudah ada di DB → langsung kembalikan hasil (`status: ready`)
+    - Data belum ada + `q` diisi → crawl YouTube dulu, lalu filter by tanggal (`status: crawled`)
+    - Data belum ada + tanpa `q` → kembalikan kosong (`status: empty`)
+
+    **Catatan penting:**
+    YouTube API tidak bisa filter by tanggal — crawl mengambil video terbaru/relevan,
+    lalu hasilnya difilter dari DB berdasarkan `published_at` video.
+
     ```json
     {
-      "date_from": "2025-06-01",
-      "date_to":   "2025-06-30",
-      "q":         "jokowi",
+      "date_from": "2025-01-01",
+      "date_to":   "2025-12-31",
+      "q":         "banjir jakarta",
       "sort_by":   "views",
-      "include_sentiment": true
+      "auto_crawl": true
     }
     ```
-
-    Identik dengan GET `/videos/date-search` tapi parameter dikirim lewat body —
-    lebih nyaman untuk request dari frontend/aplikasi.
     """
     from sqlalchemy import text
+    from app.services.youtube.pipeline_service import collect_comments_for_video
 
     dt_from = datetime(body.date_from.year, body.date_from.month, body.date_from.day, tzinfo=timezone.utc)
     dt_to   = datetime(body.date_to.year,   body.date_to.month,   body.date_to.day,   23, 59, 59, tzinfo=timezone.utc)
 
-    filters = [
-        "p.platform = 'youtube'",
-        "p.published_at >= :dt_from",
-        "p.published_at <= :dt_to",
-    ]
-    params: dict = {
-        "dt_from": dt_from,
-        "dt_to":   dt_to,
-        "limit":   body.limit,
-        "offset":  body.offset,
-    }
+    # ── Helper: query videos dari DB dengan filter tanggal ────────────────────
+    async def _query_db(kw_id: uuid.UUID | None = None, q_like: str | None = None) -> tuple[list, int]:
+        filters = ["p.platform = 'youtube'", "p.published_at >= :dt_from", "p.published_at <= :dt_to"]
+        p: dict = {"dt_from": dt_from, "dt_to": dt_to, "limit": body.limit, "offset": body.offset}
 
-    if body.keyword_id:
-        filters.append("p.keyword_id = :keyword_id")
-        params["keyword_id"] = str(body.keyword_id)
-    elif body.q:
-        filters.append("k.keyword ILIKE :q_like")
-        params["q_like"] = f"%{body.q.strip()}%"
+        if kw_id:
+            filters.append("p.keyword_id = :kw_id")
+            p["kw_id"] = str(kw_id)
+        elif q_like:
+            filters.append("k.keyword ILIKE :q_like")
+            p["q_like"] = q_like
 
-    order_clause = {
-        "newest": "p.published_at DESC NULLS LAST",
-        "oldest": "p.published_at ASC NULLS LAST",
-        "views":  "(p.metadata->>'views')::bigint DESC NULLS LAST",
-    }.get(body.sort_by, "p.published_at DESC NULLS LAST")
+        order = {
+            "newest": "p.published_at DESC NULLS LAST",
+            "oldest": "p.published_at ASC NULLS LAST",
+            "views":  "(p.metadata->>'views')::bigint DESC NULLS LAST",
+        }.get(body.sort_by, "p.published_at DESC NULLS LAST")
 
-    where_clause = " AND ".join(filters)
+        where = " AND ".join(filters)
+        rows = (await db.execute(text(f"""
+            SELECT p.id, p.external_id, p.content, p.author, p.url,
+                   p.keyword_id, p.collected_at, p.published_at, p.metadata,
+                   k.keyword, k.id AS kw_id
+            FROM posts p LEFT JOIN keywords k ON p.keyword_id = k.id
+            WHERE {where} ORDER BY {order} OFFSET :offset LIMIT :limit
+        """), p)).mappings().all()
 
-    sql_videos = text(f"""
-        SELECT
-            p.id, p.external_id, p.content, p.author, p.url,
-            p.keyword_id, p.collected_at, p.published_at, p.metadata,
-            k.keyword, k.id AS kw_id
-        FROM posts p
-        LEFT JOIN keywords k ON p.keyword_id = k.id
-        WHERE {where_clause}
-        ORDER BY {order_clause}
-        OFFSET :offset LIMIT :limit
-    """)
+        total = (await db.execute(text(f"""
+            SELECT COUNT(*) FROM posts p LEFT JOIN keywords k ON p.keyword_id = k.id WHERE {where}
+        """), {k: v for k, v in p.items() if k not in ("limit", "offset")})).scalar() or 0
 
-    sql_count = text(f"""
-        SELECT COUNT(*) FROM posts p
-        LEFT JOIN keywords k ON p.keyword_id = k.id
-        WHERE {where_clause}
-    """)
+        return list(rows), total
 
-    rows        = (await db.execute(sql_videos, params)).mappings().all()
-    total_count = (await db.execute(sql_count, {k: v for k, v in params.items() if k not in ("limit", "offset")})).scalar() or 0
+    # ── Resolve keyword_id dari q jika belum ada ─────────────────────────────
+    resolved_kw_id: uuid.UUID | None = body.keyword_id
+    q_like = f"%{body.q.strip()}%" if body.q else None
 
+    existing_kw = None
+    if not resolved_kw_id and body.q:
+        existing_kw = await db.scalar(
+            select(Keyword).where(func.lower(Keyword.keyword) == body.q.strip().lower()).limit(1)
+        )
+        if existing_kw:
+            resolved_kw_id = existing_kw.id
+
+    # ── Cek data di DB ────────────────────────────────────────────────────────
+    rows, total_count = await _query_db(resolved_kw_id, q_like if not resolved_kw_id else None)
+    crawl_status = "ready"
+    crawl_message = None
+    crawled_new = 0
+
+    # ── Auto-crawl jika kosong + ada q ───────────────────────────────────────
+    if total_count == 0 and body.auto_crawl and body.q:
+        from app.domain.projects.models import Project
+        from app.repositories.keyword_repository import KeywordRepository
+        from app.services.collector.service import CollectorService
+
+        # Buat keyword baru jika belum ada
+        if not existing_kw and not resolved_kw_id:
+            project_id = await db.scalar(
+                select(Project.id).where(Project.is_active == True).limit(1)  # noqa: E712
+            )
+            if not project_id:
+                from app.domain.users.models import User as UserModel
+                first_user = await db.scalar(select(UserModel.id).limit(1))
+                default_project = Project(
+                    user_id=first_user,
+                    name="Default Project",
+                    description="Auto-created",
+                    is_active=True,
+                )
+                db.add(default_project)
+                await db.flush()
+                project_id = default_project.id
+                await db.commit()
+
+            new_kw = Keyword(project_id=project_id, keyword=body.q.strip(), is_active=True)
+            db.add(new_kw)
+            await db.flush()
+            resolved_kw_id = new_kw.id
+            await db.commit()
+
+        # Crawl video (max 1 halaman = ~20 video, sesuai limit kuota)
+        kw_repo = KeywordRepository(db)
+        svc = CollectorService(kw_repo)
+        collect_result = await svc.collect_for_platform(
+            keyword_id=resolved_kw_id,
+            platform="youtube",
+            max_pages=1,
+        )
+        crawled_new = collect_result.new_posts
+
+        if collect_result.errors:
+            import logging as _logging
+            _logging.getLogger(__name__).warning("date_search crawl errors: %s", collect_result.errors)
+
+        # Collect komentar untuk 3 video teratas
+        db.expire_all()
+        fresh_posts = list((await db.scalars(
+            select(Post)
+            .where(Post.keyword_id == resolved_kw_id, Post.platform == "youtube")
+            .order_by(Post.collected_at.desc())
+            .limit(3)
+        )).all())
+
+        for post in fresh_posts:
+            try:
+                await collect_comments_for_video(
+                    db=db, post_id=post.id, keyword_id=resolved_kw_id,
+                    max_comments=20, max_pages=1,
+                )
+            except Exception:
+                pass
+
+        db.expire_all()
+
+        # Query ulang setelah crawl
+        rows, total_count = await _query_db(resolved_kw_id, None)
+        crawl_status  = "crawled"
+        crawl_message = (
+            f"Data belum ada — crawl {crawled_new} video baru dari YouTube. "
+            f"Ditemukan {total_count} video dalam rentang {body.date_from} s/d {body.date_to}."
+        )
+
+    elif total_count == 0 and not body.q:
+        crawl_status = "empty"
+
+    # ── Build items ───────────────────────────────────────────────────────────
     items = []
     for row in rows:
         meta = row["metadata"] or {}
@@ -720,11 +806,13 @@ async def date_range_search_post(
         })
 
     result: dict = {
+        "status":  crawl_status,
+        "message": crawl_message,
         "filter": {
             "date_from":  str(body.date_from),
             "date_to":    str(body.date_to),
             "q":          body.q,
-            "keyword_id": str(body.keyword_id) if body.keyword_id else None,
+            "keyword_id": str(resolved_kw_id) if resolved_kw_id else None,
             "sort_by":    body.sort_by,
         },
         "total":  total_count,
@@ -733,63 +821,51 @@ async def date_range_search_post(
         "items":  items,
     }
 
+    # ── Sentiment + daily breakdown ───────────────────────────────────────────
     if body.include_sentiment:
         kw_filter_sent = ""
         params_sent: dict = {"dt_from": dt_from, "dt_to": dt_to}
 
-        if body.keyword_id:
-            kw_filter_sent = "AND p.keyword_id = :keyword_id"
-            params_sent["keyword_id"] = str(body.keyword_id)
-        elif body.q:
+        if resolved_kw_id:
+            kw_filter_sent = "AND p.keyword_id = :kw_id"
+            params_sent["kw_id"] = str(resolved_kw_id)
+        elif q_like:
             kw_filter_sent = "AND k.keyword ILIKE :q_like"
-            params_sent["q_like"] = f"%{body.q.strip()}%"
+            params_sent["q_like"] = q_like
 
-        sql_sent = text(f"""
+        sent_rows = (await db.execute(text(f"""
             SELECT la.label, COUNT(*) AS cnt
             FROM lexicon_analyses la
             JOIN comments c ON la.comment_id = c.id
             JOIN posts p    ON c.post_id = p.id
             LEFT JOIN keywords k ON p.keyword_id = k.id
             WHERE p.platform = 'youtube'
-              AND p.published_at >= :dt_from
-              AND p.published_at <= :dt_to
+              AND p.published_at >= :dt_from AND p.published_at <= :dt_to
               {kw_filter_sent}
             GROUP BY la.label
-        """)
+        """), params_sent)).mappings().all()
 
-        sent_rows = (await db.execute(sql_sent, params_sent)).mappings().all()
         dist: dict[str, int] = {r["label"]: r["cnt"] for r in sent_rows}
         total_analyzed = sum(dist.values())
 
-        sentiment_summary = {
+        daily_rows = (await db.execute(text(f"""
+            SELECT DATE(p.published_at AT TIME ZONE 'UTC') AS day, COUNT(*) AS video_count
+            FROM posts p LEFT JOIN keywords k ON p.keyword_id = k.id
+            WHERE p.platform = 'youtube'
+              AND p.published_at >= :dt_from AND p.published_at <= :dt_to
+              {kw_filter_sent}
+            GROUP BY day ORDER BY day ASC
+        """), params_sent)).mappings().all()
+
+        result["sentiment"] = {
             lbl: {
                 "count":      dist.get(lbl, 0),
                 "percentage": round(dist.get(lbl, 0) / total_analyzed * 100, 1) if total_analyzed else 0.0,
             }
             for lbl in ["positif", "negatif", "netral"]
         }
-        dominant = max(dist, key=dist.get) if dist else "netral"
-
-        sql_daily = text(f"""
-            SELECT
-                DATE(p.published_at AT TIME ZONE 'UTC') AS day,
-                COUNT(*) AS video_count
-            FROM posts p
-            LEFT JOIN keywords k ON p.keyword_id = k.id
-            WHERE p.platform = 'youtube'
-              AND p.published_at >= :dt_from
-              AND p.published_at <= :dt_to
-              {kw_filter_sent}
-            GROUP BY day
-            ORDER BY day ASC
-        """)
-
-        daily_rows = (await db.execute(sql_daily, params_sent)).mappings().all()
-        result["sentiment"] = {
-            **sentiment_summary,
-            "dominant":       dominant,
-            "total_analyzed": total_analyzed,
-        }
+        result["sentiment"]["dominant"] = max(dist, key=dist.get) if dist else "netral"
+        result["sentiment"]["total_analyzed"] = total_analyzed
         result["daily_breakdown"] = [
             {"date": str(r["day"]), "video_count": r["video_count"]}
             for r in daily_rows
