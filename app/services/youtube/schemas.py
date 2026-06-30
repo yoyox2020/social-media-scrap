@@ -53,6 +53,13 @@ class TrendingFetchRequest(BaseModel):
     max_pages_per_keyword: int = Field(default=2, ge=1, le=5)
 
 
+class YouTubePopularRequest(BaseModel):
+    region_code: str = Field(default="ID", max_length=10, description="Kode negara (ISO 3166-1 alpha-2), misal: ID, US, JP")
+    limit: int = Field(default=20, ge=1, le=50, description="Jumlah video (maks 50)")
+    category_id: str | None = Field(default=None, description="ID kategori YouTube (opsional, misal: '10' untuk musik)")
+    save_to_db: bool = Field(default=True, description="Simpan hasil ke DB sebagai Posts")
+
+
 class DashboardRequest(BaseModel):
     project_id: uuid.UUID | None = None
 

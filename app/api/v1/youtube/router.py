@@ -39,7 +39,9 @@ from app.services.youtube.schemas import (
     SmartSearchRequest,
     TrendingFetchRequest,
     YouTubeCollectRequest,
+    YouTubePopularRequest,
 )
+from app.services.processing.normalizer import _utc_from_iso
 from app.shared.utils import build_success_response
 
 router = APIRouter(prefix="/youtube", tags=["youtube"])
@@ -613,6 +615,177 @@ async def viral_videos(
         "total": len(items),
         "note": "Diurutkan berdasarkan view count tertinggi dari semua data di DB",
         "items": items,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# YOUTUBE POPULAR — Video populer via YouTube Data API v3 (mostPopular chart)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _format_popular_item(item: dict, rank: int) -> dict:
+    """Normalisasi satu item dari YouTube Data API v3 videos.list response."""
+    snippet = item.get("snippet") or {}
+    stats   = item.get("statistics") or {}
+    content = item.get("contentDetails") or {}
+    video_id = item.get("id", "")
+    thumbs   = snippet.get("thumbnails") or {}
+    thumb_url = (thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}).get("url", "")
+    return {
+        "rank":         rank,
+        "video_id":     video_id,
+        "url":          f"https://www.youtube.com/watch?v={video_id}",
+        "title":        snippet.get("title", ""),
+        "channel":      snippet.get("channelTitle", ""),
+        "channel_id":   snippet.get("channelId", ""),
+        "description":  snippet.get("description", ""),
+        "thumbnail_url": thumb_url,
+        "published_at": snippet.get("publishedAt"),
+        "duration":     content.get("duration", ""),
+        "view_count":   int(stats.get("viewCount", 0) or 0),
+        "like_count":   int(stats.get("likeCount", 0) or 0),
+        "comment_count": int(stats.get("commentCount", 0) or 0),
+    }
+
+
+@router.get("/videos/popular", response_model=dict)
+async def get_popular_videos(
+    region_code: str = Query(default="ID", max_length=10, description="Kode negara (ISO 3166-1 alpha-2), misal: ID, US, JP"),
+    limit: int = Query(default=20, ge=1, le=50, description="Jumlah video (maks 50)"),
+    category_id: str | None = Query(default=None, description="ID kategori YouTube (opsional, misal: '10' untuk musik)"),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Ambil video paling populer di YouTube secara **live** dari YouTube Data API v3.
+
+    Sumber: `GET https://www.googleapis.com/youtube/v3/videos?chart=mostPopular`
+
+    Data **tidak** disimpan ke DB — gunakan POST `/videos/popular` untuk simpan ke DB.
+    """
+    from app.shared.config import settings
+    from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
+
+    if not settings.youtube_data_api_key:
+        from app.shared.exceptions import AppException
+        raise AppException(code="CONFIG_ERROR", message="YOUTUBE_DATA_API_KEY belum dikonfigurasi", status_code=503)
+
+    client = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
+    raw = await client.fetch_popular(region_code=region_code, max_results=limit, category_id=category_id)
+
+    items_raw = raw.get("items") or []
+    items = [_format_popular_item(item, i + 1) for i, item in enumerate(items_raw)]
+
+    return build_success_response({
+        "source":      "youtube_data_api_v3",
+        "region_code": region_code,
+        "total":       len(items),
+        "items":       items,
+    })
+
+
+@router.post("/videos/popular", response_model=dict)
+async def crawl_popular_videos(
+    body: YouTubePopularRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Ambil video populer YouTube via YouTube Data API v3 dan **simpan ke DB**.
+
+    - Membuat keyword `_popular_{region_code}` otomatis jika belum ada
+    - Deduplication: video yang sudah ada di DB dilewati
+    - Kembalikan jumlah video baru yang berhasil disimpan
+    """
+    from datetime import datetime as _dt
+    from app.shared.config import settings
+    from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
+    from app.domain.projects.models import Project
+    from app.repositories.post_repository import PostRepository
+
+    if not settings.youtube_data_api_key:
+        from app.shared.exceptions import AppException
+        raise AppException(code="CONFIG_ERROR", message="YOUTUBE_DATA_API_KEY belum dikonfigurasi", status_code=503)
+
+    # Ambil data dari YouTube API
+    client = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
+    raw = await client.fetch_popular(
+        region_code=body.region_code,
+        max_results=body.limit,
+        category_id=body.category_id,
+    )
+    items_raw = raw.get("items") or []
+    items = [_format_popular_item(item, i + 1) for i, item in enumerate(items_raw)]
+
+    saved_count = 0
+    keyword_id_used = None
+
+    if body.save_to_db and items:
+        # Cari / buat keyword khusus trending populer per region
+        kw_text = f"_popular_{body.region_code.upper()}"
+        keyword = await db.scalar(
+            select(Keyword).where(func.lower(Keyword.keyword) == kw_text.lower()).limit(1)
+        )
+        if not keyword:
+            project_id = await db.scalar(
+                select(Project.id).where(Project.is_active == True).limit(1)  # noqa: E712
+            )
+            if not project_id:
+                from app.domain.users.models import User as UserModel
+                first_user = await db.scalar(select(UserModel.id).limit(1))
+                proj = Project(user_id=first_user, name=f"YouTube Popular {body.region_code}", is_active=True)
+                db.add(proj)
+                await db.flush()
+                project_id = proj.id
+
+            keyword = Keyword(project_id=project_id, keyword=kw_text, is_active=True)
+            db.add(keyword)
+            await db.flush()
+            await db.commit()
+
+        keyword_id_used = keyword.id
+
+        # Deduplication + simpan ke DB
+        post_repo = PostRepository(db)
+        ext_ids = [it["video_id"] for it in items if it["video_id"]]
+        existing = await post_repo.get_existing_external_ids(ext_ids, "youtube")
+
+        new_posts = []
+        for it in items:
+            if it["video_id"] in existing:
+                continue
+            new_posts.append(Post(
+                id=uuid.uuid4(),
+                keyword_id=keyword.id,
+                external_id=it["video_id"],
+                platform="youtube",
+                content=it["title"],
+                author=it["channel"],
+                url=it["url"],
+                metadata_={
+                    "views":       it["view_count"],
+                    "likes":       it["like_count"],
+                    "comments":    it["comment_count"],
+                    "description": it["description"],
+                    "thumbnail":   it["thumbnail_url"],
+                    "duration":    it["duration"],
+                    "source":      "youtube_data_api_popular",
+                    "region_code": body.region_code,
+                },
+                raw_data={"_popular": True, "region_code": body.region_code},
+                published_at=_utc_from_iso(it["published_at"]),
+                collected_at=_dt.now(timezone.utc),
+            ))
+
+        if new_posts:
+            saved_count = await post_repo.bulk_create(new_posts)
+            await db.commit()
+
+    return build_success_response({
+        "source":       "youtube_data_api_v3",
+        "region_code":  body.region_code,
+        "total_fetched": len(items),
+        "saved_to_db":  saved_count,
+        "keyword_id":   str(keyword_id_used) if keyword_id_used else None,
+        "items":        items,
     })
 
 
