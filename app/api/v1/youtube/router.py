@@ -565,6 +565,7 @@ async def list_videos(
 async def viral_videos(
     limit: int = Query(default=20, ge=1, le=100, description="Jumlah video teratas"),
     keyword_id: uuid.UUID | None = Query(default=None, description="Filter per keyword (opsional)"),
+    limit_comments: int = Query(default=10, ge=0, le=200, description="Jumlah sample komentar (0 = tidak ambil)"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -612,10 +613,42 @@ async def viral_videos(
         for i, r in enumerate(rows)
     ]
 
+    comments = []
+    if limit_comments > 0:
+        c_filters = ["p.platform = 'youtube'"]
+        c_params: dict = {"lc": limit_comments}
+        if keyword_id:
+            c_filters.append("p.keyword_id = :keyword_id_c")
+            c_params["keyword_id_c"] = str(keyword_id)
+        c_where = " AND ".join(c_filters)
+        comment_rows = (await db.execute(text(f"""
+            SELECT c.id, c.content, c.author,
+                   la.label AS sentiment, la.score,
+                   p.url AS video_url, p.external_id
+            FROM comments c
+            JOIN posts p ON c.post_id = p.id
+            LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+            WHERE {c_where}
+            ORDER BY c.created_at DESC
+            LIMIT :lc
+        """), c_params)).mappings().all()
+        comments = [
+            {
+                "id": str(r["id"]),
+                "content": r["content"],
+                "author": r["author"],
+                "sentiment": r["sentiment"],
+                "score": round(float(r["score"]), 3) if r["score"] is not None else None,
+                "video_url": r["video_url"] or f"https://www.youtube.com/watch?v={r['external_id']}",
+            }
+            for r in comment_rows
+        ]
+
     return build_success_response({
         "total": len(items),
         "note": "Diurutkan berdasarkan view count tertinggi dari semua data di DB",
         "items": items,
+        "comments": comments,
     })
 
 
@@ -706,6 +739,48 @@ async def viral_videos_post(
         for i, r in enumerate(rows)
     ]
 
+    # ── Komentar ──────────────────────────────────────────────────────────────
+    comments = []
+    if body.limit_comments > 0 and total > 0:
+        c_filters = ["p.platform = 'youtube'"]
+        c_params: dict = {"lc": body.limit_comments}
+        if body.keyword_id:
+            c_filters.append("p.keyword_id = :keyword_id_c")
+            c_params["keyword_id_c"] = str(body.keyword_id)
+        elif body.q:
+            c_filters.append("k.keyword ILIKE :q_like_c")
+            c_params["q_like_c"] = f"%{body.q.strip()}%"
+        if body.date_from:
+            c_filters.append("p.published_at >= :date_from_c")
+            c_params["date_from_c"] = datetime(body.date_from.year, body.date_from.month, body.date_from.day, tzinfo=timezone.utc)
+        if body.date_to:
+            c_filters.append("p.published_at <= :date_to_c")
+            c_params["date_to_c"] = datetime(body.date_to.year, body.date_to.month, body.date_to.day, 23, 59, 59, tzinfo=timezone.utc)
+        c_where = " AND ".join(c_filters)
+        comment_rows = (await db.execute(text(f"""
+            SELECT c.id, c.content, c.author,
+                   la.label AS sentiment, la.score,
+                   p.url AS video_url, p.external_id
+            FROM comments c
+            JOIN posts p ON c.post_id = p.id
+            LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+            LEFT JOIN keywords k ON p.keyword_id = k.id
+            WHERE {c_where}
+            ORDER BY c.created_at DESC
+            LIMIT :lc
+        """), c_params)).mappings().all()
+        comments = [
+            {
+                "id": str(r["id"]),
+                "content": r["content"],
+                "author": r["author"],
+                "sentiment": r["sentiment"],
+                "score": round(float(r["score"]), 3) if r["score"] is not None else None,
+                "video_url": r["video_url"] or f"https://www.youtube.com/watch?v={r['external_id']}",
+            }
+            for r in comment_rows
+        ]
+
     # ── Fallback ke YouTube Data API v3 jika DB kosong ────────────────────────
     if total == 0 and body.auto_search:
         from app.shared.config import settings
@@ -788,6 +863,7 @@ async def viral_videos_post(
         "offset": body.offset,
         "limit":  body.limit,
         "items":  items,
+        "comments": comments,
     })
 
 

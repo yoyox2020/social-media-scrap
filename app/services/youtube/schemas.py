@@ -70,6 +70,7 @@ class ViralSearchRequest(BaseModel):
     limit: int = Field(default=20, ge=1, le=200)
     offset: int = Field(default=0, ge=0)
     auto_search: bool = Field(default=True, description="Jika tidak ada di DB, otomatis cari ke YouTube Data API v3")
+    limit_comments: int = Field(default=10, ge=0, le=200, description="Jumlah sample komentar (0 = tidak ambil)")
 
 
 class DashboardRequest(BaseModel):
