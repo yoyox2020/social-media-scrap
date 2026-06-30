@@ -14,6 +14,8 @@ from app.integrations.ensemble_data.client import EnsembleDataClient
 from app.integrations.ensemble_data.endpoints import YouTubeEndpoints
 
 PLATFORM = "youtube"
+MAX_DEPTH = 5       # hard cap — 1 depth = ~20 video = 1 EnsembleData unit
+MAX_PAGES = 5       # hard cap komentar per video
 
 
 class YouTubeConnector:
@@ -36,7 +38,7 @@ class YouTubeConnector:
         """
         return await self.client.get(
             YouTubeEndpoints.KEYWORD_SEARCH.path,
-            params={"keyword": keyword, "depth": depth},
+            params={"keyword": keyword, "depth": min(depth, MAX_DEPTH)},
         )
 
     async def search_by_hashtag(
@@ -55,7 +57,7 @@ class YouTubeConnector:
         """
         return await self.client.get(
             YouTubeEndpoints.HASHTAG_SEARCH.path,
-            params={"name": hashtag, "depth": depth, "only_shorts": only_shorts},
+            params={"name": hashtag, "depth": min(depth, MAX_DEPTH), "only_shorts": only_shorts},
         )
 
     async def get_featured_categories(self, keyword: str) -> dict[str, Any]:

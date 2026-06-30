@@ -134,8 +134,8 @@ async def collect_comments_for_video(
     db: AsyncSession,
     post_id: uuid.UUID,
     keyword_id: uuid.UUID,
-    max_comments: int = 100,
-    max_pages: int = 3,
+    max_comments: int = 50,
+    max_pages: int = 1,
 ) -> CommentCollectionResult:
     """
     Ambil semua halaman komentar untuk satu video, simpan ke DB,
@@ -577,9 +577,9 @@ async def get_keyword_pipeline_status(
 async def smart_search_youtube(
     db: AsyncSession,
     q: str,
-    max_pages: int = 2,
-    max_comments_per_video: int = 50,
-    max_comment_pages: int = 2,
+    max_pages: int = 1,
+    max_comments_per_video: int = 20,
+    max_comment_pages: int = 1,
     force_refresh: bool = False,
 ) -> dict:
     """

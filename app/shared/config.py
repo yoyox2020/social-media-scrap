@@ -61,9 +61,9 @@ class Settings(BaseSettings):
     youtube_trending_geo: str = "ID"
     youtube_trending_period: str = "24h"
     youtube_trending_limit: int = 10
-    youtube_max_pages_per_keyword: int = 2
-    youtube_max_comment_pages: int = 3
-    youtube_max_comments_per_video: int = 100
+    youtube_max_pages_per_keyword: int = 1      # limit EnsembleData: max 5 unit per search
+    youtube_max_comment_pages: int = 1          # limit EnsembleData: max 5 unit per video
+    youtube_max_comments_per_video: int = 50
 
     # Rate Limiting
     rate_limit_agents_max_requests: int = 10

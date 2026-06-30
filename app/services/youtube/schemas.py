@@ -13,16 +13,16 @@ from pydantic import BaseModel, Field, model_validator
 
 class YouTubeCollectRequest(BaseModel):
     keyword_id: uuid.UUID
-    max_pages: int = Field(default=2, ge=1, le=10)
-    max_comment_pages: int = Field(default=3, ge=1, le=10)
-    max_comments_per_video: int = Field(default=100, ge=10, le=500)
+    max_pages: int = Field(default=1, ge=1, le=5)
+    max_comment_pages: int = Field(default=1, ge=1, le=5)
+    max_comments_per_video: int = Field(default=50, ge=10, le=200)
 
 
 class SmartSearchRequest(BaseModel):
     q: str = Field(..., min_length=1, max_length=200, description="Kata kunci pencarian YouTube")
-    max_pages: int = Field(default=2, ge=1, le=5, description="Jumlah halaman video (~20 per halaman)")
-    max_comments_per_video: int = Field(default=50, ge=10, le=200, description="Maks komentar per video")
-    max_comment_pages: int = Field(default=2, ge=1, le=5, description="Maks halaman komentar per video")
+    max_pages: int = Field(default=1, ge=1, le=5, description="Jumlah halaman video (~20 per halaman)")
+    max_comments_per_video: int = Field(default=20, ge=10, le=100, description="Maks komentar per video")
+    max_comment_pages: int = Field(default=1, ge=1, le=5, description="Maks halaman komentar per video")
     force_refresh: bool = Field(default=False, description="Paksa crawl ulang meski data sudah ada di DB")
 
 
