@@ -826,7 +826,7 @@ async def date_range_search_post(
             "date_from":  str(body.date_from),
             "date_to":    str(body.date_to),
             "q":          body.q,
-            "keyword_id": str(resolved_kw_id) if resolved_kw_id else None,
+            "keyword_id": str(filter_kw_id) if filter_kw_id else None,
             "sort_by":    body.sort_by,
         },
         "total":  total_count,
@@ -840,9 +840,9 @@ async def date_range_search_post(
         kw_filter_sent = ""
         params_sent: dict = {"dt_from": dt_from, "dt_to": dt_to}
 
-        if resolved_kw_id:
+        if filter_kw_id:
             kw_filter_sent = "AND p.keyword_id = :kw_id"
-            params_sent["kw_id"] = str(resolved_kw_id)
+            params_sent["kw_id"] = str(filter_kw_id)
         elif q_like:
             kw_filter_sent = "AND k.keyword ILIKE :q_like"
             params_sent["q_like"] = q_like
