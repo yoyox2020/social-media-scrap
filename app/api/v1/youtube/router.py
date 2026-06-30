@@ -746,7 +746,7 @@ async def date_range_search_post(
 
         sql_sent = text(f"""
             SELECT la.label, COUNT(*) AS cnt
-            FROM lexicon_analysis la
+            FROM lexicon_analyses la
             JOIN comments c ON la.comment_id = c.id
             JOIN posts p    ON c.post_id = p.id
             LEFT JOIN keywords k ON p.keyword_id = k.id
@@ -946,7 +946,7 @@ async def date_range_search(
 
         sql_sent = text(f"""
             SELECT la.label, COUNT(*) AS cnt
-            FROM lexicon_analysis la
+            FROM lexicon_analyses la
             JOIN comments c ON la.comment_id = c.id
             JOIN posts p    ON c.post_id = p.id
             LEFT JOIN keywords k ON p.keyword_id = k.id
