@@ -95,15 +95,31 @@ class YouTubeConnector:
     ) -> dict[str, Any]:
         """
         Ambil komentar video.
+        Jika EnsembleData quota habis (HTTP 495), otomatis fallback ke YouTube Data API v3
+        (commentThreads.list) — cursor dipakai ulang sebagai pageToken.
 
         Args:
             video_id: YouTube video ID (contoh: 'cKkb5tperxc')
             cursor:   Token halaman berikutnya. "" untuk halaman pertama.
         """
-        return await self.client.get(
-            YouTubeEndpoints.VIDEO_COMMENTS.path,
-            params={"id": video_id, "cursor": cursor},
-        )
+        from app.shared.exceptions import ExternalAPIError
+
+        try:
+            return await self.client.get(
+                YouTubeEndpoints.VIDEO_COMMENTS.path,
+                params={"id": video_id, "cursor": cursor},
+            )
+        except ExternalAPIError as exc:
+            if "495" not in str(exc):
+                raise
+            from app.shared.config import settings
+            from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
+
+            if not settings.youtube_data_api_key:
+                raise  # Tidak ada fallback key, teruskan error asli
+
+            yt_client = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
+            return await yt_client.list_comment_threads(video_id, page_token=cursor or None)
 
     # ── Channel ───────────────────────────────────────────────────────────────
 
@@ -175,9 +191,12 @@ class YouTubeConnector:
         Ambil cursor untuk halaman berikutnya.
 
         Keyword search: depth menggantikan cursor → kembalikan None.
-        Comments: field nextCursor di data.
+        Comments: field nextCursor di data (EnsembleData) atau nextPageToken (YouTube Data API v3).
         """
         data = raw.get("data") or {}
+        if raw.get("_source") == "youtube_data_api":
+            token = data.get("nextPageToken")
+            return str(token) if token else None
         cursor = data.get("nextCursor") or data.get("cursor") or data.get("next_cursor")
         return str(cursor) if cursor else None
 
@@ -213,8 +232,39 @@ class YouTubeConnector:
 
         Struktur: data.comments[*].commentThreadRenderer.comment
         Kembalikan comment inner object agar helper di pipeline bisa parse.
+
+        Jika sumbernya YouTube Data API v3 (commentThreads.list), normalisasi ke
+        bentuk yang sama (properties/author/toolbar) agar helper parsing di
+        pipeline_service.py tidak perlu tahu sumbernya.
         """
         data = raw.get("data") or {}
+
+        if raw.get("_source") == "youtube_data_api":
+            extracted = []
+            for item in data.get("items") or []:
+                top = (item.get("snippet") or {}).get("topLevelComment") or {}
+                snippet = top.get("snippet") or {}
+                comment_id = top.get("id") or item.get("id") or ""
+                if not comment_id:
+                    continue
+                extracted.append({
+                    "commentId": comment_id,
+                    "properties": {
+                        "commentId": comment_id,
+                        "content": {"content": snippet.get("textDisplay") or snippet.get("textOriginal") or ""},
+                        "publishedTime": snippet.get("publishedAt") or "",
+                    },
+                    "author": {
+                        "displayName": snippet.get("authorDisplayName"),
+                        "channelId": (snippet.get("authorChannelId") or {}).get("value"),
+                    },
+                    "toolbar": {
+                        "likeCountNotliked": str(snippet.get("likeCount", 0)),
+                        "replyCount": str((item.get("snippet") or {}).get("totalReplyCount", 0)),
+                    },
+                })
+            return extracted
+
         raw_comments = data.get("comments") or []
         extracted = []
         for item in raw_comments:

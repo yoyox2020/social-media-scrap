@@ -68,3 +68,40 @@ class YouTubeDataAPIClient:
             resp = await client.get(f"{_BASE_URL}/videos", params=params)
             resp.raise_for_status()
             return resp.json()
+
+    async def list_comment_threads(
+        self,
+        video_id: str,
+        max_results: int = 50,
+        page_token: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Ambil komentar top-level video. Fallback saat EnsembleData quota habis (HTTP 495).
+        GET https://www.googleapis.com/youtube/v3/commentThreads
+        """
+        params: dict[str, Any] = {
+            "part": "snippet",
+            "videoId": video_id,
+            "maxResults": min(max_results, 100),
+            "order": "relevance",
+            "textFormat": "plainText",
+            "key": self.api_key,
+        }
+        if page_token:
+            params["pageToken"] = page_token
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(f"{_BASE_URL}/commentThreads", params=params)
+            if resp.status_code == 403:
+                # Komentar dimatikan untuk video ini — bukan error, kembalikan kosong
+                return {"_source": _SOURCE_MARKER, "data": {"items": [], "nextPageToken": None}}
+            resp.raise_for_status()
+            data = resp.json()
+
+        return {
+            "_source": _SOURCE_MARKER,
+            "data": {
+                "items": data.get("items") or [],
+                "nextPageToken": data.get("nextPageToken"),
+            },
+        }
