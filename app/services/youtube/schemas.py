@@ -68,6 +68,7 @@ class ViralSearchRequest(BaseModel):
     sort_by: str = Field(default="views", pattern="^(views|newest|oldest)$", description="views | newest | oldest")
     limit: int = Field(default=20, ge=1, le=200)
     offset: int = Field(default=0, ge=0)
+    auto_search: bool = Field(default=True, description="Jika tidak ada di DB, otomatis cari ke YouTube Data API v3")
 
 
 class DashboardRequest(BaseModel):

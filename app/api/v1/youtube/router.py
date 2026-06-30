@@ -706,6 +706,76 @@ async def viral_videos_post(
         for i, r in enumerate(rows)
     ]
 
+    # ── Fallback ke YouTube Data API v3 jika DB kosong ────────────────────────
+    if total == 0 and body.auto_search:
+        from app.shared.config import settings
+        from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
+
+        if settings.youtube_data_api_key:
+            yt = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
+
+            if body.q:
+                # Cari berdasarkan keyword, diurutkan view terbanyak
+                raw = await yt.search_videos(body.q, max_results=body.limit, order="viewCount")
+                yt_items_raw = raw.get("data", {}).get("items") or []
+                yt_items = []
+                for i, it in enumerate(yt_items_raw):
+                    vid_id = (it.get("id") or {}).get("videoId") if isinstance(it.get("id"), dict) else None
+                    if not vid_id:
+                        continue
+                    snip = it.get("snippet") or {}
+                    thumbs = snip.get("thumbnails") or {}
+                    thumb_url = (thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}).get("url", "")
+                    yt_items.append({
+                        "rank":          i + 1,
+                        "video_id":      vid_id,
+                        "url":           f"https://www.youtube.com/watch?v={vid_id}",
+                        "title":         snip.get("title", ""),
+                        "channel":       snip.get("channelTitle", ""),
+                        "view_count":    0,
+                        "thumbnail_url": thumb_url,
+                        "duration":      "",
+                        "published_at":  snip.get("publishedAt"),
+                        "collected_at":  None,
+                        "keyword":       body.q,
+                        "keyword_id":    None,
+                    })
+                return build_success_response({
+                    "source":  "youtube_data_api_v3",
+                    "note":    f"Data tidak ditemukan di DB — hasil langsung dari YouTube search (order=viewCount) untuk '{body.q}'",
+                    "sort_by": "viewCount",
+                    "filter": {
+                        "keyword_id": str(body.keyword_id) if body.keyword_id else None,
+                        "q":          body.q,
+                        "date_from":  str(body.date_from) if body.date_from else None,
+                        "date_to":    str(body.date_to) if body.date_to else None,
+                    },
+                    "total":  len(yt_items),
+                    "offset": body.offset,
+                    "limit":  body.limit,
+                    "items":  yt_items,
+                })
+            else:
+                # Tanpa keyword → ambil mostPopular chart
+                raw = await yt.fetch_popular(region_code="ID", max_results=body.limit)
+                yt_items_raw = raw.get("items") or []
+                yt_items = [_format_popular_item(it, i + 1) for i, it in enumerate(yt_items_raw)]
+                return build_success_response({
+                    "source":  "youtube_data_api_v3",
+                    "note":    "Data tidak ditemukan di DB — hasil langsung dari YouTube mostPopular chart (ID)",
+                    "sort_by": "mostPopular",
+                    "filter": {
+                        "keyword_id": None,
+                        "q":          None,
+                        "date_from":  str(body.date_from) if body.date_from else None,
+                        "date_to":    str(body.date_to) if body.date_to else None,
+                    },
+                    "total":  len(yt_items),
+                    "offset": body.offset,
+                    "limit":  body.limit,
+                    "items":  yt_items,
+                })
+
     return build_success_response({
         "sort_by": body.sort_by,
         "filter": {
