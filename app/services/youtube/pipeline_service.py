@@ -71,13 +71,27 @@ async def fetch_and_store_trending(
 
     await db.flush()
 
+    # Validasi project_id — fallback ke project aktif pertama jika tidak ada
+    from app.domain.projects.models import Project
+    project_exists = await db.scalar(
+        select(Project.id).where(Project.id == request.project_id).limit(1)
+    )
+    if not project_exists:
+        project_exists = await db.scalar(
+            select(Project.id).where(Project.is_active == True).limit(1)  # noqa: E712
+        )
+    if not project_exists:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError("Project", str(request.project_id))
+    resolved_project_id = project_exists
+
     keywords_created = 0
     keyword_ids: list[uuid.UUID] = []
 
     for item in result.items:
         existing = await db.scalar(
             select(Keyword).where(
-                Keyword.project_id == request.project_id,
+                Keyword.project_id == resolved_project_id,
                 Keyword.keyword == item.title,
             )
         )
@@ -85,7 +99,7 @@ async def fetch_and_store_trending(
             keyword_ids.append(existing.id)
         else:
             kw = Keyword(
-                project_id=request.project_id,
+                project_id=resolved_project_id,
                 keyword=item.title,
                 is_active=True,
             )
