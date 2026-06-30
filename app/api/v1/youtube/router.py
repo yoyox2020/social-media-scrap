@@ -692,6 +692,14 @@ async def date_range_search_post(
     q_like = f"%{body.q.strip()}%" if body.q else None
 
     existing_kw = None
+    # Validasi keyword_id jika disertakan — jika tidak ada di DB, fallback ke q
+    if resolved_kw_id:
+        existing_kw = await db.scalar(
+            select(Keyword).where(Keyword.id == resolved_kw_id).limit(1)
+        )
+        if not existing_kw:
+            resolved_kw_id = None
+
     if not resolved_kw_id and body.q:
         existing_kw = await db.scalar(
             select(Keyword).where(func.lower(Keyword.keyword) == body.q.strip().lower()).limit(1)
