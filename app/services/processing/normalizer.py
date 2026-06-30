@@ -121,15 +121,40 @@ class YouTubeNormalizer:
         return "".join(r.get("text", "") for r in runs)
 
     def _to_post(self, item: dict, keyword_id: uuid.UUID) -> Post:
-        """
-        Parse videoRenderer dari /youtube/search.
-
-        Struktur kunci:
-          videoId, title.runs, ownerText.runs, viewCountText.simpleText,
-          publishedTimeText.simpleText, thumbnail.thumbnails, descriptionSnippet.runs
-        """
         video_id = self._get_video_id(item)
+        collected = datetime.now(timezone.utc)
 
+        if item.get("_yt_api"):
+            # ── YouTube Data API v3 format ──────────────────────────────────
+            snippet = item.get("snippet") or {}
+            title = snippet.get("title", "")
+            channel = snippet.get("channelTitle", "")
+            description = snippet.get("description", "")
+            thumbs = snippet.get("thumbnails") or {}
+            thumb_url = (thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}).get("url", "")
+            published_at = _utc_from_iso(snippet.get("publishedAt"))
+            return Post(
+                id=uuid.uuid4(),
+                keyword_id=keyword_id,
+                external_id=video_id,
+                platform=self.PLATFORM,
+                content=title,
+                author=channel,
+                url=f"https://www.youtube.com/watch?v={video_id}" if video_id else None,
+                metadata_={
+                    "views": 0,
+                    "likes": 0,
+                    "comments": 0,
+                    "description": description,
+                    "thumbnail": thumb_url,
+                    "source": "youtube_data_api",
+                },
+                raw_data=item,
+                published_at=published_at,
+                collected_at=collected,
+            )
+
+        # ── EnsembleData videoRenderer format ──────────────────────────────
         title = self._runs_to_text(item.get("title"))
         channel = self._runs_to_text(item.get("ownerText") or item.get("shortBylineText"))
 
@@ -147,7 +172,6 @@ class YouTubeNormalizer:
         description = self._runs_to_text(desc_runs if isinstance(desc_runs, dict) else {})
 
         published_text = (item.get("publishedTimeText") or {}).get("simpleText", "")
-        collected = datetime.now(timezone.utc)
 
         return Post(
             id=uuid.uuid4(),

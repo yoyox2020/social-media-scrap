@@ -31,15 +31,27 @@ class YouTubeConnector:
     ) -> dict[str, Any]:
         """
         Cari video YouTube berdasarkan keyword.
-
-        Args:
-            keyword: Kata kunci pencarian
-            depth:   Jumlah halaman yang diambil dalam satu call (1 = ~20 video)
+        Jika EnsembleData quota habis (HTTP 495), otomatis fallback ke YouTube Data API v3.
         """
-        return await self.client.get(
-            YouTubeEndpoints.KEYWORD_SEARCH.path,
-            params={"keyword": keyword, "depth": min(depth, MAX_DEPTH)},
-        )
+        from app.shared.exceptions import ExternalAPIError
+
+        try:
+            return await self.client.get(
+                YouTubeEndpoints.KEYWORD_SEARCH.path,
+                params={"keyword": keyword, "depth": min(depth, MAX_DEPTH)},
+            )
+        except ExternalAPIError as exc:
+            if "495" not in str(exc):
+                raise
+            # Quota EnsembleData habis — coba YouTube Data API v3
+            from app.shared.config import settings
+            from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
+
+            if not settings.youtube_data_api_key:
+                raise  # Tidak ada fallback key, teruskan error asli
+
+            yt_client = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
+            return await yt_client.search_videos(keyword, max_results=50)
 
     async def search_by_hashtag(
         self,
@@ -171,11 +183,19 @@ class YouTubeConnector:
 
     def extract_posts(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
         """
-        Ambil list video dari response /youtube/search.
-
-        Struktur: data.posts[*].videoRenderer
-        Kembalikan list videoRenderer langsung agar normalizer bisa parse.
+        Ambil list video dari response pencarian.
+        Mendukung dua sumber: EnsembleData (videoRenderer) dan YouTube Data API v3 (snippet).
         """
+        # YouTube Data API v3 fallback
+        if raw.get("_source") == "youtube_data_api":
+            extracted = []
+            for item in raw.get("data", {}).get("items", []):
+                video_id = (item.get("id") or {}).get("videoId") if isinstance(item.get("id"), dict) else None
+                if video_id:
+                    extracted.append({"videoId": video_id, "_yt_api": True, "snippet": item.get("snippet") or {}})
+            return extracted
+
+        # EnsembleData format
         data = raw.get("data") or {}
         posts = data.get("posts") or data.get("results") or data.get("videos") or data.get("items") or []
         extracted = []

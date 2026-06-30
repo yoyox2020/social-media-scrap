@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     ensemble_data_timeout: int = 30
     ensemble_data_max_retries: int = 3
 
+    # YouTube Data API v3 (fallback saat EnsembleData quota habis)
+    youtube_data_api_key: str = ""
+
     # Celery
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend: str = "redis://localhost:6379/1"
