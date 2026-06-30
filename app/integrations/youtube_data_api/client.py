@@ -7,8 +7,26 @@ from typing import Any
 
 import httpx
 
+from app.shared.exceptions import ExternalAPIError
+
 _BASE_URL = "https://www.googleapis.com/youtube/v3"
 _SOURCE_MARKER = "youtube_data_api"
+
+
+async def _get(path: str, params: dict[str, Any]) -> httpx.Response:
+    """GET dengan error YouTube Data API v3 dibungkus jadi ExternalAPIError (bukan crash mentah)."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(f"{_BASE_URL}/{path}", params=params)
+            resp.raise_for_status()
+            return resp
+    except httpx.HTTPStatusError as exc:
+        raise ExternalAPIError(
+            service="YouTubeDataAPI",
+            message=f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
+        )
+    except httpx.RequestError as exc:
+        raise ExternalAPIError(service="YouTubeDataAPI", message=str(exc))
 
 
 class YouTubeDataAPIClient:
@@ -33,12 +51,8 @@ class YouTubeDataAPIClient:
             "key": self.api_key,
             "maxResults": min(max_results, 50),
         }
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(f"{_BASE_URL}/search", params=params)
-            resp.raise_for_status()
-            data = resp.json()
-
-        items = data.get("items") or []
+        resp = await _get("search", params)
+        items = resp.json().get("items") or []
         return {
             "_source": _SOURCE_MARKER,
             "data": {"items": items},
@@ -53,6 +67,9 @@ class YouTubeDataAPIClient:
         """
         Ambil video paling populer (mostPopular chart) dari YouTube Data API v3.
         GET https://www.googleapis.com/youtube/v3/videos?chart=mostPopular&regionCode=ID
+
+        category_id yang tidak valid (bukan digit, misal placeholder Swagger "string")
+        diabaikan saja daripada bikin request ke Google gagal 400.
         """
         params: dict[str, Any] = {
             "part": "snippet,contentDetails,statistics",
@@ -61,13 +78,11 @@ class YouTubeDataAPIClient:
             "maxResults": min(max_results, 50),
             "key": self.api_key,
         }
-        if category_id:
-            params["videoCategoryId"] = category_id
+        if category_id and category_id.strip().isdigit():
+            params["videoCategoryId"] = category_id.strip()
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(f"{_BASE_URL}/videos", params=params)
-            resp.raise_for_status()
-            return resp.json()
+        resp = await _get("videos", params)
+        return resp.json()
 
     async def list_comment_threads(
         self,
@@ -90,13 +105,21 @@ class YouTubeDataAPIClient:
         if page_token:
             params["pageToken"] = page_token
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(f"{_BASE_URL}/commentThreads", params=params)
-            if resp.status_code == 403:
-                # Komentar dimatikan untuk video ini — bukan error, kembalikan kosong
-                return {"_source": _SOURCE_MARKER, "data": {"items": [], "nextPageToken": None}}
-            resp.raise_for_status()
-            data = resp.json()
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(f"{_BASE_URL}/commentThreads", params=params)
+                if resp.status_code == 403:
+                    # Komentar dimatikan untuk video ini — bukan error, kembalikan kosong
+                    return {"_source": _SOURCE_MARKER, "data": {"items": [], "nextPageToken": None}}
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPStatusError as exc:
+            raise ExternalAPIError(
+                service="YouTubeDataAPI",
+                message=f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
+            )
+        except httpx.RequestError as exc:
+            raise ExternalAPIError(service="YouTubeDataAPI", message=str(exc))
 
         return {
             "_source": _SOURCE_MARKER,
