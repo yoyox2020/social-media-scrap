@@ -38,6 +38,7 @@ from app.services.youtube.schemas import (
     DateSearchRequest,
     SmartSearchRequest,
     TrendingFetchRequest,
+    ViralSearchRequest,
     YouTubeCollectRequest,
     YouTubePopularRequest,
 )
@@ -615,6 +616,108 @@ async def viral_videos(
         "total": len(items),
         "note": "Diurutkan berdasarkan view count tertinggi dari semua data di DB",
         "items": items,
+    })
+
+
+@router.post("/videos/viral", response_model=dict)
+async def viral_videos_post(
+    body: ViralSearchRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Cari video viral/trending dari **database** dengan filter lengkap (POST version).
+
+    Filter tersedia:
+    - `keyword_id` : filter per keyword ID
+    - `q`          : filter nama keyword (ILIKE)
+    - `date_from`  : filter dari tanggal publish video
+    - `date_to`    : filter sampai tanggal publish video
+    - `sort_by`    : `views` (terviral) | `newest` | `oldest`
+    - `limit`      : jumlah hasil (maks 200)
+    - `offset`     : pagination
+    """
+    from sqlalchemy import text
+
+    filters = ["p.platform = 'youtube'"]
+    params: dict = {"limit": body.limit, "offset": body.offset}
+
+    if body.keyword_id:
+        filters.append("p.keyword_id = :keyword_id")
+        params["keyword_id"] = str(body.keyword_id)
+    elif body.q:
+        filters.append("k.keyword ILIKE :q_like")
+        params["q_like"] = f"%{body.q.strip()}%"
+
+    if body.date_from:
+        filters.append("p.published_at >= :date_from")
+        params["date_from"] = datetime(body.date_from.year, body.date_from.month, body.date_from.day, tzinfo=timezone.utc)
+    if body.date_to:
+        filters.append("p.published_at <= :date_to")
+        params["date_to"] = datetime(body.date_to.year, body.date_to.month, body.date_to.day, 23, 59, 59, tzinfo=timezone.utc)
+
+    if body.sort_by == "views":
+        filters.append("p.metadata->>'views' IS NOT NULL")
+
+    order = {
+        "views":  "(p.metadata->>'views')::bigint DESC NULLS LAST",
+        "newest": "p.published_at DESC NULLS LAST",
+        "oldest": "p.published_at ASC NULLS LAST",
+    }.get(body.sort_by, "(p.metadata->>'views')::bigint DESC NULLS LAST")
+
+    where_clause = " AND ".join(filters)
+
+    count_sql = text(f"""
+        SELECT COUNT(*) FROM posts p
+        LEFT JOIN keywords k ON p.keyword_id = k.id
+        WHERE {where_clause}
+    """)
+    total = (await db.execute(count_sql, {k: v for k, v in params.items() if k not in ("limit", "offset")})).scalar() or 0
+
+    sql = text(f"""
+        SELECT
+            p.id, p.external_id, p.content, p.author, p.url,
+            p.published_at, p.collected_at, p.metadata,
+            k.keyword, k.id AS keyword_id,
+            (p.metadata->>'views')::bigint AS view_count
+        FROM posts p
+        LEFT JOIN keywords k ON p.keyword_id = k.id
+        WHERE {where_clause}
+        ORDER BY {order}
+        OFFSET :offset LIMIT :limit
+    """)
+    rows = (await db.execute(sql, params)).mappings().all()
+
+    items = [
+        {
+            "rank":          i + 1 + body.offset,
+            "video_id":      r["external_id"],
+            "url":           r["url"] or f"https://youtube.com/watch?v={r['external_id']}",
+            "title":         r["content"],
+            "channel":       r["author"],
+            "view_count":    r["view_count"] or 0,
+            "thumbnail_url": (r["metadata"] or {}).get("thumbnail", (r["metadata"] or {}).get("thumbnail_url", "")),
+            "duration":      (r["metadata"] or {}).get("duration", ""),
+            "published_at":  r["published_at"].isoformat() if r["published_at"] else None,
+            "collected_at":  r["collected_at"].isoformat() if r["collected_at"] else None,
+            "keyword":       r["keyword"],
+            "keyword_id":    str(r["keyword_id"]) if r["keyword_id"] else None,
+        }
+        for i, r in enumerate(rows)
+    ]
+
+    return build_success_response({
+        "sort_by": body.sort_by,
+        "filter": {
+            "keyword_id": str(body.keyword_id) if body.keyword_id else None,
+            "q":          body.q,
+            "date_from":  str(body.date_from) if body.date_from else None,
+            "date_to":    str(body.date_to) if body.date_to else None,
+        },
+        "total":  total,
+        "offset": body.offset,
+        "limit":  body.limit,
+        "items":  items,
     })
 
 

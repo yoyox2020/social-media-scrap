@@ -60,6 +60,16 @@ class YouTubePopularRequest(BaseModel):
     save_to_db: bool = Field(default=True, description="Simpan hasil ke DB sebagai Posts")
 
 
+class ViralSearchRequest(BaseModel):
+    keyword_id: uuid.UUID | None = Field(default=None, description="Filter per keyword ID (opsional)")
+    q: str | None = Field(default=None, max_length=200, description="Filter nama keyword (ILIKE, opsional)")
+    date_from: date | None = Field(default=None, description="Filter dari tanggal publish video (YYYY-MM-DD)")
+    date_to: date | None = Field(default=None, description="Filter sampai tanggal publish video (YYYY-MM-DD)")
+    sort_by: str = Field(default="views", pattern="^(views|newest|oldest)$", description="views | newest | oldest")
+    limit: int = Field(default=20, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+
+
 class DashboardRequest(BaseModel):
     project_id: uuid.UUID | None = None
 
