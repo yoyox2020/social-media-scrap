@@ -757,6 +757,7 @@ async def date_range_search_post(
             keyword_id=crawl_kw_id,
             platform="youtube",
             max_pages=1,
+            max_results=5,
         )
         crawled_new = collect_result.new_posts
 

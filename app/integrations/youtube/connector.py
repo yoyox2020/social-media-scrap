@@ -51,7 +51,7 @@ class YouTubeConnector:
                 raise  # Tidak ada fallback key, teruskan error asli
 
             yt_client = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
-            return await yt_client.search_videos(keyword, max_results=50)
+            return await yt_client.search_videos(keyword, max_results=5)
 
     async def search_by_hashtag(
         self,

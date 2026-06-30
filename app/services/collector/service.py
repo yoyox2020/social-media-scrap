@@ -48,6 +48,7 @@ class CollectorService:
         keyword_id: uuid.UUID,
         platform: str,
         max_pages: int = 5,
+        max_results: int | None = None,
     ) -> CollectionResult:
         """
         Jalankan koleksi secara langsung (sinkron/async) tanpa Celery.
@@ -83,6 +84,9 @@ class CollectorService:
 
                         if not items:
                             break
+
+                        if max_results is not None:
+                            items = items[:max_results]
 
                         posts = normalizer.normalize(items, keyword_id)
                         result.total_fetched += len(posts)
