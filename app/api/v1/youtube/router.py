@@ -687,40 +687,46 @@ async def date_range_search_post(
 
         return list(rows), total
 
-    # ── Resolve keyword_id dari q jika belum ada ─────────────────────────────
-    resolved_kw_id: uuid.UUID | None = body.keyword_id
+    # ── q adalah pencarian utama; keyword_id hanya filter DB tambahan ────────
     q_like = f"%{body.q.strip()}%" if body.q else None
 
-    existing_kw = None
-    # Validasi keyword_id jika disertakan — jika tidak ada di DB, fallback ke q
-    if resolved_kw_id:
-        existing_kw = await db.scalar(
-            select(Keyword).where(Keyword.id == resolved_kw_id).limit(1)
-        )
-        if not existing_kw:
-            resolved_kw_id = None
-
-    if not resolved_kw_id and body.q:
-        existing_kw = await db.scalar(
+    # Keyword yang cocok dengan q di DB (dipakai untuk crawl)
+    kw_from_q = None
+    if body.q:
+        kw_from_q = await db.scalar(
             select(Keyword).where(func.lower(Keyword.keyword) == body.q.strip().lower()).limit(1)
         )
-        if existing_kw:
-            resolved_kw_id = existing_kw.id
+
+    # filter_kw_id: hanya untuk mempersempit hasil DB
+    # Pakai keyword_id dari body jika valid, lalu fallback ke keyword dari q
+    filter_kw_id: uuid.UUID | None = None
+    if body.keyword_id:
+        kw_id_valid = await db.scalar(
+            select(Keyword.id).where(Keyword.id == body.keyword_id).limit(1)
+        )
+        if kw_id_valid:
+            filter_kw_id = body.keyword_id
+    if not filter_kw_id and kw_from_q:
+        filter_kw_id = kw_from_q.id
 
     # ── Cek data di DB ────────────────────────────────────────────────────────
-    rows, total_count = await _query_db(resolved_kw_id, q_like if not resolved_kw_id else None)
+    rows, total_count = await _query_db(filter_kw_id, q_like if not filter_kw_id else None)
     crawl_status = "ready"
     crawl_message = None
     crawled_new = 0
 
-    # ── Auto-crawl jika kosong + ada q ───────────────────────────────────────
+    # ── Auto-crawl jika kosong + ada q (crawl selalu berdasarkan q) ──────────
     if total_count == 0 and body.auto_crawl and body.q:
         from app.domain.projects.models import Project
         from app.repositories.keyword_repository import KeywordRepository
         from app.services.collector.service import CollectorService
 
-        # Buat keyword baru jika belum ada
-        if not existing_kw and not resolved_kw_id:
+        # crawl_kw_id selalu dari q, bukan dari keyword_id body
+        crawl_kw = kw_from_q
+        crawl_kw_id = crawl_kw.id if crawl_kw else None
+
+        # Buat keyword baru dari q jika belum ada
+        if not crawl_kw:
             project_id = await db.scalar(
                 select(Project.id).where(Project.is_active == True).limit(1)  # noqa: E712
             )
@@ -741,14 +747,14 @@ async def date_range_search_post(
             new_kw = Keyword(project_id=project_id, keyword=body.q.strip(), is_active=True)
             db.add(new_kw)
             await db.flush()
-            resolved_kw_id = new_kw.id
+            crawl_kw_id = new_kw.id
             await db.commit()
 
-        # Crawl video (max 1 halaman = ~20 video, sesuai limit kuota)
+        # Crawl video berdasarkan q
         kw_repo = KeywordRepository(db)
         svc = CollectorService(kw_repo)
         collect_result = await svc.collect_for_platform(
-            keyword_id=resolved_kw_id,
+            keyword_id=crawl_kw_id,
             platform="youtube",
             max_pages=1,
         )
@@ -762,7 +768,7 @@ async def date_range_search_post(
         db.expire_all()
         fresh_posts = list((await db.scalars(
             select(Post)
-            .where(Post.keyword_id == resolved_kw_id, Post.platform == "youtube")
+            .where(Post.keyword_id == crawl_kw_id, Post.platform == "youtube")
             .order_by(Post.collected_at.desc())
             .limit(3)
         )).all())
@@ -770,7 +776,7 @@ async def date_range_search_post(
         for post in fresh_posts:
             try:
                 await collect_comments_for_video(
-                    db=db, post_id=post.id, keyword_id=resolved_kw_id,
+                    db=db, post_id=post.id, keyword_id=crawl_kw_id,
                     max_comments=20, max_pages=1,
                 )
             except Exception:
@@ -778,8 +784,8 @@ async def date_range_search_post(
 
         db.expire_all()
 
-        # Query ulang setelah crawl
-        rows, total_count = await _query_db(resolved_kw_id, None)
+        # Query ulang setelah crawl (pakai crawl_kw_id agar hasil konsisten)
+        rows, total_count = await _query_db(crawl_kw_id, None)
         crawl_status  = "crawled"
         crawl_message = (
             f"Data belum ada — crawl {crawled_new} video baru dari YouTube. "
