@@ -35,6 +35,7 @@ from app.services.youtube.pipeline_service import (
     get_wordcloud_data,
 )
 from app.services.youtube.schemas import (
+    DateSearchRequest,
     SmartSearchRequest,
     TrendingFetchRequest,
     YouTubeCollectRequest,
@@ -613,6 +614,391 @@ async def viral_videos(
         "note": "Diurutkan berdasarkan view count tertinggi dari semua data di DB",
         "items": items,
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATE RANGE SEARCH — cari video dari DB berdasarkan kata kunci + rentang tanggal
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/videos/date-search", response_model=dict)
+async def date_range_search_post(
+    body: DateSearchRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Cari video YouTube dari DB berdasarkan **rentang tanggal publish** video (versi POST).
+
+    Body JSON:
+    ```json
+    {
+      "date_from": "2025-06-01",
+      "date_to":   "2025-06-30",
+      "q":         "jokowi",
+      "sort_by":   "views",
+      "include_sentiment": true
+    }
+    ```
+
+    Identik dengan GET `/videos/date-search` tapi parameter dikirim lewat body —
+    lebih nyaman untuk request dari frontend/aplikasi.
+    """
+    from sqlalchemy import text
+
+    dt_from = datetime(body.date_from.year, body.date_from.month, body.date_from.day, tzinfo=timezone.utc)
+    dt_to   = datetime(body.date_to.year,   body.date_to.month,   body.date_to.day,   23, 59, 59, tzinfo=timezone.utc)
+
+    filters = [
+        "p.platform = 'youtube'",
+        "p.published_at >= :dt_from",
+        "p.published_at <= :dt_to",
+    ]
+    params: dict = {
+        "dt_from": dt_from,
+        "dt_to":   dt_to,
+        "limit":   body.limit,
+        "offset":  body.offset,
+    }
+
+    if body.keyword_id:
+        filters.append("p.keyword_id = :keyword_id")
+        params["keyword_id"] = str(body.keyword_id)
+    elif body.q:
+        filters.append("k.keyword ILIKE :q_like")
+        params["q_like"] = f"%{body.q.strip()}%"
+
+    order_clause = {
+        "newest": "p.published_at DESC NULLS LAST",
+        "oldest": "p.published_at ASC NULLS LAST",
+        "views":  "(p.metadata->>'views')::bigint DESC NULLS LAST",
+    }.get(body.sort_by, "p.published_at DESC NULLS LAST")
+
+    where_clause = " AND ".join(filters)
+
+    sql_videos = text(f"""
+        SELECT
+            p.id, p.external_id, p.content, p.author, p.url,
+            p.keyword_id, p.collected_at, p.published_at, p.metadata,
+            k.keyword, k.id AS kw_id
+        FROM posts p
+        LEFT JOIN keywords k ON p.keyword_id = k.id
+        WHERE {where_clause}
+        ORDER BY {order_clause}
+        OFFSET :offset LIMIT :limit
+    """)
+
+    sql_count = text(f"""
+        SELECT COUNT(*) FROM posts p
+        LEFT JOIN keywords k ON p.keyword_id = k.id
+        WHERE {where_clause}
+    """)
+
+    rows        = (await db.execute(sql_videos, params)).mappings().all()
+    total_count = (await db.execute(sql_count, {k: v for k, v in params.items() if k not in ("limit", "offset")})).scalar() or 0
+
+    items = []
+    for row in rows:
+        meta = row["metadata"] or {}
+        raw_views = meta.get("views", meta.get("view_count", 0))
+        try:
+            view_count = int(str(raw_views).replace(",", "").split()[0]) if raw_views else 0
+        except (ValueError, IndexError):
+            view_count = 0
+        items.append({
+            "id":            str(row["id"]),
+            "video_id":      row["external_id"],
+            "url":           row["url"] or f"https://youtube.com/watch?v={row['external_id']}",
+            "title":         row["content"],
+            "channel":       row["author"],
+            "view_count":    view_count,
+            "thumbnail_url": meta.get("thumbnail", meta.get("thumbnail_url", "")),
+            "duration":      meta.get("duration", ""),
+            "keyword":       row["keyword"],
+            "keyword_id":    str(row["kw_id"]) if row["kw_id"] else None,
+            "published_at":  row["published_at"].isoformat() if row["published_at"] else None,
+            "collected_at":  row["collected_at"].isoformat() if row["collected_at"] else None,
+        })
+
+    result: dict = {
+        "filter": {
+            "date_from":  str(body.date_from),
+            "date_to":    str(body.date_to),
+            "q":          body.q,
+            "keyword_id": str(body.keyword_id) if body.keyword_id else None,
+            "sort_by":    body.sort_by,
+        },
+        "total":  total_count,
+        "offset": body.offset,
+        "limit":  body.limit,
+        "items":  items,
+    }
+
+    if body.include_sentiment:
+        kw_filter_sent = ""
+        params_sent: dict = {"dt_from": dt_from, "dt_to": dt_to}
+
+        if body.keyword_id:
+            kw_filter_sent = "AND p.keyword_id = :keyword_id"
+            params_sent["keyword_id"] = str(body.keyword_id)
+        elif body.q:
+            kw_filter_sent = "AND k.keyword ILIKE :q_like"
+            params_sent["q_like"] = f"%{body.q.strip()}%"
+
+        sql_sent = text(f"""
+            SELECT la.label, COUNT(*) AS cnt
+            FROM lexicon_analysis la
+            JOIN comments c ON la.comment_id = c.id
+            JOIN posts p    ON c.post_id = p.id
+            LEFT JOIN keywords k ON p.keyword_id = k.id
+            WHERE p.platform = 'youtube'
+              AND p.published_at >= :dt_from
+              AND p.published_at <= :dt_to
+              {kw_filter_sent}
+            GROUP BY la.label
+        """)
+
+        sent_rows = (await db.execute(sql_sent, params_sent)).mappings().all()
+        dist: dict[str, int] = {r["label"]: r["cnt"] for r in sent_rows}
+        total_analyzed = sum(dist.values())
+
+        sentiment_summary = {
+            lbl: {
+                "count":      dist.get(lbl, 0),
+                "percentage": round(dist.get(lbl, 0) / total_analyzed * 100, 1) if total_analyzed else 0.0,
+            }
+            for lbl in ["positif", "negatif", "netral"]
+        }
+        dominant = max(dist, key=dist.get) if dist else "netral"
+
+        sql_daily = text(f"""
+            SELECT
+                DATE(p.published_at AT TIME ZONE 'UTC') AS day,
+                COUNT(*) AS video_count
+            FROM posts p
+            LEFT JOIN keywords k ON p.keyword_id = k.id
+            WHERE p.platform = 'youtube'
+              AND p.published_at >= :dt_from
+              AND p.published_at <= :dt_to
+              {kw_filter_sent}
+            GROUP BY day
+            ORDER BY day ASC
+        """)
+
+        daily_rows = (await db.execute(sql_daily, params_sent)).mappings().all()
+        result["sentiment"] = {
+            **sentiment_summary,
+            "dominant":       dominant,
+            "total_analyzed": total_analyzed,
+        }
+        result["daily_breakdown"] = [
+            {"date": str(r["day"]), "video_count": r["video_count"]}
+            for r in daily_rows
+        ]
+
+    return build_success_response(result)
+
+
+@router.get("/videos/date-search", response_model=dict)
+async def date_range_search(
+    date_from: date = Query(..., description="Tanggal mulai (YYYY-MM-DD), inklusif"),
+    date_to: date = Query(..., description="Tanggal akhir (YYYY-MM-DD), inklusif"),
+    q: str | None = Query(default=None, max_length=200, description="Filter kata kunci (opsional, tanpa filter = semua keyword)"),
+    keyword_id: uuid.UUID | None = Query(default=None, description="Filter per keyword ID (opsional)"),
+    sort_by: str = Query(default="newest", description="Urutan: newest (terbaru), oldest (terlama), views (terviral)"),
+    limit: int = Query(default=20, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    include_sentiment: bool = Query(default=True, description="Sertakan distribusi sentimen komentar dalam rentang tanggal ini"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Cari video YouTube dari DB berdasarkan **rentang tanggal publish** video.
+
+    Parameter wajib:
+    - `date_from` : tanggal mulai (YYYY-MM-DD)
+    - `date_to`   : tanggal akhir (YYYY-MM-DD), inklusif
+
+    Parameter opsional:
+    - `q`          : filter kata kunci (cari di nama keyword, LIKE match)
+    - `keyword_id` : filter per keyword ID (lebih presisi dari `q`)
+    - `sort_by`    : newest / oldest / views
+    - `include_sentiment` : sertakan distribusi sentimen & breakdown per hari
+
+    **Catatan:** filter tanggal berlaku pada `published_at` video (bukan `collected_at`).
+    Video yang di-scrape hari ini tapi di-publish 3 bulan lalu akan muncul jika
+    rentang tanggal mencakup tanggal publishnya.
+    """
+    from sqlalchemy import text
+
+    if date_from > date_to:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail="date_from tidak boleh lebih besar dari date_to")
+
+    dt_from = datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc)
+    dt_to   = datetime(date_to.year,   date_to.month,   date_to.day,   23, 59, 59, tzinfo=timezone.utc)
+
+    # ── Build WHERE filters ───────────────────────────────────────────────────
+    filters = [
+        "p.platform = 'youtube'",
+        "p.published_at >= :dt_from",
+        "p.published_at <= :dt_to",
+    ]
+    params: dict = {
+        "dt_from": dt_from,
+        "dt_to":   dt_to,
+        "limit":   limit,
+        "offset":  offset,
+    }
+
+    if keyword_id:
+        filters.append("p.keyword_id = :keyword_id")
+        params["keyword_id"] = str(keyword_id)
+    elif q:
+        filters.append("k.keyword ILIKE :q_like")
+        params["q_like"] = f"%{q.strip()}%"
+
+    order_clause = {
+        "newest": "p.published_at DESC NULLS LAST",
+        "oldest": "p.published_at ASC NULLS LAST",
+        "views":  "(p.metadata->>'views')::bigint DESC NULLS LAST",
+    }.get(sort_by, "p.published_at DESC NULLS LAST")
+
+    where_clause = " AND ".join(filters)
+
+    # ── Videos ───────────────────────────────────────────────────────────────
+    sql_videos = text(f"""
+        SELECT
+            p.id,
+            p.external_id,
+            p.content,
+            p.author,
+            p.url,
+            p.keyword_id,
+            p.collected_at,
+            p.published_at,
+            p.metadata,
+            k.keyword,
+            k.id AS kw_id
+        FROM posts p
+        LEFT JOIN keywords k ON p.keyword_id = k.id
+        WHERE {where_clause}
+        ORDER BY {order_clause}
+        OFFSET :offset LIMIT :limit
+    """)
+
+    sql_count = text(f"""
+        SELECT COUNT(*) FROM posts p
+        LEFT JOIN keywords k ON p.keyword_id = k.id
+        WHERE {where_clause}
+    """)
+
+    rows        = (await db.execute(sql_videos, params)).mappings().all()
+    total_count = (await db.execute(sql_count, {k: v for k, v in params.items() if k not in ("limit", "offset")})).scalar() or 0
+
+    items = []
+    for row in rows:
+        meta = row["metadata"] or {}
+        raw_views = meta.get("views", meta.get("view_count", 0))
+        try:
+            view_count = int(str(raw_views).replace(",", "").split()[0]) if raw_views else 0
+        except (ValueError, IndexError):
+            view_count = 0
+        items.append({
+            "id":            str(row["id"]),
+            "video_id":      row["external_id"],
+            "url":           row["url"] or f"https://youtube.com/watch?v={row['external_id']}",
+            "title":         row["content"],
+            "channel":       row["author"],
+            "view_count":    view_count,
+            "thumbnail_url": meta.get("thumbnail", meta.get("thumbnail_url", "")),
+            "duration":      meta.get("duration", ""),
+            "keyword":       row["keyword"],
+            "keyword_id":    str(row["kw_id"]) if row["kw_id"] else None,
+            "published_at":  row["published_at"].isoformat() if row["published_at"] else None,
+            "collected_at":  row["collected_at"].isoformat() if row["collected_at"] else None,
+        })
+
+    result: dict = {
+        "filter": {
+            "date_from":  str(date_from),
+            "date_to":    str(date_to),
+            "q":          q,
+            "keyword_id": str(keyword_id) if keyword_id else None,
+            "sort_by":    sort_by,
+        },
+        "total":  total_count,
+        "offset": offset,
+        "limit":  limit,
+        "items":  items,
+    }
+
+    # ── Sentiment + breakdown per hari (opsional) ─────────────────────────────
+    if include_sentiment:
+        kw_filter_sent = ""
+        params_sent: dict = {"dt_from": dt_from, "dt_to": dt_to}
+
+        if keyword_id:
+            kw_filter_sent = "AND p.keyword_id = :keyword_id"
+            params_sent["keyword_id"] = str(keyword_id)
+        elif q:
+            kw_filter_sent = "AND k.keyword ILIKE :q_like"
+            params_sent["q_like"] = f"%{q.strip()}%"
+
+        sql_sent = text(f"""
+            SELECT la.label, COUNT(*) AS cnt
+            FROM lexicon_analysis la
+            JOIN comments c ON la.comment_id = c.id
+            JOIN posts p    ON c.post_id = p.id
+            LEFT JOIN keywords k ON p.keyword_id = k.id
+            WHERE p.platform = 'youtube'
+              AND p.published_at >= :dt_from
+              AND p.published_at <= :dt_to
+              {kw_filter_sent}
+            GROUP BY la.label
+        """)
+
+        sent_rows = (await db.execute(sql_sent, params_sent)).mappings().all()
+        dist: dict[str, int] = {r["label"]: r["cnt"] for r in sent_rows}
+        total_analyzed = sum(dist.values())
+
+        sentiment_summary = {
+            lbl: {
+                "count":      dist.get(lbl, 0),
+                "percentage": round(dist.get(lbl, 0) / total_analyzed * 100, 1) if total_analyzed else 0.0,
+            }
+            for lbl in ["positif", "negatif", "netral"]
+        }
+        dominant = max(dist, key=dist.get) if dist else "netral"
+
+        # Breakdown jumlah video per hari dalam rentang
+        sql_daily = text(f"""
+            SELECT
+                DATE(p.published_at AT TIME ZONE 'UTC') AS day,
+                COUNT(*) AS video_count
+            FROM posts p
+            LEFT JOIN keywords k ON p.keyword_id = k.id
+            WHERE p.platform = 'youtube'
+              AND p.published_at >= :dt_from
+              AND p.published_at <= :dt_to
+              {kw_filter_sent}
+            GROUP BY day
+            ORDER BY day ASC
+        """)
+
+        daily_rows = (await db.execute(sql_daily, params_sent)).mappings().all()
+        daily_breakdown = [
+            {"date": str(r["day"]), "video_count": r["video_count"]}
+            for r in daily_rows
+        ]
+
+        result["sentiment"] = {
+            **sentiment_summary,
+            "dominant":       dominant,
+            "total_analyzed": total_analyzed,
+        }
+        result["daily_breakdown"] = daily_breakdown
+
+    return build_success_response(result)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

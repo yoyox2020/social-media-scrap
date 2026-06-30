@@ -2,9 +2,9 @@
 Schemas untuk YouTube pipeline service.
 """
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -24,6 +24,23 @@ class SmartSearchRequest(BaseModel):
     max_comments_per_video: int = Field(default=50, ge=10, le=200, description="Maks komentar per video")
     max_comment_pages: int = Field(default=2, ge=1, le=5, description="Maks halaman komentar per video")
     force_refresh: bool = Field(default=False, description="Paksa crawl ulang meski data sudah ada di DB")
+
+
+class DateSearchRequest(BaseModel):
+    date_from: date = Field(..., description="Tanggal mulai (YYYY-MM-DD), inklusif")
+    date_to: date = Field(..., description="Tanggal akhir (YYYY-MM-DD), inklusif")
+    q: str | None = Field(default=None, max_length=200, description="Filter nama keyword (ILIKE, opsional)")
+    keyword_id: uuid.UUID | None = Field(default=None, description="Filter per keyword ID (lebih presisi dari q)")
+    sort_by: str = Field(default="newest", pattern="^(newest|oldest|views)$", description="newest | oldest | views")
+    limit: int = Field(default=20, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+    include_sentiment: bool = Field(default=True, description="Sertakan distribusi sentimen & breakdown per hari")
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> "DateSearchRequest":
+        if self.date_from > self.date_to:
+            raise ValueError("date_from tidak boleh lebih besar dari date_to")
+        return self
 
 
 class TrendingFetchRequest(BaseModel):
