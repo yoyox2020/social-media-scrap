@@ -15,11 +15,21 @@ class YouTubeDataAPIClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
 
-    async def search_videos(self, keyword: str, max_results: int = 50) -> dict[str, Any]:
+    async def search_videos(
+        self,
+        keyword: str,
+        max_results: int = 50,
+        order: str = "relevance",
+    ) -> dict[str, Any]:
+        """
+        Cari video YouTube berdasarkan keyword.
+        order: relevance | viewCount | date | rating | title
+        """
         params = {
             "part": "snippet",
             "q": keyword,
             "type": "video",
+            "order": order,
             "key": self.api_key,
             "maxResults": min(max_results, 50),
         }

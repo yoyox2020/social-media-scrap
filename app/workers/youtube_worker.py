@@ -180,6 +180,7 @@ async def _run_youtube_pipeline(
             keyword_id=kw_uuid,
             platform="youtube",
             max_pages=max_pages,
+            db=db,
         )
 
     videos_new = collection_result.new_posts

@@ -6,11 +6,15 @@ Flow:
   Celery task → Connector (EnsembleData) → Normalizer → PostRepository
 """
 import uuid
+from typing import TYPE_CHECKING
 
 from app.repositories.keyword_repository import KeywordRepository
 from app.services.collector.schemas import CollectJobResponse, CollectionResult
 from app.shared.exceptions import NotFoundError, ValidationError
 from app.integrations.ensemble_data.endpoints import SUPPORTED_COLLECTION_PLATFORMS
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class CollectorService:
@@ -49,68 +53,94 @@ class CollectorService:
         platform: str,
         max_pages: int = 5,
         max_results: int | None = None,
+        db: "AsyncSession | None" = None,
     ) -> CollectionResult:
         """
         Jalankan koleksi secara langsung (sinkron/async) tanpa Celery.
         Dipanggil dari dalam Celery task.
+
+        Jika `db` tidak diberikan, dibuat session baru dari AsyncSessionLocal
+        global. Saat dipanggil dari Celery ForkPoolWorker, caller WAJIB
+        mengirim session yang dibuat lewat fresh engine (lihat
+        `_get_fresh_session()` di app/workers/youtube_worker.py) — engine
+        global terikat ke event loop parent process dan akan menyebabkan
+        asyncpg InterfaceError ("another operation is in progress") jika
+        dipakai di event loop baru milik child process.
         """
+        if db is not None:
+            return await self._collect_for_platform_with_session(
+                db, keyword_id, platform, max_pages, max_results
+            )
+
         from app.infrastructure.database.connection import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as fresh_db:
+            return await self._collect_for_platform_with_session(
+                fresh_db, keyword_id, platform, max_pages, max_results
+            )
+
+    async def _collect_for_platform_with_session(
+        self,
+        db: "AsyncSession",
+        keyword_id: uuid.UUID,
+        platform: str,
+        max_pages: int,
+        max_results: int | None,
+    ) -> CollectionResult:
         from app.integrations.ensemble_data.client import EnsembleDataClient
         from app.repositories.post_repository import PostRepository
         from app.services.processing.normalizer import get_normalizer
-        from app.domain.keywords.models import Keyword
 
-        async with AsyncSessionLocal() as db:
-            keyword_repo = KeywordRepository(db)
-            keyword = await keyword_repo.get_by_id(keyword_id)
-            if not keyword:
-                raise NotFoundError("Keyword", str(keyword_id))
+        keyword_repo = KeywordRepository(db)
+        keyword = await keyword_repo.get_by_id(keyword_id)
+        if not keyword:
+            raise NotFoundError("Keyword", str(keyword_id))
 
-            result = CollectionResult(platform=platform, keyword=keyword.keyword)
-            normalizer = get_normalizer(platform)
-            connector = _get_connector(platform)
-            post_repo = PostRepository(db)
+        result = CollectionResult(platform=platform, keyword=keyword.keyword)
+        normalizer = get_normalizer(platform)
+        connector = _get_connector(platform)
+        post_repo = PostRepository(db)
 
-            async with EnsembleDataClient() as client:
-                connector_instance = connector(client)
-                cursor = None
+        async with EnsembleDataClient() as client:
+            connector_instance = connector(client)
+            cursor = None
 
-                for page in range(max_pages):
-                    try:
-                        raw = await _fetch_page(
-                            connector_instance, platform, keyword.keyword, cursor, max_pages
-                        )
-                        items = connector_instance.extract_posts(raw)
+            for page in range(max_pages):
+                try:
+                    raw = await _fetch_page(
+                        connector_instance, platform, keyword.keyword, cursor, max_pages
+                    )
+                    items = connector_instance.extract_posts(raw)
 
-                        if not items:
-                            break
-
-                        if max_results is not None:
-                            items = items[:max_results]
-
-                        posts = normalizer.normalize(items, keyword_id)
-                        result.total_fetched += len(posts)
-                        result.pages_fetched += 1
-
-                        # Deduplication
-                        ext_ids = [p.external_id for p in posts]
-                        existing = await post_repo.get_existing_external_ids(ext_ids, platform)
-                        new_posts = [p for p in posts if p.external_id not in existing]
-                        result.skipped_duplicates += len(posts) - len(new_posts)
-
-                        if new_posts:
-                            inserted = await post_repo.bulk_create(new_posts)
-                            result.new_posts += inserted
-
-                        cursor = connector_instance.extract_cursor(raw)
-                        if cursor is None:
-                            break
-
-                    except Exception as exc:
-                        result.errors.append(f"Page {page + 1}: {exc}")
+                    if not items:
                         break
 
-                await db.commit()
+                    if max_results is not None:
+                        items = items[:max_results]
+
+                    posts = normalizer.normalize(items, keyword_id)
+                    result.total_fetched += len(posts)
+                    result.pages_fetched += 1
+
+                    # Deduplication
+                    ext_ids = [p.external_id for p in posts]
+                    existing = await post_repo.get_existing_external_ids(ext_ids, platform)
+                    new_posts = [p for p in posts if p.external_id not in existing]
+                    result.skipped_duplicates += len(posts) - len(new_posts)
+
+                    if new_posts:
+                        inserted = await post_repo.bulk_create(new_posts)
+                        result.new_posts += inserted
+
+                    cursor = connector_instance.extract_cursor(raw)
+                    if cursor is None:
+                        break
+
+                except Exception as exc:
+                    result.errors.append(f"Page {page + 1}: {exc}")
+                    break
+
+            await db.commit()
 
         return result
 
