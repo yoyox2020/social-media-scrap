@@ -564,7 +564,8 @@ async def list_videos(
 @router.get("/videos/viral", response_model=dict)
 async def viral_videos(
     limit: int = Query(default=20, ge=1, le=100, description="Jumlah video teratas"),
-    keyword_id: uuid.UUID | None = Query(default=None, description="Filter per keyword (opsional)"),
+    keyword_id: uuid.UUID | None = Query(default=None, description="Filter per keyword UUID (opsional)"),
+    q: str | None = Query(default=None, max_length=200, description="Filter nama keyword (ILIKE, opsional — alternatif keyword_id)"),
     limit_comments: int = Query(default=10, ge=0, le=200, description="Jumlah sample komentar (0 = tidak ambil)"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -572,6 +573,8 @@ async def viral_videos(
     """
     Top N video YouTube dengan views terbanyak dari semua data yang tersimpan di DB.
     Default menampilkan 20 video paling viral lintas semua keyword.
+
+    Filter keyword: gunakan `keyword_id` (UUID) ATAU `q` (nama keyword, ILIKE).
     """
     from sqlalchemy import text
 
@@ -581,6 +584,9 @@ async def viral_videos(
     if keyword_id:
         filters.append("p.keyword_id = :keyword_id")
         params["keyword_id"] = str(keyword_id)
+    elif q:
+        filters.append("k.keyword ILIKE :q_like")
+        params["q_like"] = f"%{q.strip()}%"
 
     where_clause = " AND ".join(filters)
     sql = text(f"""
@@ -620,6 +626,9 @@ async def viral_videos(
         if keyword_id:
             c_filters.append("p.keyword_id = :keyword_id_c")
             c_params["keyword_id_c"] = str(keyword_id)
+        elif q:
+            c_filters.append("k.keyword ILIKE :q_like_c")
+            c_params["q_like_c"] = f"%{q.strip()}%"
         c_where = " AND ".join(c_filters)
         comment_rows = (await db.execute(text(f"""
             SELECT c.id, c.content, c.author,
@@ -628,6 +637,7 @@ async def viral_videos(
             FROM comments c
             JOIN posts p ON c.post_id = p.id
             LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+            LEFT JOIN keywords k ON p.keyword_id = k.id
             WHERE {c_where}
             ORDER BY c.created_at DESC
             LIMIT :lc
@@ -647,6 +657,7 @@ async def viral_videos(
     return build_success_response({
         "total": len(items),
         "note": "Diurutkan berdasarkan view count tertinggi dari semua data di DB",
+        "filter": {"keyword_id": str(keyword_id) if keyword_id else None, "q": q},
         "items": items,
         "comments": comments,
     })
