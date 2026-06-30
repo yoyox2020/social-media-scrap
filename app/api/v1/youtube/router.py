@@ -1166,6 +1166,43 @@ async def date_range_search_post(
             "collected_at":  row["collected_at"].isoformat() if row["collected_at"] else None,
         })
 
+    # ── Komentar ──────────────────────────────────────────────────────────────
+    comments = []
+    if body.limit_comments > 0:
+        kw_filter_c = ""
+        params_c: dict = {"dt_from": dt_from, "dt_to": dt_to, "lc": body.limit_comments}
+        if filter_kw_id:
+            kw_filter_c = "AND p.keyword_id = :kw_id_c"
+            params_c["kw_id_c"] = str(filter_kw_id)
+        elif q_like:
+            kw_filter_c = "AND k.keyword ILIKE :q_like_c"
+            params_c["q_like_c"] = q_like
+        comment_rows = (await db.execute(text(f"""
+            SELECT c.id, c.content, c.author,
+                   la.label AS sentiment, la.score,
+                   p.url AS video_url, p.external_id
+            FROM comments c
+            JOIN posts p ON c.post_id = p.id
+            LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+            LEFT JOIN keywords k ON p.keyword_id = k.id
+            WHERE p.platform = 'youtube'
+              AND p.published_at >= :dt_from AND p.published_at <= :dt_to
+              {kw_filter_c}
+            ORDER BY c.created_at DESC
+            LIMIT :lc
+        """), params_c)).mappings().all()
+        comments = [
+            {
+                "id":        str(r["id"]),
+                "content":   r["content"],
+                "author":    r["author"],
+                "sentiment": r["sentiment"],
+                "score":     round(float(r["score"]), 3) if r["score"] is not None else None,
+                "video_url": r["video_url"] or f"https://www.youtube.com/watch?v={r['external_id']}",
+            }
+            for r in comment_rows
+        ]
+
     result: dict = {
         "status":  crawl_status,
         "message": crawl_message,
@@ -1180,6 +1217,7 @@ async def date_range_search_post(
         "offset": body.offset,
         "limit":  body.limit,
         "items":  items,
+        "comments": comments,
     }
 
     # ── Sentiment + daily breakdown ───────────────────────────────────────────
@@ -1244,6 +1282,7 @@ async def date_range_search(
     sort_by: str = Query(default="newest", description="Urutan: newest (terbaru), oldest (terlama), views (terviral)"),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    limit_comments: int = Query(default=50, ge=0, le=500, description="Jumlah sample komentar (0 = tidak ambil)"),
     include_sentiment: bool = Query(default=True, description="Sertakan distribusi sentimen komentar dalam rentang tanggal ini"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -1355,6 +1394,43 @@ async def date_range_search(
             "collected_at":  row["collected_at"].isoformat() if row["collected_at"] else None,
         })
 
+    # ── Komentar ──────────────────────────────────────────────────────────────
+    comments = []
+    if limit_comments > 0:
+        kw_filter_c = ""
+        params_c: dict = {"dt_from": dt_from, "dt_to": dt_to, "lc": limit_comments}
+        if keyword_id:
+            kw_filter_c = "AND p.keyword_id = :kw_id_c"
+            params_c["kw_id_c"] = str(keyword_id)
+        elif q:
+            kw_filter_c = "AND k.keyword ILIKE :q_like_c"
+            params_c["q_like_c"] = f"%{q.strip()}%"
+        comment_rows = (await db.execute(text(f"""
+            SELECT c.id, c.content, c.author,
+                   la.label AS sentiment, la.score,
+                   p.url AS video_url, p.external_id
+            FROM comments c
+            JOIN posts p ON c.post_id = p.id
+            LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+            LEFT JOIN keywords k ON p.keyword_id = k.id
+            WHERE p.platform = 'youtube'
+              AND p.published_at >= :dt_from AND p.published_at <= :dt_to
+              {kw_filter_c}
+            ORDER BY c.created_at DESC
+            LIMIT :lc
+        """), params_c)).mappings().all()
+        comments = [
+            {
+                "id":        str(r["id"]),
+                "content":   r["content"],
+                "author":    r["author"],
+                "sentiment": r["sentiment"],
+                "score":     round(float(r["score"]), 3) if r["score"] is not None else None,
+                "video_url": r["video_url"] or f"https://www.youtube.com/watch?v={r['external_id']}",
+            }
+            for r in comment_rows
+        ]
+
     result: dict = {
         "filter": {
             "date_from":  str(date_from),
@@ -1367,6 +1443,7 @@ async def date_range_search(
         "offset": offset,
         "limit":  limit,
         "items":  items,
+        "comments": comments,
     }
 
     # ── Sentiment + breakdown per hari (opsional) ─────────────────────────────
