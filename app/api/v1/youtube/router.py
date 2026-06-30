@@ -658,8 +658,8 @@ async def viral_videos(
         "total": len(items),
         "note": "Diurutkan berdasarkan view count tertinggi dari semua data di DB",
         "filter": {"keyword_id": str(keyword_id) if keyword_id else None, "q": q},
-        "items": items,
         "comments": comments,
+        "items": items,
     })
 
 
@@ -873,8 +873,8 @@ async def viral_videos_post(
         "total":  total,
         "offset": body.offset,
         "limit":  body.limit,
-        "items":  items,
         "comments": comments,
+        "items":  items,
     })
 
 
