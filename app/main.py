@@ -1,9 +1,44 @@
 from contextlib import asynccontextmanager
+import json
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+
+def _fix_leading_zeros(s: str) -> str:
+    """
+    Perbaiki leading zero pada angka JSON di luar string.
+    Contoh: 05 → 5, 007 → 7. Tidak mengubah 0.5 atau string "007".
+    """
+    result = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == '"':
+            # Salin string secara utuh — jangan ubah isi string
+            result.append(c)
+            i += 1
+            while i < n:
+                ch = s[i]
+                result.append(ch)
+                if ch == '\\' and i + 1 < n:
+                    i += 1
+                    result.append(s[i])
+                elif ch == '"':
+                    break
+                i += 1
+        elif c == '0' and i + 1 < n and s[i + 1].isdigit():
+            # Leading zero di luar string — strip semua leading zero
+            while i < n and s[i] == '0' and i + 1 < n and s[i + 1].isdigit():
+                i += 1
+            result.append(s[i])
+        else:
+            result.append(c)
+        i += 1
+    return ''.join(result)
 
 from app.api.v1 import (
     agents,
@@ -79,6 +114,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def sanitize_json_body(request: Request, call_next):
+    """
+    Auto-fix JSON body yang tidak valid sebelum FastAPI mem-parse-nya.
+    Saat ini menangani: leading zeros pada angka (05 → 5, 007 → 7).
+    Tidak mengubah request yang JSON-nya sudah valid.
+    """
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type and request.method in ("POST", "PUT", "PATCH"):
+        body = await request.body()
+        if body:
+            body_str = body.decode("utf-8", errors="replace")
+            try:
+                json.loads(body_str)
+            except json.JSONDecodeError:
+                fixed = _fix_leading_zeros(body_str)
+                try:
+                    json.loads(fixed)
+                    request._body = fixed.encode("utf-8")
+                except json.JSONDecodeError:
+                    pass  # Masih invalid → biarkan FastAPI handle error aslinya
+    return await call_next(request)
 
 
 @app.exception_handler(AppException)
