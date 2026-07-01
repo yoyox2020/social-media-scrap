@@ -660,7 +660,7 @@ async def get_video_detail(
     comments = []
     if limit_comments > 0:
         rows = (await db.execute(text("""
-            SELECT c.id, c.external_id, c.content, c.author, c.created_at, c.metadata_,
+            SELECT c.id, c.external_id, c.content, c.author, c.created_at, c.metadata,
                    la.label AS sentiment, la.score AS sentiment_score
             FROM comments c
             LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
@@ -670,7 +670,7 @@ async def get_video_detail(
         """), {"post_id": str(post.id), "lc": limit_comments})).mappings().all()
 
         for r in rows:
-            cm = r["metadata_"] or {}
+            cm = r["metadata"] or {}
             comments.append({
                 "id": str(r["id"]),
                 "comment_id": r["external_id"],
@@ -1821,7 +1821,7 @@ async def list_comments(
 
     rows = (await db.execute(text(f"""
         SELECT
-            c.id, c.external_id, c.content, c.author, c.created_at, c.metadata_,
+            c.id, c.external_id, c.content, c.author, c.created_at, c.metadata,
             p.id AS post_id, p.external_id AS post_ext_id, p.content AS post_title, p.url AS post_url,
             la.label AS sentiment, la.score AS sentiment_score,
             k.keyword
@@ -1836,7 +1836,7 @@ async def list_comments(
 
     items = []
     for r in rows:
-        meta = r["metadata_"] or {}
+        meta = r["metadata"] or {}
         items.append({
             "id": str(r["id"]),
             "comment_id": r["external_id"],
