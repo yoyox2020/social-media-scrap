@@ -191,14 +191,14 @@ async def check_and_flag_commenters(db: AsyncSession, tracker_id: uuid.UUID) -> 
         text("""
             SELECT
                 c.author,
-                c.metadata_ ->> 'author_channel_id' AS channel_id,
+                c.metadata ->> 'author_channel_id' AS channel_id,
                 COUNT(*) AS cnt
             FROM comments c
             JOIN posts p ON p.id = c.post_id
             WHERE
                 p.platform = 'youtube'
-                AND p.metadata_ ->> 'tracker_id' = :tracker_id
-            GROUP BY c.author, c.metadata_ ->> 'author_channel_id'
+                AND p.metadata ->> 'tracker_id' = :tracker_id
+            GROUP BY c.author, c.metadata ->> 'author_channel_id'
             HAVING COUNT(*) > :threshold
         """),
         {"tracker_id": str(tracker_id), "threshold": COMMENTER_FLAG_THRESHOLD},

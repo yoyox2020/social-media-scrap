@@ -157,6 +157,7 @@ class YouTubeConnector:
         self,
         browse_id: str,
         cursor: str = "",
+        depth: int = 1,
     ) -> dict[str, Any]:
         """
         Ambil video dari channel.
@@ -164,10 +165,11 @@ class YouTubeConnector:
         Args:
             browse_id: Channel ID (UCxxxxxxxxxxxxxxx)
             cursor:    Token halaman berikutnya, "" untuk halaman pertama
+            depth:     Jumlah halaman yang diambil (1 = ~20 video, min 1)
         """
         return await self.client.get(
             YouTubeEndpoints.CHANNEL_VIDEOS.path,
-            params={"browseId": browse_id, "cursor": cursor},
+            params={"browseId": browse_id, "cursor": cursor, "depth": min(depth, MAX_DEPTH)},
         )
 
     async def get_channel_id_to_name(self, browse_id: str) -> dict[str, Any]:
