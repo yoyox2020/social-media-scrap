@@ -31,15 +31,24 @@ COMMENTER_FLAG_THRESHOLD = 10
 async def detect_and_create_trackers(db: AsyncSession) -> list[uuid.UUID]:
     """
     Cari post YouTube dengan views >=1M yang belum punya tracker, buat tracker baru.
+    Satu tracker per channel — jika channel sudah punya tracker aktif, skip.
     Return list tracker_id yang baru dibuat.
     """
-    # Post viral yang BELUM ada trackernya
+    # Post yang sudah ada trackernya (berdasarkan trigger_post_id)
     existing_tracker_post_ids_result = await db.execute(
         select(ViralChannelTracker.trigger_post_id).where(
             ViralChannelTracker.trigger_post_id.isnot(None)
         )
     )
-    already_tracked: set[uuid.UUID] = set(existing_tracker_post_ids_result.scalars().all())
+    already_tracked_posts: set[uuid.UUID] = set(existing_tracker_post_ids_result.scalars().all())
+
+    # Channel yang sudah punya tracker aktif (deduplication per channel)
+    existing_active_channels_result = await db.execute(
+        select(ViralChannelTracker.channel_id).where(
+            ViralChannelTracker.status == "active"
+        )
+    )
+    tracked_channels: set[str] = set(existing_active_channels_result.scalars().all())
 
     viral_posts_result = await db.execute(
         select(Post).where(
@@ -53,11 +62,11 @@ async def detect_and_create_trackers(db: AsyncSession) -> list[uuid.UUID]:
     now = datetime.now(timezone.utc)
 
     for post in viral_posts:
-        if post.id in already_tracked:
+        if post.id in already_tracked_posts:
             continue
 
         channel_id = _extract_channel_id_from_raw(post.raw_data or {})
-        if not channel_id:
+        if not channel_id or channel_id in tracked_channels:
             continue
 
         channel_name = _extract_channel_name_from_raw(post.raw_data or {})
@@ -76,6 +85,7 @@ async def detect_and_create_trackers(db: AsyncSession) -> list[uuid.UUID]:
         db.add(tracker)
         await db.flush()
         new_tracker_ids.append(tracker.id)
+        tracked_channels.add(channel_id)  # prevent duplicates within this run
 
     await db.commit()
     return new_tracker_ids
