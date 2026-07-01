@@ -68,11 +68,11 @@ celery_app.conf.update(
             "schedule": crontab(hour=3, minute=0),
             "options": {"queue": "default"},
         },
-        # YouTube: fetch trending Indonesia setiap 1 jam
+        # YouTube: fetch trending Indonesia setiap hari jam 12.00 WIB
         # project_id kosong → task otomatis pilih project pertama dari DB
-        "youtube-trending-every-1h": {
+        "youtube-trending-daily-12:00": {
             "task": "workers.youtube.fetch_trending",
-            "schedule": crontab(minute=0, hour="0,6,12,18"),   # setiap jam tepat (:00)
+            "schedule": crontab(hour=12, minute=0),
             "kwargs": {
                 "project_id": "",    # kosong = auto-detect dari DB
                 "geo": "ID",
