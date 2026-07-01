@@ -69,6 +69,7 @@ import app.domain.reports.models  # noqa: F401
 import app.domain.trending.models  # noqa: F401
 import app.domain.youtube_analysis.models  # noqa: F401
 import app.domain.search_topics.models  # noqa: F401
+import app.domain.scrape_runs.models  # noqa: F401
 
 from app.api.v1.youtube.router import router as youtube_router
 from app.infrastructure.database.connection import engine

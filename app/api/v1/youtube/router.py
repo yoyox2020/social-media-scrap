@@ -1880,6 +1880,117 @@ async def pipeline_status(
     return build_success_response(result.model_dump())
 
 
+@router.get("/monitor", response_model=dict)
+async def scrape_monitor(
+    limit: int = Query(default=20, ge=1, le=100),
+    status: str | None = Query(default=None, description="Filter: running | success | failed | fallback"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Monitor scraping — apakah worker jalan, scraping apa yang sedang/sudah berlangsung.
+
+    - `running`  : sedang berjalan sekarang
+    - `success`  : selesai normal via EnsembleData
+    - `fallback` : selesai tapi ada error/partial, fallback ke YouTube Data API
+    - `failed`   : gagal total
+    """
+    from app.domain.scrape_runs.models import ScrapeRun
+
+    # Cek apakah ada run yang sedang berjalan
+    running_count: int = await db.scalar(
+        text("SELECT COUNT(*) FROM scrape_runs WHERE status = 'running'")
+    ) or 0
+
+    # Run yang stuck > 30 menit dianggap dead
+    stale_count: int = await db.scalar(
+        text("""
+            SELECT COUNT(*) FROM scrape_runs
+            WHERE status = 'running'
+              AND started_at < NOW() - INTERVAL '30 minutes'
+        """)
+    ) or 0
+
+    # Statistik 24 jam terakhir
+    stats = (await db.execute(text("""
+        SELECT
+            status,
+            COUNT(*)                            AS total,
+            SUM(videos_fetched)                 AS videos_fetched,
+            SUM(videos_new)                     AS videos_new,
+            SUM(comments_new)                   AS comments_new,
+            AVG(duration_seconds)               AS avg_duration_sec
+        FROM scrape_runs
+        WHERE started_at >= NOW() - INTERVAL '24 hours'
+        GROUP BY status
+    """))).mappings().all()
+
+    stats_by_status = {
+        r["status"]: {
+            "total": r["total"],
+            "videos_fetched": int(r["videos_fetched"] or 0),
+            "videos_new": int(r["videos_new"] or 0),
+            "comments_new": int(r["comments_new"] or 0),
+            "avg_duration_sec": round(float(r["avg_duration_sec"] or 0), 1),
+        }
+        for r in stats
+    }
+
+    # Run terbaru
+    where = "WHERE sr.status = :status" if status else ""
+    params: dict = {"limit": limit}
+    if status:
+        params["status"] = status
+
+    rows = (await db.execute(text(f"""
+        SELECT
+            sr.id, sr.keyword_text, sr.api_source, sr.status, sr.triggered_by,
+            sr.videos_fetched, sr.videos_new, sr.videos_duplicate,
+            sr.comments_fetched, sr.comments_new,
+            sr.duration_seconds, sr.error_message,
+            sr.started_at, sr.finished_at,
+            k.keyword AS kw_name
+        FROM scrape_runs sr
+        LEFT JOIN keywords k ON sr.keyword_id = k.id
+        {where}
+        ORDER BY sr.started_at DESC
+        LIMIT :limit
+    """), params)).mappings().all()
+
+    runs = []
+    for r in rows:
+        runs.append({
+            "run_id":           str(r["id"]),
+            "keyword":          r["kw_name"] or r["keyword_text"],
+            "api_source":       r["api_source"],
+            "status":           r["status"],
+            "triggered_by":     r["triggered_by"],
+            "videos_fetched":   r["videos_fetched"],
+            "videos_new":       r["videos_new"],
+            "videos_duplicate": r["videos_duplicate"],
+            "comments_fetched": r["comments_fetched"],
+            "comments_new":     r["comments_new"],
+            "duration_sec":     round(float(r["duration_seconds"]), 1) if r["duration_seconds"] else None,
+            "error":            r["error_message"],
+            "started_at":       r["started_at"].isoformat() if r["started_at"] else None,
+            "finished_at":      r["finished_at"].isoformat() if r["finished_at"] else None,
+        })
+
+    is_alive = running_count > 0 or (
+        await db.scalar(
+            text("SELECT COUNT(*) FROM scrape_runs WHERE started_at >= NOW() - INTERVAL '2 hours'")
+        ) or 0
+    ) > 0
+
+    return build_success_response({
+        "worker_alive": is_alive,
+        "currently_running": running_count,
+        "stale_runs": stale_count,
+        "last_24h": stats_by_status,
+        "runs": runs,
+    })
+
+
 @router.get("/scrape-history", response_model=dict)
 async def scrape_history(
     keyword_id: uuid.UUID | None = Query(default=None, description="Filter per keyword (opsional)"),
