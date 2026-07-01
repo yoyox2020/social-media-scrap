@@ -1907,6 +1907,103 @@ async def pipeline_status(
     return build_success_response(result.model_dump())
 
 
+@router.get("/scrape-history", response_model=dict)
+async def scrape_history(
+    keyword_id: uuid.UUID | None = Query(default=None, description="Filter per keyword (opsional)"),
+    date_from: date | None = Query(default=None, description="Dari tanggal (YYYY-MM-DD)"),
+    date_to: date | None = Query(default=None, description="Sampai tanggal (YYYY-MM-DD)"),
+    group_by: str = Query(default="day", pattern="^(day|hour)$", description="Grup per 'day' atau 'hour'"),
+    limit: int = Query(default=30, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Riwayat scraping — kapan video & komentar dikumpulkan, dikelompokkan per hari atau jam.
+
+    Setiap baris mewakili satu sesi scraping (1 keyword × 1 hari/jam):
+    - videos_collected: jumlah video yang masuk DB di periode itu
+    - comments_collected: total komentar dari video tersebut
+    - started_at / ended_at: rentang waktu pengumpulan
+    """
+    filters = ["p.collected_at IS NOT NULL", "p.platform = 'youtube'"]
+    params: dict = {"limit": limit, "offset": offset}
+
+    if keyword_id:
+        filters.append("p.keyword_id = :keyword_id")
+        params["keyword_id"] = str(keyword_id)
+    if date_from:
+        filters.append("DATE(p.collected_at AT TIME ZONE 'UTC') >= :date_from")
+        params["date_from"] = date_from.isoformat()
+    if date_to:
+        filters.append("DATE(p.collected_at AT TIME ZONE 'UTC') <= :date_to")
+        params["date_to"] = date_to.isoformat()
+
+    where = " AND ".join(filters)
+
+    if group_by == "hour":
+        group_expr = "DATE_TRUNC('hour', p.collected_at)"
+        period_label = "DATE_TRUNC('hour', p.collected_at) AS period"
+    else:
+        group_expr = "DATE(p.collected_at AT TIME ZONE 'UTC')"
+        period_label = "DATE(p.collected_at AT TIME ZONE 'UTC') AS period"
+
+    rows = (await db.execute(
+        text(f"""
+            SELECT
+                {period_label},
+                p.keyword_id,
+                k.keyword                       AS keyword_name,
+                COUNT(DISTINCT p.id)            AS videos_collected,
+                COUNT(c.id)                     AS comments_collected,
+                MIN(p.collected_at)             AS started_at,
+                MAX(p.collected_at)             AS ended_at
+            FROM posts p
+            JOIN keywords k ON k.id = p.keyword_id
+            LEFT JOIN comments c ON c.post_id = p.id
+            WHERE {where}
+            GROUP BY {group_expr}, p.keyword_id, k.keyword
+            ORDER BY period DESC
+            LIMIT :limit OFFSET :offset
+        """),
+        params,
+    )).fetchall()
+
+    total: int = await db.scalar(
+        text(f"""
+            SELECT COUNT(*) FROM (
+                SELECT {group_expr}, p.keyword_id
+                FROM posts p
+                JOIN keywords k ON k.id = p.keyword_id
+                WHERE {where}
+                GROUP BY {group_expr}, p.keyword_id
+            ) sub
+        """),
+        {k: v for k, v in params.items() if k not in ("limit", "offset")},
+    ) or 0
+
+    items = []
+    for r in rows:
+        period = r.period
+        items.append({
+            "period": period.isoformat() if hasattr(period, "isoformat") else str(period),
+            "keyword_id": str(r.keyword_id),
+            "keyword_name": r.keyword_name,
+            "videos_collected": r.videos_collected,
+            "comments_collected": r.comments_collected,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "ended_at": r.ended_at.isoformat() if r.ended_at else None,
+        })
+
+    return build_success_response({
+        "group_by": group_by,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": items,
+    })
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SENTIMENT ANALYTICS
 # ─────────────────────────────────────────────────────────────────────────────
