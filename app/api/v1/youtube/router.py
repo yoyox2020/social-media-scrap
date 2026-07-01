@@ -15,7 +15,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import and_, desc, func, select
+from sqlalchemy import and_, desc, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.comments.models import Comment
@@ -47,6 +47,68 @@ from app.services.processing.normalizer import _utc_from_iso
 from app.shared.utils import build_success_response
 
 router = APIRouter(prefix="/youtube", tags=["youtube"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KEYWORDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/keywords", response_model=dict)
+async def list_keywords(
+    q: str | None = Query(default=None, max_length=200, description="Filter nama keyword (ILIKE)"),
+    is_active: bool | None = Query(default=None, description="Filter aktif/tidak aktif"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Daftar semua keyword beserta jumlah video dan komentar yang sudah di-scrape."""
+    filters = ["k.id IS NOT NULL"]
+    params: dict = {"limit": limit, "offset": offset}
+
+    if q:
+        filters.append("k.keyword ILIKE :q_like")
+        params["q_like"] = f"%{q.strip()}%"
+    if is_active is not None:
+        filters.append("k.is_active = :is_active")
+        params["is_active"] = is_active
+
+    where_clause = " AND ".join(filters)
+
+    total: int = (await db.scalar(
+        text(f"SELECT COUNT(*) FROM keywords k WHERE {where_clause}"),
+        {k: v for k, v in params.items() if k not in ("limit", "offset")},
+    )) or 0
+
+    rows = (await db.execute(text(f"""
+        SELECT
+            k.id,
+            k.keyword,
+            k.is_active,
+            k.created_at,
+            COUNT(DISTINCT p.id)  AS video_count,
+            COUNT(DISTINCT c.id)  AS comment_count
+        FROM keywords k
+        LEFT JOIN posts p    ON p.keyword_id = k.id AND p.platform = 'youtube'
+        LEFT JOIN comments c ON c.post_id = p.id
+        WHERE {where_clause}
+        GROUP BY k.id, k.keyword, k.is_active, k.created_at
+        ORDER BY video_count DESC, k.created_at DESC
+        OFFSET :offset LIMIT :limit
+    """), params)).mappings().all()
+
+    items = [
+        {
+            "id": str(r["id"]),
+            "keyword": r["keyword"],
+            "is_active": r["is_active"],
+            "video_count": r["video_count"],
+            "comment_count": r["comment_count"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
+    return build_success_response({"total": total, "offset": offset, "limit": limit, "items": items})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -478,7 +540,7 @@ async def list_videos(
     File video TIDAK disimpan — hanya link & metadata.
     Filter opsional per tanggal/jam kapan video di-collect.
     """
-    from sqlalchemy import text
+
 
     # Query raw SQL untuk bypass SQLAlchemy label/key mapping issue pada kolom JSONB
     filters = ["p.platform = 'youtube'"]
@@ -504,6 +566,12 @@ async def list_videos(
     }.get(sort_by, "(p.metadata->>'views')::bigint DESC NULLS LAST")
 
     where_clause = " AND ".join(filters)
+    count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
+    total: int = (await db.scalar(
+        text(f"SELECT COUNT(*) FROM posts p LEFT JOIN keywords k ON p.keyword_id = k.id WHERE {where_clause}"),
+        count_params,
+    )) or 0
+
     sql = text(f"""
         SELECT
             p.id,
@@ -551,10 +619,93 @@ async def list_videos(
             "date_to": str(date_to) if date_to else None,
             "hour": hour,
         },
-        "total": len(items),
+        "total": total,
         "offset": offset,
+        "limit": limit,
         "note": "url berisi link YouTube. File video tidak disimpan di server.",
         "items": items,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VIDEO DETAIL
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/videos/{video_id}", response_model=dict)
+async def get_video_detail(
+    video_id: str,
+    limit_comments: int = Query(default=20, ge=0, le=200, description="Jumlah komentar (0 = tidak ambil)"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Detail satu video YouTube — bisa pakai UUID post DB atau YouTube video_id (mis. dQw4w9WgXcQ).
+    Menyertakan komentar beserta sentimen.
+    """
+    # Coba parse sebagai UUID dulu, fallback ke YouTube video_id (external_id)
+    try:
+        post_uuid = uuid.UUID(video_id)
+        post = await db.get(Post, post_uuid)
+    except ValueError:
+        post = await db.scalar(
+            select(Post).where(Post.external_id == video_id, Post.platform == "youtube").limit(1)
+        )
+
+    if not post:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError("Video", video_id)
+
+    meta = post.metadata_ or {}
+
+    comments = []
+    if limit_comments > 0:
+        rows = (await db.execute(text("""
+            SELECT c.id, c.external_id, c.content, c.author, c.created_at, c.metadata_,
+                   la.label AS sentiment, la.score AS sentiment_score
+            FROM comments c
+            LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+            WHERE c.post_id = :post_id
+            ORDER BY c.created_at DESC
+            LIMIT :lc
+        """), {"post_id": str(post.id), "lc": limit_comments})).mappings().all()
+
+        for r in rows:
+            cm = r["metadata_"] or {}
+            comments.append({
+                "id": str(r["id"]),
+                "comment_id": r["external_id"],
+                "content": r["content"],
+                "author": r["author"],
+                "sentiment": r["sentiment"],
+                "sentiment_score": round(float(r["sentiment_score"]), 3) if r["sentiment_score"] is not None else None,
+                "like_count": cm.get("like_count", 0),
+                "reply_count": cm.get("reply_count", 0),
+                "author_channel_id": cm.get("author_channel_id"),
+                "published_time": cm.get("published_time", ""),
+                "scraped_at": r["created_at"].isoformat() if r["created_at"] else None,
+            })
+
+    total_comments: int = (await db.scalar(
+        text("SELECT COUNT(*) FROM comments WHERE post_id = :pid"), {"pid": str(post.id)}
+    )) or 0
+
+    return build_success_response({
+        "id": str(post.id),
+        "video_id": post.external_id,
+        "url": post.url or f"https://youtube.com/watch?v={post.external_id}",
+        "title": post.content,
+        "channel": post.author,
+        "view_count": meta.get("views", 0),
+        "like_count": meta.get("likes", 0),
+        "description": meta.get("description", ""),
+        "thumbnail_url": meta.get("thumbnail", ""),
+        "duration": meta.get("duration", ""),
+        "source": meta.get("source", ""),
+        "keyword_id": str(post.keyword_id) if post.keyword_id else None,
+        "published_at": post.published_at.isoformat() if post.published_at else None,
+        "collected_at": post.collected_at.isoformat() if post.collected_at else None,
+        "total_comments_in_db": total_comments,
+        "comments": comments,
     })
 
 
@@ -577,7 +728,7 @@ async def viral_videos(
 
     Filter keyword: gunakan `keyword_id` (UUID) ATAU `q` (nama keyword, ILIKE).
     """
-    from sqlalchemy import text
+
 
     filters = ["p.platform = 'youtube'", "p.metadata->>'views' IS NOT NULL"]
     params: dict = {"limit": limit}
@@ -682,7 +833,7 @@ async def viral_videos_post(
     - `limit`      : jumlah hasil (maks 200)
     - `offset`     : pagination
     """
-    from sqlalchemy import text
+
 
     filters = ["p.platform = 'youtube'"]
     params: dict = {"limit": body.limit, "offset": body.offset}
@@ -1082,7 +1233,7 @@ async def date_range_search_post(
     }
     ```
     """
-    from sqlalchemy import text
+
     from app.services.youtube.pipeline_service import collect_comments_for_video
 
     dt_from = datetime(body.date_from.year, body.date_from.month, body.date_from.day, tzinfo=timezone.utc)
@@ -1392,7 +1543,7 @@ async def date_range_search(
     Video yang di-scrape hari ini tapi di-publish 3 bulan lalu akan muncul jika
     rentang tanggal mencakup tanggal publishnya.
     """
-    from sqlalchemy import text
+
 
     if date_from > date_to:
         from fastapi import HTTPException
@@ -1609,8 +1760,11 @@ async def date_range_search(
 
 @router.get("/comments", response_model=dict)
 async def list_comments(
-    keyword_id: uuid.UUID | None = Query(default=None),
-    video_id: uuid.UUID | None = Query(default=None, description="UUID Post (bukan video_id YouTube)"),
+    keyword_id: uuid.UUID | None = Query(default=None, description="Filter per keyword UUID"),
+    q: str | None = Query(default=None, max_length=200, description="Filter nama keyword (ILIKE)"),
+    video_id: uuid.UUID | None = Query(default=None, description="UUID Post di DB (bukan YouTube video_id)"),
+    youtube_video_id: str | None = Query(default=None, description="YouTube video_id (mis. dQw4w9WgXcQ)"),
+    sentiment: str | None = Query(default=None, description="positif | negatif | netral"),
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
     hour: int | None = Query(default=None, ge=0, le=23),
@@ -1621,52 +1775,100 @@ async def list_comments(
 ):
     """
     List komentar yang sudah di-scrape dari YouTube.
-    Filter per keyword, per video, atau per rentang tanggal/jam.
+    Filter per keyword (UUID atau nama), per video (UUID atau YouTube video_id), sentimen, atau rentang tanggal/jam.
     """
-    q = select(Comment, Post).join(Post, Comment.post_id == Post.id)
+
+
+    filters = ["p.platform = 'youtube'"]
+    params: dict = {"limit": limit, "offset": offset}
 
     if video_id:
-        q = q.where(Comment.post_id == video_id)
+        filters.append("c.post_id = :video_id")
+        params["video_id"] = str(video_id)
+    if youtube_video_id:
+        filters.append("p.external_id = :yt_vid_id")
+        params["yt_vid_id"] = youtube_video_id.strip()
     if keyword_id:
-        q = q.where(Post.keyword_id == keyword_id)
+        filters.append("p.keyword_id = :keyword_id")
+        params["keyword_id"] = str(keyword_id)
+    elif q:
+        filters.append("k.keyword ILIKE :q_like")
+        params["q_like"] = f"%{q.strip()}%"
+    if sentiment:
+        filters.append("la.label = :sentiment")
+        params["sentiment"] = sentiment
     if date_from:
-        q = q.where(Comment.created_at >= datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc))
+        filters.append("c.created_at >= :date_from")
+        params["date_from"] = datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc)
     if date_to:
-        end = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59, tzinfo=timezone.utc)
-        q = q.where(Comment.created_at <= end)
+        filters.append("c.created_at <= :date_to")
+        params["date_to"] = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59, tzinfo=timezone.utc)
     if hour is not None:
-        from sqlalchemy import extract
-        q = q.where(extract("hour", Comment.created_at) == hour)
+        filters.append("EXTRACT(hour FROM c.created_at) = :hour")
+        params["hour"] = hour
 
-    q = q.order_by(desc(Comment.created_at)).offset(offset).limit(limit)
-    rows = await db.execute(q)
+    where_clause = " AND ".join(filters)
+    join_type = "JOIN" if sentiment else "LEFT JOIN"
+
+    count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
+    total: int = (await db.scalar(text(f"""
+        SELECT COUNT(*) FROM comments c
+        JOIN posts p ON c.post_id = p.id
+        LEFT JOIN keywords k ON p.keyword_id = k.id
+        {join_type} lexicon_analyses la ON la.comment_id = c.id
+        WHERE {where_clause}
+    """), count_params)) or 0
+
+    rows = (await db.execute(text(f"""
+        SELECT
+            c.id, c.external_id, c.content, c.author, c.created_at, c.metadata_,
+            p.id AS post_id, p.external_id AS post_ext_id, p.content AS post_title, p.url AS post_url,
+            la.label AS sentiment, la.score AS sentiment_score,
+            k.keyword
+        FROM comments c
+        JOIN posts p ON c.post_id = p.id
+        LEFT JOIN keywords k ON p.keyword_id = k.id
+        {join_type} lexicon_analyses la ON la.comment_id = c.id
+        WHERE {where_clause}
+        ORDER BY c.created_at DESC
+        OFFSET :offset LIMIT :limit
+    """), params)).mappings().all()
 
     items = []
-    for comment, post in rows.all():
-        meta = comment.metadata_ or {}
+    for r in rows:
+        meta = r["metadata_"] or {}
         items.append({
-            "id": str(comment.id),
-            "comment_id": comment.external_id,
-            "content": comment.content,
-            "author": comment.author,
+            "id": str(r["id"]),
+            "comment_id": r["external_id"],
+            "content": r["content"],
+            "author": r["author"],
+            "sentiment": r["sentiment"],
+            "sentiment_score": round(float(r["sentiment_score"]), 3) if r["sentiment_score"] is not None else None,
             "like_count": meta.get("like_count", 0),
             "reply_count": meta.get("reply_count", 0),
+            "author_channel_id": meta.get("author_channel_id"),
             "published_time": meta.get("published_time", ""),
-            "video_url": post.url or f"https://youtube.com/watch?v={post.external_id}",
-            "video_title": post.content,
-            "scraped_at": comment.created_at.isoformat(),
+            "video_id": r["post_ext_id"],
+            "video_url": r["post_url"] or f"https://youtube.com/watch?v={r['post_ext_id']}",
+            "video_title": r["post_title"],
+            "keyword": r["keyword"],
+            "scraped_at": r["created_at"].isoformat() if r["created_at"] else None,
         })
 
     return build_success_response({
         "filter": {
             "keyword_id": str(keyword_id) if keyword_id else None,
+            "q": q,
             "video_id": str(video_id) if video_id else None,
+            "youtube_video_id": youtube_video_id,
+            "sentiment": sentiment,
             "date_from": str(date_from) if date_from else None,
             "date_to": str(date_to) if date_to else None,
             "hour": hour,
         },
-        "total": len(items),
+        "total": total,
         "offset": offset,
+        "limit": limit,
         "items": items,
     })
 
@@ -1923,3 +2125,44 @@ async def list_flagged_accounts(
         for f in rows
     ]
     return build_success_response({"total": total, "limit": limit, "offset": offset, "items": items})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VIRAL TRACKING — MANUAL TRIGGERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/viral-tracking/detect", response_model=dict, status_code=202, summary="Jalankan deteksi post viral sekarang")
+async def trigger_viral_detect(
+    current_user: User = Depends(get_current_user),
+):
+    """Trigger manual deteksi post >=1M views dan buat tracker baru (otomatis setiap 6 jam)."""
+    from app.workers.viral_tracking_worker import detect_viral_posts_task
+    task = detect_viral_posts_task.delay()
+    return build_success_response({"job_id": task.id, "status": "queued", "message": "Deteksi post viral berjalan di background."})
+
+
+@router.post("/viral-tracking/{tracker_id}/scrape", response_model=dict, status_code=202, summary="Paksa scrape channel tracker sekarang")
+async def trigger_tracker_scrape(
+    tracker_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Trigger manual scrape channel untuk tracker tertentu, tanpa menunggu jadwal harian."""
+    tracker = await db.get(ViralChannelTracker, tracker_id)
+    if not tracker:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError("ViralChannelTracker", str(tracker_id))
+
+    tracker.last_scraped_date = None
+    await db.commit()
+
+    from app.workers.viral_tracking_worker import viral_channel_daily_scrape_task
+    task = viral_channel_daily_scrape_task.delay(str(tracker_id))
+    return build_success_response({
+        "job_id": task.id,
+        "tracker_id": str(tracker_id),
+        "channel_id": tracker.channel_id,
+        "channel_name": tracker.channel_name,
+        "status": "queued",
+        "message": "Scrape channel berjalan di background.",
+    })
