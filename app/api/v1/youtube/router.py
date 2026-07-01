@@ -628,88 +628,6 @@ async def list_videos(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VIDEO DETAIL
-# ─────────────────────────────────────────────────────────────────────────────
-
-@router.get("/videos/{video_id}", response_model=dict)
-async def get_video_detail(
-    video_id: str,
-    limit_comments: int = Query(default=20, ge=0, le=200, description="Jumlah komentar (0 = tidak ambil)"),
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Detail satu video YouTube — bisa pakai UUID post DB atau YouTube video_id (mis. dQw4w9WgXcQ).
-    Menyertakan komentar beserta sentimen.
-    """
-    # Coba parse sebagai UUID dulu, fallback ke YouTube video_id (external_id)
-    try:
-        post_uuid = uuid.UUID(video_id)
-        post = await db.get(Post, post_uuid)
-    except ValueError:
-        post = await db.scalar(
-            select(Post).where(Post.external_id == video_id, Post.platform == "youtube").limit(1)
-        )
-
-    if not post:
-        from app.shared.exceptions import NotFoundError
-        raise NotFoundError("Video", video_id)
-
-    meta = post.metadata_ or {}
-
-    comments = []
-    if limit_comments > 0:
-        rows = (await db.execute(text("""
-            SELECT c.id, c.external_id, c.content, c.author, c.created_at, c.metadata,
-                   la.label AS sentiment, la.score AS sentiment_score
-            FROM comments c
-            LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
-            WHERE c.post_id = :post_id
-            ORDER BY c.created_at DESC
-            LIMIT :lc
-        """), {"post_id": str(post.id), "lc": limit_comments})).mappings().all()
-
-        for r in rows:
-            cm = r["metadata"] or {}
-            comments.append({
-                "id": str(r["id"]),
-                "comment_id": r["external_id"],
-                "content": r["content"],
-                "author": r["author"],
-                "sentiment": r["sentiment"],
-                "sentiment_score": round(float(r["sentiment_score"]), 3) if r["sentiment_score"] is not None else None,
-                "like_count": cm.get("like_count", 0),
-                "reply_count": cm.get("reply_count", 0),
-                "author_channel_id": cm.get("author_channel_id"),
-                "published_time": cm.get("published_time", ""),
-                "scraped_at": r["created_at"].isoformat() if r["created_at"] else None,
-            })
-
-    total_comments: int = (await db.scalar(
-        text("SELECT COUNT(*) FROM comments WHERE post_id = :pid"), {"pid": str(post.id)}
-    )) or 0
-
-    return build_success_response({
-        "id": str(post.id),
-        "video_id": post.external_id,
-        "url": post.url or f"https://youtube.com/watch?v={post.external_id}",
-        "title": post.content,
-        "channel": post.author,
-        "view_count": meta.get("views", 0),
-        "like_count": meta.get("likes", 0),
-        "description": meta.get("description", ""),
-        "thumbnail_url": meta.get("thumbnail", ""),
-        "duration": meta.get("duration", ""),
-        "source": meta.get("source", ""),
-        "keyword_id": str(post.keyword_id) if post.keyword_id else None,
-        "published_at": post.published_at.isoformat() if post.published_at else None,
-        "collected_at": post.collected_at.isoformat() if post.collected_at else None,
-        "total_comments_in_db": total_comments,
-        "comments": comments,
-    })
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # TOP VIRAL VIDEOS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1027,6 +945,87 @@ async def viral_videos_post(
         "limit":  body.limit,
         "comments": comments,
         "items":  items,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VIDEO DETAIL — harus setelah /videos/viral agar tidak ambil route /videos/viral
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/videos/{video_id}", response_model=dict)
+async def get_video_detail(
+    video_id: str,
+    limit_comments: int = Query(default=20, ge=0, le=200, description="Jumlah komentar (0 = tidak ambil)"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Detail satu video YouTube — bisa pakai UUID post DB atau YouTube video_id (mis. dQw4w9WgXcQ).
+    Menyertakan komentar beserta sentimen.
+    """
+    try:
+        post_uuid = uuid.UUID(video_id)
+        post = await db.get(Post, post_uuid)
+    except ValueError:
+        post = await db.scalar(
+            select(Post).where(Post.external_id == video_id, Post.platform == "youtube").limit(1)
+        )
+
+    if not post:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError("Video", video_id)
+
+    meta = post.metadata_ or {}
+
+    comments = []
+    if limit_comments > 0:
+        rows = (await db.execute(text("""
+            SELECT c.id, c.external_id, c.content, c.author, c.created_at, c.metadata,
+                   la.label AS sentiment, la.score AS sentiment_score
+            FROM comments c
+            LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+            WHERE c.post_id = :post_id
+            ORDER BY c.created_at DESC
+            LIMIT :lc
+        """), {"post_id": str(post.id), "lc": limit_comments})).mappings().all()
+
+        for r in rows:
+            cm = r["metadata"] or {}
+            comments.append({
+                "id": str(r["id"]),
+                "comment_id": r["external_id"],
+                "content": r["content"],
+                "author": r["author"],
+                "sentiment": r["sentiment"],
+                "sentiment_score": round(float(r["sentiment_score"]), 3) if r["sentiment_score"] is not None else None,
+                "like_count": cm.get("like_count", 0),
+                "reply_count": cm.get("reply_count", 0),
+                "author_channel_id": cm.get("author_channel_id"),
+                "published_time": cm.get("published_time", ""),
+                "scraped_at": r["created_at"].isoformat() if r["created_at"] else None,
+            })
+
+    total_comments: int = (await db.scalar(
+        text("SELECT COUNT(*) FROM comments WHERE post_id = :pid"), {"pid": str(post.id)}
+    )) or 0
+
+    return build_success_response({
+        "id": str(post.id),
+        "video_id": post.external_id,
+        "url": post.url or f"https://youtube.com/watch?v={post.external_id}",
+        "title": post.content,
+        "channel": post.author,
+        "view_count": meta.get("views", 0),
+        "like_count": meta.get("likes", 0),
+        "description": meta.get("description", ""),
+        "thumbnail_url": meta.get("thumbnail", ""),
+        "duration": meta.get("duration", ""),
+        "source": meta.get("source", ""),
+        "keyword_id": str(post.keyword_id) if post.keyword_id else None,
+        "published_at": post.published_at.isoformat() if post.published_at else None,
+        "collected_at": post.collected_at.isoformat() if post.collected_at else None,
+        "total_comments_in_db": total_comments,
+        "comments": comments,
     })
 
 
