@@ -209,6 +209,7 @@ async def collect_comments_for_video(
                 continue
 
             toolbar = raw_c.get("toolbar") or {}
+            author_channel_id = (raw_c.get("author") or {}).get("channelId")
             comment = Comment(
                 post_id=post_id,
                 external_id=ext_id,
@@ -220,6 +221,7 @@ async def collect_comments_for_video(
                     "reply_count": _parse_count(toolbar.get("replyCount", "0")),
                     "published_time": (raw_c.get("properties") or {}).get("publishedTime", ""),
                     "is_pinned": bool((raw_c.get("commentViewModel") or {}).get("pinnedText")),
+                    **({"author_channel_id": author_channel_id} if author_channel_id else {}),
                 },
             )
             db.add(comment)

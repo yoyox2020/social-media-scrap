@@ -14,6 +14,7 @@ import app.domain.trends.models  # noqa: F401
 import app.domain.reports.models  # noqa: F401
 import app.domain.trending.models  # noqa: F401
 import app.domain.youtube_analysis.models  # noqa: F401
+import app.domain.viral_tracking.models  # noqa: F401
 
 from app.shared.config import settings
 
@@ -31,6 +32,7 @@ celery_app = Celery(
         "app.workers.report_worker",
         "app.workers.scheduled_tasks",
         "app.workers.youtube_worker",
+        "app.workers.viral_tracking_worker",
     ],
 )
 
@@ -53,6 +55,18 @@ celery_app.conf.update(
             "schedule": crontab(hour=9, minute=0, day_of_week=1),
             "kwargs": {"period": "week"},
             "options": {"queue": "reports"},
+        },
+        # Viral tracking: deteksi post >=1M views setiap 6 jam
+        "viral-tracking-detect-every-6h": {
+            "task": "workers.viral_tracking.detect_viral_posts",
+            "schedule": crontab(minute=0, hour="0,6,12,18"),
+            "options": {"queue": "default"},
+        },
+        # Viral tracking: resume semua tracker aktif setiap hari jam 03:00
+        "viral-tracking-daily-check-03:00": {
+            "task": "workers.viral_tracking.daily_check",
+            "schedule": crontab(hour=3, minute=0),
+            "options": {"queue": "default"},
         },
         # YouTube: fetch trending Indonesia setiap 1 jam
         # project_id kosong → task otomatis pilih project pertama dari DB

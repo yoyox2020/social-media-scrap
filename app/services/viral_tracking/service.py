@@ -1,0 +1,313 @@
+"""
+Viral Tracking Service.
+
+Alur otomatis:
+  1. detect_and_create_trackers  — temukan post >=1M views tanpa tracker → buat ViralChannelTracker
+  2. run_daily_channel_scrape     — scrape 5 video/hari dari channel yang dilacak
+  3. check_and_flag_commenters    — temukan akun yang >10x komentar → flag + buat tracker baru
+"""
+from __future__ import annotations
+
+import uuid
+from collections import Counter
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.domain.posts.models import Post
+from app.domain.viral_tracking.models import FlaggedAccount, ViralChannelTracker
+
+VIRAL_VIEW_THRESHOLD = 1_000_000
+TRACKER_DAYS = 7
+POSTS_PER_DAY = 5
+COMMENTER_FLAG_THRESHOLD = 10
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+
+async def detect_and_create_trackers(db: AsyncSession) -> list[uuid.UUID]:
+    """
+    Cari post YouTube dengan views >=1M yang belum punya tracker, buat tracker baru.
+    Return list tracker_id yang baru dibuat.
+    """
+    # Post viral yang BELUM ada trackernya
+    existing_tracker_post_ids_result = await db.execute(
+        select(ViralChannelTracker.trigger_post_id).where(
+            ViralChannelTracker.trigger_post_id.isnot(None)
+        )
+    )
+    already_tracked: set[uuid.UUID] = set(existing_tracker_post_ids_result.scalars().all())
+
+    viral_posts_result = await db.execute(
+        select(Post).where(
+            Post.platform == "youtube",
+            Post.metadata_["views"].as_integer() >= VIRAL_VIEW_THRESHOLD,
+        )
+    )
+    viral_posts: list[Post] = list(viral_posts_result.scalars().all())
+
+    new_tracker_ids: list[uuid.UUID] = []
+    now = datetime.now(timezone.utc)
+
+    for post in viral_posts:
+        if post.id in already_tracked:
+            continue
+
+        channel_id = _extract_channel_id_from_raw(post.raw_data or {})
+        if not channel_id:
+            continue
+
+        channel_name = _extract_channel_name_from_raw(post.raw_data or {})
+
+        tracker = ViralChannelTracker(
+            channel_id=channel_id,
+            channel_name=channel_name,
+            trigger_post_id=post.id,
+            keyword_id=post.keyword_id,
+            tracker_type="viral",
+            started_at=now,
+            ends_at=now + timedelta(days=TRACKER_DAYS),
+            status="active",
+            posts_collected=0,
+        )
+        db.add(tracker)
+        await db.flush()
+        new_tracker_ids.append(tracker.id)
+
+    await db.commit()
+    return new_tracker_ids
+
+
+async def run_daily_channel_scrape(db: AsyncSession, tracker_id: uuid.UUID) -> int:
+    """
+    Scrape 5 video terbaru dari channel tracker. Skip jika sudah scraping hari ini.
+    Return jumlah post baru yang disimpan.
+    """
+    tracker = await db.get(ViralChannelTracker, tracker_id)
+    if not tracker or tracker.status != "active":
+        return 0
+
+    today = date.today()
+    if tracker.last_scraped_date == today:
+        return 0  # Sudah scraping hari ini
+
+    now = datetime.now(timezone.utc)
+    if tracker.ends_at < now:
+        tracker.status = "completed"
+        await db.commit()
+        return 0
+
+    from app.integrations.ensemble_data.client import EnsembleDataClient
+    from app.integrations.youtube.connector import YouTubeConnector
+    from app.repositories.post_repository import PostRepository
+    from app.services.processing.normalizer import YouTubeNormalizer
+
+    post_repo = PostRepository(db)
+    normalizer = YouTubeNormalizer()
+    new_count = 0
+
+    try:
+        async with EnsembleDataClient() as client:
+            connector = YouTubeConnector(client)
+            raw = await connector.get_channel_videos(tracker.channel_id, cursor="")
+            items = connector.extract_posts(raw)
+
+            items = items[:POSTS_PER_DAY]
+            if not items:
+                return 0
+
+            posts = normalizer.normalize(items, tracker.keyword_id or uuid.UUID(int=0))
+            ext_ids = [p.external_id for p in posts]
+            existing = await post_repo.get_existing_external_ids(ext_ids, "youtube")
+            new_posts = [p for p in posts if p.external_id not in existing]
+
+            for post in new_posts:
+                meta = post.metadata_ or {}
+                meta["tracker_id"] = str(tracker_id)
+                meta["source"] = "viral_tracking"
+                post.metadata_ = meta
+
+            if new_posts:
+                new_count = await post_repo.bulk_create(new_posts)
+
+    except Exception:
+        pass  # log di caller (Celery worker)
+
+    tracker.last_scraped_date = today
+    tracker.posts_collected = (tracker.posts_collected or 0) + new_count
+    await db.commit()
+    return new_count
+
+
+async def check_and_flag_commenters(db: AsyncSession, tracker_id: uuid.UUID) -> list[uuid.UUID]:
+    """
+    Cari akun yang komentar >10x pada post tracker ini.
+    Flag mereka di flagged_accounts, buat tracker baru jika channel_id valid (UCxxx).
+    Return list flagged_account IDs yang baru dibuat.
+    """
+    tracker = await db.get(ViralChannelTracker, tracker_id)
+    if not tracker:
+        return []
+
+    # Ambil semua komentar pada post yang dikumpulkan via tracker ini
+    rows = await db.execute(
+        text("""
+            SELECT
+                c.author,
+                c.metadata_ ->> 'author_channel_id' AS channel_id,
+                COUNT(*) AS cnt
+            FROM comments c
+            JOIN posts p ON p.id = c.post_id
+            WHERE
+                p.platform = 'youtube'
+                AND p.metadata_ ->> 'tracker_id' = :tracker_id
+            GROUP BY c.author, c.metadata_ ->> 'author_channel_id'
+            HAVING COUNT(*) > :threshold
+        """),
+        {"tracker_id": str(tracker_id), "threshold": COMMENTER_FLAG_THRESHOLD},
+    )
+    commenter_rows = rows.fetchall()
+
+    if not commenter_rows:
+        return []
+
+    # Ambil akun yang sudah diflag di tracker ini agar tidak duplikat
+    existing_flagged = set(
+        (await db.execute(
+            select(FlaggedAccount.channel_id).where(
+                FlaggedAccount.tracker_id == tracker_id
+            )
+        )).scalars().all()
+    )
+
+    now = datetime.now(timezone.utc)
+    new_flag_ids: list[uuid.UUID] = []
+
+    for row in commenter_rows:
+        author_name: str = row.author or "unknown"
+        ch_id: str | None = row.channel_id
+        cnt: int = row.cnt
+
+        if ch_id and ch_id in existing_flagged:
+            continue
+
+        # Buat ViralChannelTracker untuk commenter jika channel_id valid
+        analysis_tracker_id: uuid.UUID | None = None
+        if ch_id and ch_id.startswith("UC"):
+            analysis_tracker = ViralChannelTracker(
+                channel_id=ch_id,
+                channel_name=author_name,
+                trigger_post_id=tracker.trigger_post_id,
+                keyword_id=tracker.keyword_id,
+                tracker_type="flagged_commenter",
+                started_at=now,
+                ends_at=now + timedelta(days=TRACKER_DAYS),
+                status="active",
+                posts_collected=0,
+            )
+            db.add(analysis_tracker)
+            await db.flush()
+            analysis_tracker_id = analysis_tracker.id
+
+        flagged = FlaggedAccount(
+            channel_id=ch_id or "",
+            channel_name=author_name,
+            comment_count=cnt,
+            tracker_id=tracker_id,
+            trigger_post_id=tracker.trigger_post_id,
+            analysis_tracker_id=analysis_tracker_id,
+            flagged_at=now,
+        )
+        db.add(flagged)
+        await db.flush()
+        new_flag_ids.append(flagged.id)
+
+    await db.commit()
+    return new_flag_ids
+
+
+async def resume_active_trackers(db: AsyncSession) -> dict[str, list[str]]:
+    """
+    Jalankan harian: tandai tracker expired sebagai completed, kembalikan
+    daftar tracker yang masih aktif dan belum scraping hari ini.
+    """
+    now = datetime.now(timezone.utc)
+    today = date.today()
+
+    # Tandai yang expired
+    expired_result = await db.execute(
+        select(ViralChannelTracker).where(
+            ViralChannelTracker.status == "active",
+            ViralChannelTracker.ends_at < now,
+        )
+    )
+    expired = expired_result.scalars().all()
+    for t in expired:
+        t.status = "completed"
+
+    # Aktif + belum scraping hari ini
+    pending_result = await db.execute(
+        select(ViralChannelTracker).where(
+            ViralChannelTracker.status == "active",
+            ViralChannelTracker.ends_at >= now,
+        )
+    )
+    active = pending_result.scalars().all()
+
+    needs_scrape = [str(t.id) for t in active if t.last_scraped_date != today]
+
+    if expired:
+        await db.commit()
+
+    return {
+        "expired_completed": [str(t.id) for t in expired],
+        "needs_scrape": needs_scrape,
+    }
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _extract_channel_id_from_raw(raw_data: dict[str, Any]) -> str | None:
+    """Ekstrak channel_id (UCxxx) dari raw_data post — support EnsembleData & YT Data API v3."""
+    # YouTube Data API v3 format
+    snippet = raw_data.get("snippet") or {}
+    if snippet.get("channelId"):
+        return snippet["channelId"]
+
+    # EnsembleData videoRenderer format
+    try:
+        return (
+            raw_data["longBylineText"]["runs"][0]
+            ["navigationEndpoint"]["browseEndpoint"]["browseId"]
+        )
+    except (KeyError, IndexError, TypeError):
+        pass
+
+    try:
+        return (
+            raw_data["ownerText"]["runs"][0]
+            ["navigationEndpoint"]["browseEndpoint"]["browseId"]
+        )
+    except (KeyError, IndexError, TypeError):
+        pass
+
+    return None
+
+
+def _extract_channel_name_from_raw(raw_data: dict[str, Any]) -> str:
+    """Ekstrak nama channel dari raw_data post."""
+    snippet = raw_data.get("snippet") or {}
+    if snippet.get("channelTitle"):
+        return snippet["channelTitle"]
+
+    def _runs_text(obj: dict | None) -> str:
+        if not obj:
+            return ""
+        return "".join(r.get("text", "") for r in (obj.get("runs") or []))
+
+    name = _runs_text(raw_data.get("longBylineText")) or _runs_text(raw_data.get("ownerText"))
+    return name or "unknown"

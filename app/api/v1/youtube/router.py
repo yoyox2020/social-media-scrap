@@ -23,6 +23,7 @@ from app.domain.keywords.models import Keyword
 from app.domain.posts.models import Post
 from app.domain.trending.models import TrendingTopic
 from app.domain.users.models import User
+from app.domain.viral_tracking.models import FlaggedAccount, ViralChannelTracker
 from app.domain.youtube_analysis.models import LexiconAnalysis
 from app.infrastructure.database.connection import get_db
 from app.services.auth.dependencies import get_current_user
@@ -1766,3 +1767,159 @@ async def wordcloud(
         date_from=date_from, date_to=date_to,
     )
     return build_success_response(result.model_dump())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VIRAL TRACKING
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/viral-tracking", summary="List viral channel trackers")
+async def list_viral_trackers(
+    status: str | None = Query(default=None, description="active | completed"),
+    tracker_type: str | None = Query(default=None, description="viral | flagged_commenter"),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Daftar channel yang sedang/pernah dilacak karena post viral."""
+    q = select(ViralChannelTracker)
+    if status:
+        q = q.where(ViralChannelTracker.status == status)
+    if tracker_type:
+        q = q.where(ViralChannelTracker.tracker_type == tracker_type)
+    q = q.order_by(desc(ViralChannelTracker.started_at)).limit(limit).offset(offset)
+
+    rows = list((await db.scalars(q)).all())
+    total = (await db.scalar(
+        select(func.count(ViralChannelTracker.id)).where(
+            *(
+                ([ViralChannelTracker.status == status] if status else []) +
+                ([ViralChannelTracker.tracker_type == tracker_type] if tracker_type else [])
+            )
+        )
+    )) or 0
+
+    items = [
+        {
+            "id": str(t.id),
+            "channel_id": t.channel_id,
+            "channel_name": t.channel_name,
+            "tracker_type": t.tracker_type,
+            "status": t.status,
+            "posts_collected": t.posts_collected,
+            "started_at": t.started_at.isoformat() if t.started_at else None,
+            "ends_at": t.ends_at.isoformat() if t.ends_at else None,
+            "last_scraped_date": t.last_scraped_date.isoformat() if t.last_scraped_date else None,
+            "trigger_post_id": str(t.trigger_post_id) if t.trigger_post_id else None,
+            "keyword_id": str(t.keyword_id) if t.keyword_id else None,
+        }
+        for t in rows
+    ]
+    return build_success_response({"total": total, "limit": limit, "offset": offset, "items": items})
+
+
+@router.get("/viral-tracking/{tracker_id}", summary="Detail viral tracker + posts + flagged accounts")
+async def get_viral_tracker_detail(
+    tracker_id: uuid.UUID,
+    limit_posts: int = Query(default=20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Detail tracker beserta post yang dikumpulkan dan akun yang diflag."""
+    tracker = await db.get(ViralChannelTracker, tracker_id)
+    if not tracker:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError("ViralChannelTracker", str(tracker_id))
+
+    # Posts dikumpulkan oleh tracker ini
+    posts_rows = list((await db.scalars(
+        select(Post)
+        .where(
+            Post.platform == "youtube",
+            Post.metadata_["tracker_id"].as_string() == str(tracker_id),
+        )
+        .order_by(desc(Post.collected_at))
+        .limit(limit_posts)
+    )).all())
+
+    posts = [
+        {
+            "id": str(p.id),
+            "video_id": p.external_id,
+            "title": p.content,
+            "url": p.url,
+            "views": (p.metadata_ or {}).get("views", 0),
+            "collected_at": p.collected_at.isoformat() if p.collected_at else None,
+        }
+        for p in posts_rows
+    ]
+
+    # Flagged accounts
+    flagged_rows = list((await db.scalars(
+        select(FlaggedAccount)
+        .where(FlaggedAccount.tracker_id == tracker_id)
+        .order_by(desc(FlaggedAccount.flagged_at))
+    )).all())
+
+    flagged = [
+        {
+            "id": str(f.id),
+            "channel_id": f.channel_id,
+            "channel_name": f.channel_name,
+            "comment_count": f.comment_count,
+            "flagged_at": f.flagged_at.isoformat() if f.flagged_at else None,
+            "analysis_tracker_id": str(f.analysis_tracker_id) if f.analysis_tracker_id else None,
+        }
+        for f in flagged_rows
+    ]
+
+    return build_success_response({
+        "tracker": {
+            "id": str(tracker.id),
+            "channel_id": tracker.channel_id,
+            "channel_name": tracker.channel_name,
+            "tracker_type": tracker.tracker_type,
+            "status": tracker.status,
+            "posts_collected": tracker.posts_collected,
+            "started_at": tracker.started_at.isoformat() if tracker.started_at else None,
+            "ends_at": tracker.ends_at.isoformat() if tracker.ends_at else None,
+            "last_scraped_date": tracker.last_scraped_date.isoformat() if tracker.last_scraped_date else None,
+            "trigger_post_id": str(tracker.trigger_post_id) if tracker.trigger_post_id else None,
+            "keyword_id": str(tracker.keyword_id) if tracker.keyword_id else None,
+        },
+        "posts": posts,
+        "flagged_accounts": flagged,
+    })
+
+
+@router.get("/flagged-accounts", summary="List akun yang diflag karena komentar berulang")
+async def list_flagged_accounts(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Daftar akun yang komentar >10x pada post viral dan sudah diflag sistem."""
+    rows = list((await db.scalars(
+        select(FlaggedAccount)
+        .order_by(desc(FlaggedAccount.flagged_at))
+        .limit(limit).offset(offset)
+    )).all())
+
+    total = (await db.scalar(select(func.count(FlaggedAccount.id)))) or 0
+
+    items = [
+        {
+            "id": str(f.id),
+            "channel_id": f.channel_id,
+            "channel_name": f.channel_name,
+            "comment_count": f.comment_count,
+            "flagged_at": f.flagged_at.isoformat() if f.flagged_at else None,
+            "tracker_id": str(f.tracker_id),
+            "trigger_post_id": str(f.trigger_post_id) if f.trigger_post_id else None,
+            "analysis_tracker_id": str(f.analysis_tracker_id) if f.analysis_tracker_id else None,
+        }
+        for f in rows
+    ]
+    return build_success_response({"total": total, "limit": limit, "offset": offset, "items": items})
