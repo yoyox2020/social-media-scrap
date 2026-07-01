@@ -1,8 +1,9 @@
 import uuid
 from datetime import date, datetime
+from typing import Any
 
 from sqlalchemy import Date, DateTime, ForeignKey, Integer, String
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.infrastructure.database.base import Base, TimestampMixin, UUIDMixin
@@ -33,6 +34,9 @@ class ViralChannelTracker(Base, UUIDMixin, TimestampMixin):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active", server_default="active", index=True)
     posts_collected: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     last_scraped_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    scrape_logs: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
 
     flagged_accounts: Mapped[list["FlaggedAccount"]] = relationship(
         "FlaggedAccount",

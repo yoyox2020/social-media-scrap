@@ -2021,20 +2021,53 @@ async def list_viral_trackers(
     return build_success_response({"total": total, "limit": limit, "offset": offset, "items": items})
 
 
-@router.get("/viral-tracking/{tracker_id}", summary="Detail viral tracker + posts + flagged accounts")
+@router.get("/viral-tracking/{tracker_id}", summary="Detail viral tracker + timeline 7 hari + flagged accounts")
 async def get_viral_tracker_detail(
     tracker_id: uuid.UUID,
     limit_posts: int = Query(default=20, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Detail tracker beserta post yang dikumpulkan dan akun yang diflag."""
+    """
+    Detail tracker: status 7 hari, scrape_logs per hari, post terbaru, akun yang diflag.
+
+    scrape_timeline: riwayat scraping per hari (hari 1–7) dari scrape_logs.
+    progress: persentase hari yang sudah diselesaikan.
+    """
     tracker = await db.get(ViralChannelTracker, tracker_id)
     if not tracker:
         from app.shared.exceptions import NotFoundError
         raise NotFoundError("ViralChannelTracker", str(tracker_id))
 
-    # Posts dikumpulkan oleh tracker ini
+    from datetime import date as _date, timezone as _tz
+    now = datetime.now(timezone.utc)
+
+    # ── Progress & timeline ───────────────────────────────────────────────────
+    total_days = 7
+    days_elapsed = max(0, (now.date() - tracker.started_at.date()).days + 1)
+    days_elapsed = min(days_elapsed, total_days)
+    days_remaining = max(0, (tracker.ends_at.date() - now.date()).days)
+    progress_pct = round((days_elapsed / total_days) * 100, 1)
+
+    # scrape_logs tersimpan di DB; isi slot hari yang belum scraping dengan placeholder
+    existing_logs: dict[int, dict] = {
+        entry["day"]: entry for entry in (tracker.scrape_logs or [])
+    }
+    scrape_timeline = []
+    for day_n in range(1, total_days + 1):
+        target_date = (tracker.started_at.date() + __import__("datetime").timedelta(days=day_n - 1))
+        if day_n in existing_logs:
+            entry = dict(existing_logs[day_n])
+            entry["status"] = "error" if "error" in entry else "done"
+        elif target_date > now.date():
+            entry = {"day": day_n, "date": target_date.isoformat(), "status": "pending",
+                     "posts_new": None, "posts_skipped": None}
+        else:
+            entry = {"day": day_n, "date": target_date.isoformat(), "status": "skipped",
+                     "posts_new": 0, "posts_skipped": 0}
+        scrape_timeline.append(entry)
+
+    # ── Posts terbaru dari tracker ini ───────────────────────────────────────
     posts_rows = list((await db.scalars(
         select(Post)
         .where(
@@ -2057,7 +2090,7 @@ async def get_viral_tracker_detail(
         for p in posts_rows
     ]
 
-    # Flagged accounts
+    # ── Flagged accounts ─────────────────────────────────────────────────────
     flagged_rows = list((await db.scalars(
         select(FlaggedAccount)
         .where(FlaggedAccount.tracker_id == tracker_id)
@@ -2084,12 +2117,22 @@ async def get_viral_tracker_detail(
             "tracker_type": tracker.tracker_type,
             "status": tracker.status,
             "posts_collected": tracker.posts_collected,
+            "flagged_accounts_count": len(flagged),
             "started_at": tracker.started_at.isoformat() if tracker.started_at else None,
             "ends_at": tracker.ends_at.isoformat() if tracker.ends_at else None,
             "last_scraped_date": tracker.last_scraped_date.isoformat() if tracker.last_scraped_date else None,
             "trigger_post_id": str(tracker.trigger_post_id) if tracker.trigger_post_id else None,
             "keyword_id": str(tracker.keyword_id) if tracker.keyword_id else None,
         },
+        "progress": {
+            "total_days": total_days,
+            "days_elapsed": days_elapsed,
+            "days_remaining": days_remaining,
+            "percent": progress_pct,
+            "scrape_days_done": len([e for e in scrape_timeline if e["status"] == "done"]),
+            "scrape_days_error": len([e for e in scrape_timeline if e["status"] == "error"]),
+        },
+        "scrape_timeline": scrape_timeline,
         "posts": posts,
         "flagged_accounts": flagged,
     })

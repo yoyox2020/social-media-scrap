@@ -133,13 +133,47 @@ async def run_daily_channel_scrape(db: AsyncSession, tracker_id: uuid.UUID) -> i
             if new_posts:
                 new_count = await post_repo.bulk_create(new_posts)
 
-    except Exception:
-        pass  # log di caller (Celery worker)
+    except Exception as exc:
+        # Tetap catat log meski gagal
+        _append_scrape_log(tracker, today, posts_new=0, posts_skipped=0, error=str(exc))
+        tracker.last_scraped_date = today
+        await db.commit()
+        return 0
 
+    skipped = len(items) - new_count if items else 0
+    _append_scrape_log(tracker, today, posts_new=new_count, posts_skipped=skipped)
     tracker.last_scraped_date = today
     tracker.posts_collected = (tracker.posts_collected or 0) + new_count
     await db.commit()
     return new_count
+
+
+def _append_scrape_log(
+    tracker: "ViralChannelTracker",
+    scrape_date: "date",
+    *,
+    posts_new: int,
+    posts_skipped: int,
+    error: str | None = None,
+) -> None:
+    """Tambahkan satu entri ke scrape_logs JSONB. Tidak commit — caller yang commit."""
+    from datetime import date as _date
+    from sqlalchemy.orm.attributes import flag_modified
+
+    logs: list = list(tracker.scrape_logs or [])
+    day_num = (scrape_date - tracker.started_at.date()).days + 1
+    entry: dict = {
+        "day": day_num,
+        "date": scrape_date.isoformat(),
+        "posts_new": posts_new,
+        "posts_skipped": posts_skipped,
+    }
+    if error:
+        entry["error"] = error[:300]
+    logs.append(entry)
+    tracker.scrape_logs = logs
+    # Sinyal ke SQLAlchemy bahwa JSONB column berubah (mutasi in-place tidak terdeteksi otomatis)
+    flag_modified(tracker, "scrape_logs")
 
 
 async def check_and_flag_commenters(db: AsyncSession, tracker_id: uuid.UUID) -> list[uuid.UUID]:
