@@ -5,8 +5,11 @@ Flow:
   API trigger → CollectorService → Celery task per platform
   Celery task → Connector (EnsembleData) → Normalizer → PostRepository
 """
+import logging
 import uuid
 from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 from app.repositories.keyword_repository import KeywordRepository
 from app.services.collector.schemas import CollectJobResponse, CollectionResult
@@ -101,18 +104,25 @@ class CollectorService:
         connector = _get_connector(platform)
         post_repo = PostRepository(db)
 
+        logger.info(
+            "[Collector] Mulai scraping — platform=%s keyword=%r max_pages=%d",
+            platform, keyword.keyword, max_pages,
+        )
+
         async with EnsembleDataClient() as client:
             connector_instance = connector(client)
             cursor = None
 
             for page in range(max_pages):
                 try:
+                    logger.info("[Collector] Fetch halaman %d/%d — keyword=%r", page + 1, max_pages, keyword.keyword)
                     raw = await _fetch_page(
                         connector_instance, platform, keyword.keyword, cursor, max_pages
                     )
                     items = connector_instance.extract_posts(raw)
 
                     if not items:
+                        logger.info("[Collector] Halaman %d kosong, berhenti.", page + 1)
                         break
 
                     if max_results is not None:
@@ -128,20 +138,33 @@ class CollectorService:
                     new_posts = [p for p in posts if p.external_id not in existing]
                     result.skipped_duplicates += len(posts) - len(new_posts)
 
+                    logger.info(
+                        "[Collector] Halaman %d: total=%d baru=%d duplikat=%d",
+                        page + 1, len(posts), len(new_posts), len(posts) - len(new_posts),
+                    )
+
                     if new_posts:
                         inserted = await post_repo.bulk_create(new_posts)
                         result.new_posts += inserted
+                        logger.info("[Collector] Disimpan ke DB: %d video baru", inserted)
 
                     cursor = connector_instance.extract_cursor(raw)
                     if cursor is None:
+                        logger.info("[Collector] Tidak ada halaman berikutnya, selesai.")
                         break
 
                 except Exception as exc:
+                    logger.error("[Collector] Error halaman %d: %s", page + 1, exc)
                     result.errors.append(f"Page {page + 1}: {exc}")
                     break
 
             await db.commit()
 
+        logger.info(
+            "[Collector] Selesai — keyword=%r total=%d baru=%d duplikat=%d error=%d",
+            keyword.keyword, result.total_fetched, result.new_posts,
+            result.skipped_duplicates, len(result.errors),
+        )
         return result
 
 

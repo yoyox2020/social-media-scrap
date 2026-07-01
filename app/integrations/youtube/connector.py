@@ -8,10 +8,13 @@ Catatan parameter berdasarkan docs EnsembleData resmi:
   - channel info    : browseId (channel ID)
   - video details   : id (video_id)
 """
+import logging
 from typing import Any
 
 from app.integrations.ensemble_data.client import EnsembleDataClient
 from app.integrations.ensemble_data.endpoints import YouTubeEndpoints
+
+logger = logging.getLogger(__name__)
 
 PLATFORM = "youtube"
 MAX_DEPTH = 5       # hard cap — 1 depth = ~20 video = 1 EnsembleData unit
@@ -35,14 +38,19 @@ class YouTubeConnector:
         """
         from app.shared.exceptions import ExternalAPIError
 
+        logger.info("[YouTube] search_by_keyword: keyword=%r depth=%d", keyword, min(depth, MAX_DEPTH))
         try:
-            return await self.client.get(
+            result = await self.client.get(
                 YouTubeEndpoints.KEYWORD_SEARCH.path,
                 params={"keyword": keyword, "depth": min(depth, MAX_DEPTH)},
             )
+            posts = (result.get("data") or {}).get("posts") or []
+            logger.info("[YouTube] search_by_keyword: %d item diterima dari EnsembleData", len(posts))
+            return result
         except ExternalAPIError as exc:
             if "495" not in str(exc):
                 raise
+            logger.warning("[YouTube] EnsembleData quota habis (495), fallback ke YouTube Data API v3")
             # Quota EnsembleData habis — coba YouTube Data API v3
             from app.shared.config import settings
             from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
@@ -104,14 +112,25 @@ class YouTubeConnector:
         """
         from app.shared.exceptions import ExternalAPIError
 
+        page_label = "halaman pertama" if not cursor else f"cursor={cursor[:20]}…"
+        logger.info("[YouTube] get_video_comments: video_id=%s (%s)", video_id, page_label)
         try:
-            return await self.client.get(
+            result = await self.client.get(
                 YouTubeEndpoints.VIDEO_COMMENTS.path,
                 params={"id": video_id, "cursor": cursor},
             )
+            comments = (result.get("data") or {}).get("comments") or []
+            next_cur  = (result.get("data") or {}).get("nextCursor") or ""
+            logger.info(
+                "[YouTube] get_video_comments: %d komentar, next_cursor=%s",
+                len(comments),
+                repr(next_cur[:30]) if next_cur else "None (halaman terakhir)",
+            )
+            return result
         except ExternalAPIError as exc:
             if "495" not in str(exc):
                 raise
+            logger.warning("[YouTube] EnsembleData quota habis (495), fallback ke YouTube Data API v3 untuk komentar")
             from app.shared.config import settings
             from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
 

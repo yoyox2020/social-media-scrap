@@ -20,9 +20,12 @@ Flow otomatis (dipanggil Celery Beat setiap 1 jam):
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 
 from app.workers.celery_app import celery_app
+
+logger = logging.getLogger(__name__)
 
 
 def _get_fresh_session():
@@ -173,6 +176,7 @@ async def _run_youtube_pipeline(
     fresh_engine, session_factory = _get_fresh_session()
 
     # ── Step 1: collect videos ────────────────────────────────────────────────
+    logger.info("[Worker/Pipeline] MULAI — keyword_id=%s", keyword_id)
     async with session_factory() as db:
         kw_repo = KeywordRepository(db)
         svc = CollectorService(kw_repo)
@@ -185,6 +189,10 @@ async def _run_youtube_pipeline(
 
     videos_new = collection_result.new_posts
     videos_fetched = collection_result.total_fetched
+    logger.info(
+        "[Worker/Pipeline] Collect video selesai — fetched=%d new=%d duplikat=%d errors=%s",
+        videos_fetched, videos_new, collection_result.skipped_duplicates, collection_result.errors,
+    )
 
     # ── Step 2: ambil video terbaru & dispatch comment task per video ──────────
     fetch_limit = max(videos_fetched, 10)
@@ -209,6 +217,8 @@ async def _run_youtube_pipeline(
             max_pages=max_comment_pages,
         )
         jobs_dispatched += 1
+
+    logger.info("[Worker/Pipeline] Dispatch comment tasks: %d task dikirim ke queue", jobs_dispatched)
 
     return {
         "keyword_id": keyword_id,
@@ -256,6 +266,7 @@ async def _run_comments(
 ) -> dict:
     from app.services.youtube.pipeline_service import collect_comments_for_video
 
+    logger.info("[Worker/Comments] MULAI — post_id=%s keyword_id=%s max=%d", post_id, keyword_id, max_comments)
     fresh_engine, session_factory = _get_fresh_session()
     async with session_factory() as db:
         result = await collect_comments_for_video(
@@ -266,4 +277,9 @@ async def _run_comments(
             max_pages=max_pages,
         )
     await fresh_engine.dispose()
-    return result.model_dump()
+    data = result.model_dump()
+    logger.info(
+        "[Worker/Comments] SELESAI — post_id=%s komentar_baru=%s",
+        post_id, data.get("new_comments", data.get("comments_saved", "?")),
+    )
+    return data
