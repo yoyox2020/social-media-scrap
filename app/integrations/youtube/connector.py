@@ -222,6 +222,10 @@ class YouTubeConnector:
         extracted = []
         for item in posts:
             vr = item.get("videoRenderer")
+            if not vr:
+                # channel/videos returns richItemRenderer → content → videoRenderer
+                rich = item.get("richItemRenderer") or {}
+                vr = (rich.get("content") or {}).get("videoRenderer")
             if vr:
                 extracted.append(vr)
             elif item.get("videoId"):
