@@ -82,9 +82,10 @@ class YouTubeConnector:
                 params={"name": hashtag, "depth": min(depth, MAX_DEPTH), "only_shorts": only_shorts},
             )
         except ExternalAPIError as exc:
-            if "495" not in str(exc):
+            exc_str = str(exc)
+            if "495" not in exc_str and "493" not in exc_str:
                 raise
-            logger.warning("[YouTube] EnsembleData quota habis (495) untuk hashtag=%r, fallback ke YouTube Data API v3", hashtag)
+            logger.warning("[YouTube] EnsembleData tidak tersedia (%s) untuk hashtag=%r, fallback ke YouTube Data API v3", exc_str[:60], hashtag)
             from app.shared.config import settings
             from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
 
@@ -141,15 +142,15 @@ class YouTubeConnector:
             )
             return result
         except ExternalAPIError as exc:
-            if "495" not in str(exc):
+            exc_str = str(exc)
+            if "495" not in exc_str and "493" not in exc_str:
                 raise
-            logger.warning("[YouTube] EnsembleData quota habis (495), fallback ke YouTube Data API v3 untuk komentar")
+            logger.warning("[YouTube] EnsembleData tidak tersedia (%s) untuk komentar video=%s, fallback ke YouTube Data API v3", exc_str[:60], video_id)
             from app.shared.config import settings
             from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
 
             if not settings.youtube_data_api_key:
-                raise  # Tidak ada fallback key, teruskan error asli
-
+                raise
             yt_client = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
             return await yt_client.list_comment_threads(video_id, page_token=cursor or None)
 
