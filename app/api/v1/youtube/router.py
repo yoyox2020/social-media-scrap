@@ -679,6 +679,7 @@ async def viral_videos(
     post_ids = [str(r["id"]) for r in rows]
     comments_by_post: dict[str, list] = {pid: [] for pid in post_ids}
     all_labels: list[str] = []
+    total_per_post: dict[str, int] = {}
 
     if post_ids and limit_comments > 0:
         ids_sql = ", ".join(f"'{pid}'" for pid in post_ids)
@@ -693,6 +694,7 @@ async def viral_videos(
 
         for r in cmt_rows:
             pid = r["post_id"]
+            total_per_post[pid] = total_per_post.get(pid, 0) + 1
             if r["sentiment"]:
                 all_labels.append(r["sentiment"])
             bucket = comments_by_post.setdefault(pid, [])
@@ -724,7 +726,7 @@ async def viral_videos(
             "duration":     (r["metadata"] or {}).get("duration", ""),
             "published_at": r["published_at"].isoformat() if r["published_at"] else None,
             "keyword":      r["keyword"],
-            "comment_count": len(vid_cmts),
+            "comment_count": total_per_post.get(pid, 0),
             "sentiment_summary": {
                 lbl: {
                     "count":      sc.get(lbl, 0),
@@ -738,7 +740,7 @@ async def viral_videos(
     # Distribusi sentimen global
     counter        = _Counter(all_labels)
     total_analyzed = sum(counter.values())
-    total_cmts     = sum(len(v) for v in comments_by_post.values())
+    total_cmts     = sum(total_per_post.values())
     sentiment_dist = {
         lbl: {
             "count":      counter.get(lbl, 0),
@@ -860,6 +862,7 @@ async def viral_videos_post(
     # ── Komentar nested per video (batch query → group by post_id) ────────────
     comments_by_post: dict[str, list] = {pid: [] for pid in post_ids_raw}
     all_labels: list[str] = []
+    total_per_post: dict[str, int] = {}
 
     if post_ids_raw and body.limit_comments > 0 and total > 0:
         ids_sql = ", ".join(f"'{pid}'" for pid in post_ids_raw)
@@ -874,6 +877,7 @@ async def viral_videos_post(
 
         for r in cmt_rows:
             pid = r["post_id"]
+            total_per_post[pid] = total_per_post.get(pid, 0) + 1
             if r["sentiment"]:
                 all_labels.append(r["sentiment"])
             bucket = comments_by_post.setdefault(pid, [])
@@ -894,7 +898,7 @@ async def viral_videos_post(
         vid_lbls = [c["sentiment"] for c in vid_cmts if c["sentiment"]]
         sc       = _Counter(vid_lbls)
         total_sc = sum(sc.values())
-        item["comment_count"] = len(vid_cmts)
+        item["comment_count"] = total_per_post.get(pid, 0)
         item["sentiment_summary"] = {
             lbl: {
                 "count":      sc.get(lbl, 0),
@@ -1045,7 +1049,7 @@ async def viral_videos_post(
     # Distribusi sentimen global
     counter        = _Counter(all_labels)
     total_analyzed = sum(counter.values())
-    total_cmts     = sum(len(v) for v in comments_by_post.values())
+    total_cmts     = sum(total_per_post.values())
     sentiment_dist = {
         lbl: {
             "count":      counter.get(lbl, 0),
