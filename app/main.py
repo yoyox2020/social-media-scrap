@@ -279,6 +279,12 @@ async def scraping_status_page():
   .pill-flagged  { background: #450a0a; color: #fca5a5; }
   .pill-active   { background: #14532d; color: #4ade80; }
   .pill-completed { background: #1e293b; color: #64748b; }
+  .pagination { display: flex; align-items: center; gap: 10px; margin-top: 10px; justify-content: flex-end; }
+  .page-btn { background: #1e293b; border: 1px solid #334155; color: #94a3b8; padding: 5px 14px; border-radius: 6px; cursor: pointer; font-size: 0.8rem; transition: background 0.15s; }
+  .page-btn:hover:not([disabled]) { background: #334155; color: #e2e8f0; }
+  .page-btn[disabled] { opacity: 0.35; cursor: default; }
+  .page-info { font-size: 0.8rem; color: #64748b; }
+  .page-total { font-size: 0.75rem; color: #475569; margin-right: auto; }
 </style>
 </head>
 <body>
@@ -318,8 +324,9 @@ async def scraping_status_page():
   </thead>
   <tbody id="vt-table"></tbody>
 </table>
+<div class="pagination" id="vt-pagination"></div>
 
-<div class="section-title" style="margin-top:24px">Riwayat Scraping Keyword (50 terbaru)</div>
+<div class="section-title" style="margin-top:24px">Riwayat Scraping Keyword</div>
 <table>
   <thead>
     <tr>
@@ -337,9 +344,13 @@ async def scraping_status_page():
   </thead>
   <tbody id="runs-table"></tbody>
 </table>
+<div class="pagination" id="runs-pagination"></div>
 
 <script>
 let countdown = 15;
+let vtPage = 1;
+let runsPage = 1;
+const PAGE_LIMIT = 20;
 
 function statusPill(s) {
   const map = { success: 'pill-success', failed: 'pill-failed', running: 'pill-running', fallback: 'pill-fallback' };
@@ -358,6 +369,21 @@ function fmtTaskName(name) {
   const parts = name.split('.');
   return parts[parts.length - 1];
 }
+
+function renderPagination(containerId, page, totalPages, total, navFn) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  if (totalPages <= 1) { el.innerHTML = ''; return; }
+  el.innerHTML = `
+    <span class="page-total">${total} data</span>
+    <button class="page-btn" ${page <= 1 ? 'disabled' : ''} onclick="${navFn}(${page - 1})">&#8592; Prev</button>
+    <span class="page-info">Hal ${page} / ${totalPages}</span>
+    <button class="page-btn" ${page >= totalPages ? 'disabled' : ''} onclick="${navFn}(${page + 1})">Next &#8594;</button>
+  `;
+}
+
+function navVT(p) { vtPage = p; load(); }
+function navRuns(p) { runsPage = p; load(); }
 
 function renderWorkers(workers) {
   const grid = document.getElementById('workers-grid');
@@ -396,7 +422,8 @@ function renderWorkers(workers) {
 async function load() {
   try {
     const base = window.location.origin;
-    const r = await fetch(base + '/api/v1/youtube/monitor-public');
+    const url = `${base}/api/v1/youtube/monitor-public?vt_page=${vtPage}&vt_limit=${PAGE_LIMIT}&runs_page=${runsPage}&runs_limit=${PAGE_LIMIT}`;
+    const r = await fetch(url);
     const json = await r.json();
     const d = json.data;
 
@@ -424,7 +451,7 @@ async function load() {
     const vtTbody = document.getElementById('vt-table');
     const vtRows = vt.recent_activity || [];
     if (vtRows.length === 0) {
-      vtTbody.innerHTML = '<tr><td colspan="6" style="color:#475569;font-style:italic;padding:12px">Belum ada aktivitas scraping tracker</td></tr>';
+      vtTbody.innerHTML = '<tr><td colspan="6" style="color:#475569;font-style:italic;padding:12px">Belum ada data tracker</td></tr>';
     } else {
       vtTbody.innerHTML = vtRows.map(r => {
         const ll = r.last_log || {};
@@ -450,9 +477,12 @@ async function load() {
       }).join('');
     }
 
+    const vtPag = vt.pagination || {};
+    renderPagination('vt-pagination', vtPage, vtPag.total_pages || 1, vtPag.total || 0, 'navVT');
+
     // Keyword scraping runs
     const tbody = document.getElementById('runs-table');
-    tbody.innerHTML = d.runs.map(r => `<tr>
+    tbody.innerHTML = (d.runs || []).map(r => `<tr>
       <td><b>${r.keyword || '-'}</b></td>
       <td>${statusPill(r.status)}</td>
       <td style="color:#94a3b8">${r.triggered_by || '-'}</td>
@@ -464,6 +494,9 @@ async function load() {
       <td style="color:#94a3b8;font-size:.75rem">${fmt(r.started_at)}</td>
       <td class="error-text" title="${r.error || ''}">${r.error || ''}</td>
     </tr>`).join('');
+
+    const runsPag = d.runs_pagination || {};
+    renderPagination('runs-pagination', runsPage, runsPag.total_pages || 1, runsPag.total || 0, 'navRuns');
 
     document.getElementById('last-update').textContent = new Date().toLocaleTimeString('id-ID');
     countdown = 15;

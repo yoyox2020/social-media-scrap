@@ -1882,6 +1882,10 @@ async def pipeline_status(
 
 @router.get("/monitor-public", response_model=dict, tags=["monitor"])
 async def scrape_monitor_public(
+    vt_page: int = Query(default=1, ge=1, description="Halaman viral tracking"),
+    vt_limit: int = Query(default=20, ge=1, le=100, description="Item per halaman viral tracking"),
+    runs_page: int = Query(default=1, ge=1, description="Halaman riwayat scraping"),
+    runs_limit: int = Query(default=20, ge=1, le=100, description="Item per halaman scraping"),
     db: AsyncSession = Depends(get_db),
 ):
     """Status scraping tanpa auth — untuk dashboard publik."""
@@ -1919,6 +1923,8 @@ async def scrape_monitor_public(
         for r in stats
     }
 
+    runs_total: int = await db.scalar(text("SELECT COUNT(*) FROM scrape_runs")) or 0
+
     rows = (await db.execute(text("""
         SELECT sr.id, sr.keyword_text, sr.api_source, sr.status, sr.triggered_by,
                sr.videos_fetched, sr.videos_new, sr.videos_duplicate,
@@ -1929,8 +1935,8 @@ async def scrape_monitor_public(
         FROM scrape_runs sr
         LEFT JOIN keywords k ON sr.keyword_id = k.id
         ORDER BY sr.started_at DESC
-        LIMIT 50
-    """))).mappings().all()
+        LIMIT :limit OFFSET :offset
+    """), {"limit": runs_limit, "offset": (runs_page - 1) * runs_limit})).mappings().all()
 
     total_posts: int = await db.scalar(text("SELECT COUNT(*) FROM posts")) or 0
     total_comments: int = await db.scalar(text("SELECT COUNT(*) FROM comments")) or 0
@@ -1951,17 +1957,21 @@ async def scrape_monitor_public(
         text("SELECT COUNT(*) FROM posts WHERE metadata->>'source' = 'viral_tracking'")
     ) or 0
 
-    # Tracker yang baru-baru ini scraping (10 terakhir)
+    vt_total: int = await db.scalar(text("SELECT COUNT(*) FROM viral_channel_trackers")) or 0
+
+    # Semua tracker dengan pagination — yang sudah scrape muncul duluan
     vt_recent_rows = (await db.execute(text("""
         SELECT id, channel_name, tracker_type, status, posts_collected,
                last_scraped_date,
                jsonb_array_length(COALESCE(scrape_logs, '[]'::jsonb)) AS log_count,
                scrape_logs -> (jsonb_array_length(COALESCE(scrape_logs, '[]'::jsonb)) - 1) AS last_log
         FROM viral_channel_trackers
-        WHERE last_scraped_date IS NOT NULL
-        ORDER BY last_scraped_date DESC, updated_at DESC
-        LIMIT 10
-    """))).mappings().all()
+        ORDER BY
+            CASE WHEN last_scraped_date IS NOT NULL THEN 0 ELSE 1 END,
+            last_scraped_date DESC NULLS LAST,
+            updated_at DESC
+        LIMIT :limit OFFSET :offset
+    """), {"limit": vt_limit, "offset": (vt_page - 1) * vt_limit})).mappings().all()
 
     viral_recent = []
     for vt in vt_recent_rows:
@@ -2054,6 +2064,18 @@ async def scrape_monitor_public(
             "posts_in_db": posts_via_tracker,
             "flagged_accounts": flagged_count,
             "recent_activity": viral_recent,
+            "pagination": {
+                "page": vt_page,
+                "limit": vt_limit,
+                "total": vt_total,
+                "total_pages": max(1, (vt_total + vt_limit - 1) // vt_limit),
+            },
+        },
+        "runs_pagination": {
+            "page": runs_page,
+            "limit": runs_limit,
+            "total": runs_total,
+            "total_pages": max(1, (runs_total + runs_limit - 1) // runs_limit),
         },
     })
 
