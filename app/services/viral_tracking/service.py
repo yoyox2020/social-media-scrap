@@ -55,6 +55,8 @@ async def detect_and_create_trackers(db: AsyncSession) -> list[uuid.UUID]:
             Post.platform == "youtube",
             Post.metadata_["views"].as_integer() >= VIRAL_VIEW_THRESHOLD,
         )
+        # Proses post terlama dulu agar trigger_post yang paling awal yang jadi acuan
+        .order_by(Post.collected_at.asc())
     )
     viral_posts: list[Post] = list(viral_posts_result.scalars().all())
 
@@ -67,6 +69,18 @@ async def detect_and_create_trackers(db: AsyncSession) -> list[uuid.UUID]:
 
         channel_id = _extract_channel_id_from_raw(post.raw_data or {})
         if not channel_id or channel_id in tracked_channels:
+            continue
+
+        # Cek sekali lagi ke DB sebelum insert — hindari race condition
+        # jika detect task berjalan paralel di beberapa worker
+        existing_check = await db.scalar(
+            select(ViralChannelTracker.id).where(
+                ViralChannelTracker.channel_id == channel_id,
+                ViralChannelTracker.status == "active",
+            ).limit(1)
+        )
+        if existing_check:
+            tracked_channels.add(channel_id)
             continue
 
         channel_name = _extract_channel_name_from_raw(post.raw_data or {})
@@ -142,6 +156,23 @@ async def run_daily_channel_scrape(db: AsyncSession, tracker_id: uuid.UUID) -> i
 
             if new_posts:
                 new_count = await post_repo.bulk_create(new_posts)
+
+            # Collect komentar untuk setiap post baru agar check_flagged_commenters
+            # punya data komentar yang bisa dianalisis
+            if new_posts:
+                from app.services.youtube.pipeline_service import collect_comments_for_video
+                for post in new_posts:
+                    if post.id and tracker.keyword_id:
+                        try:
+                            await collect_comments_for_video(
+                                db=db,
+                                post_id=post.id,
+                                keyword_id=tracker.keyword_id,
+                                max_comments=50,
+                                max_pages=1,
+                            )
+                        except Exception:
+                            pass  # lanjut ke post berikutnya
 
     except Exception as exc:
         # Tetap catat log meski gagal
