@@ -701,6 +701,4 @@ Ubah logika resume_active_trackers agar tracker yang last_scraped_date = hari in
 Opsi 3 — Visual saja:
 Beri warna berbeda di monitor: abu-abu = belum scrape, oranye = error, hijau = sukses. Tidak mengubah data, tapi tampilan lebih informatif.
 
-Mau saya kerjakan yang mana? Kalau mau semuanya, paling cepat berikan data adalah Opsi 1 (retry sekarang) + Opsi 2 (auto-retry error) + Opsi 3 (visual). Tapi jika mau tunggu malam ini jam 03:00 WIB dulu dan lihat hasilnya, itu juga oke karena 72 tracker seharusnya berjalan sendiri.
-
 
