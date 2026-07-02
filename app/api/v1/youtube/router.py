@@ -1016,9 +1016,10 @@ async def get_popular_videos(
 async def date_range_search(
     date_from: date = Query(..., description="Tanggal mulai (YYYY-MM-DD), inklusif"),
     date_to: date = Query(..., description="Tanggal akhir (YYYY-MM-DD), inklusif"),
-    q: str | None = Query(default=None, max_length=200, description="Filter kata kunci (opsional, tanpa filter = semua keyword)"),
+    q: str | None = Query(default=None, max_length=200, description="Filter teks: cari di judul video, nama channel, atau nama keyword"),
     keyword_id: uuid.UUID | None = Query(default=None, description="Filter per keyword ID (opsional)"),
     sort_by: str = Query(default="newest", description="Urutan: newest (terbaru), oldest (terlama), views (terviral)"),
+    date_field: str = Query(default="published", description="Kolom tanggal: published (tanggal upload YouTube) atau collected (tanggal discrape)"),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     limit_comments: int = Query(default=50, ge=0, le=500, description="Jumlah sample komentar (0 = tidak ambil)"),
@@ -1027,21 +1028,22 @@ async def date_range_search(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Cari video YouTube dari DB berdasarkan **rentang tanggal publish** video.
+    Cari video YouTube dari DB berdasarkan rentang tanggal.
 
     Parameter wajib:
-    - `date_from` : tanggal mulai (YYYY-MM-DD)
-    - `date_to`   : tanggal akhir (YYYY-MM-DD), inklusif
+    - `date_from`   : tanggal mulai (YYYY-MM-DD)
+    - `date_to`     : tanggal akhir (YYYY-MM-DD), inklusif
 
     Parameter opsional:
-    - `q`          : filter kata kunci (cari di nama keyword, LIKE match)
-    - `keyword_id` : filter per keyword ID (lebih presisi dari `q`)
-    - `sort_by`    : newest / oldest / views
+    - `q`           : cari teks di judul video, nama channel, atau nama keyword
+    - `keyword_id`  : filter per keyword ID (lebih presisi dari `q`)
+    - `date_field`  : `published` (default) = tanggal upload YouTube |
+                      `collected` = tanggal video discrape ke DB
+    - `sort_by`     : newest / oldest / views
     - `include_sentiment` : sertakan distribusi sentimen & breakdown per hari
 
-    **Catatan:** filter tanggal berlaku pada `published_at` video (bukan `collected_at`).
-    Video yang di-scrape hari ini tapi di-publish 3 bulan lalu akan muncul jika
-    rentang tanggal mencakup tanggal publishnya.
+    **Tip viral tracking:** gunakan `date_field=collected` untuk mencari video
+    yang baru discrape hari ini meskipun videonya di-upload YouTube bulan lalu.
     """
     if date_from > date_to:
         from fastapi import HTTPException
@@ -1050,10 +1052,11 @@ async def date_range_search(
     dt_from = datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc)
     dt_to   = datetime(date_to.year,   date_to.month,   date_to.day,   23, 59, 59, tzinfo=timezone.utc)
 
+    date_col = "p.collected_at" if date_field == "collected" else "p.published_at"
     filters = [
         "p.platform = 'youtube'",
-        "p.published_at >= :dt_from",
-        "p.published_at <= :dt_to",
+        f"{date_col} >= :dt_from",
+        f"{date_col} <= :dt_to",
     ]
     params: dict = {
         "dt_from": dt_from,
@@ -1066,7 +1069,7 @@ async def date_range_search(
         filters.append("p.keyword_id = :keyword_id")
         params["keyword_id"] = str(keyword_id)
     elif q:
-        filters.append("k.keyword ILIKE :q_like")
+        filters.append("(p.content ILIKE :q_like OR p.author ILIKE :q_like OR k.keyword ILIKE :q_like)")
         params["q_like"] = f"%{q.strip()}%"
 
     order_clause = {
@@ -1128,7 +1131,7 @@ async def date_range_search(
             kw_filter_c = "AND p.keyword_id = :kw_id_c"
             params_c["kw_id_c"] = str(keyword_id)
         elif q:
-            kw_filter_c = "AND k.keyword ILIKE :q_like_c"
+            kw_filter_c = "AND (p.content ILIKE :q_like_c OR p.author ILIKE :q_like_c OR k.keyword ILIKE :q_like_c)"
             params_c["q_like_c"] = f"%{q.strip()}%"
         comment_rows = (await db.execute(text(f"""
             SELECT c.id, c.content, c.author,
@@ -1139,7 +1142,7 @@ async def date_range_search(
             LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
             LEFT JOIN keywords k ON p.keyword_id = k.id
             WHERE p.platform = 'youtube'
-              AND p.published_at >= :dt_from AND p.published_at <= :dt_to
+              AND {date_col} >= :dt_from AND {date_col} <= :dt_to
               {kw_filter_c}
             ORDER BY c.created_at DESC
             LIMIT :lc
@@ -1160,6 +1163,7 @@ async def date_range_search(
         "filter": {
             "date_from":  str(date_from),
             "date_to":    str(date_to),
+            "date_field": date_field,
             "q":          q,
             "keyword_id": str(keyword_id) if keyword_id else None,
             "sort_by":    sort_by,
@@ -1178,7 +1182,7 @@ async def date_range_search(
             kw_filter_sent = "AND p.keyword_id = :keyword_id"
             params_sent["keyword_id"] = str(keyword_id)
         elif q:
-            kw_filter_sent = "AND k.keyword ILIKE :q_like"
+            kw_filter_sent = "AND (p.content ILIKE :q_like OR p.author ILIKE :q_like OR k.keyword ILIKE :q_like)"
             params_sent["q_like"] = f"%{q.strip()}%"
 
         sent_rows = (await db.execute(text(f"""
@@ -1188,7 +1192,7 @@ async def date_range_search(
             JOIN posts p    ON c.post_id = p.id
             LEFT JOIN keywords k ON p.keyword_id = k.id
             WHERE p.platform = 'youtube'
-              AND p.published_at >= :dt_from AND p.published_at <= :dt_to
+              AND {date_col} >= :dt_from AND {date_col} <= :dt_to
               {kw_filter_sent}
             GROUP BY la.label
         """), params_sent)).mappings().all()
@@ -1205,11 +1209,11 @@ async def date_range_search(
         dominant = max(dist, key=dist.get) if dist else "netral"
 
         daily_rows = (await db.execute(text(f"""
-            SELECT DATE(p.published_at AT TIME ZONE 'UTC') AS day, COUNT(*) AS video_count
+            SELECT DATE({date_col} AT TIME ZONE 'UTC') AS day, COUNT(*) AS video_count
             FROM posts p
             LEFT JOIN keywords k ON p.keyword_id = k.id
             WHERE p.platform = 'youtube'
-              AND p.published_at >= :dt_from AND p.published_at <= :dt_to
+              AND {date_col} >= :dt_from AND {date_col} <= :dt_to
               {kw_filter_sent}
             GROUP BY day ORDER BY day ASC
         """), params_sent)).mappings().all()
