@@ -73,7 +73,8 @@ class Settings(BaseSettings):
     youtube_trending_limit: int = 10
     youtube_max_pages_per_keyword: int = 1      # limit EnsembleData: max 5 unit per search
     youtube_max_comment_pages: int = 1          # limit EnsembleData: max 5 unit per video
-    youtube_max_comments_per_video: int = 50
+    youtube_max_comments_per_video: int = 5     # hemat token: 5 komentar/video
+    youtube_max_videos_per_search: int = 2      # hemat token: 2 video per pencarian
 
     # Rate Limiting
     rate_limit_agents_max_requests: int = 10

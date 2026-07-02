@@ -702,16 +702,16 @@ async def smart_search_youtube(
     collection_result = await svc.collect_for_platform(
         keyword_id=kw_id,
         platform="youtube",
-        max_pages=1,        # 1 halaman dulu untuk respon cepat (~20 video)
+        max_pages=1,        # 1 halaman (~20 video), lalu dibatasi 2 di bawah
     )
 
-    #    b. Ambil video yang baru tersimpan, collect komentar untuk 3 video pertama
+    #    b. Ambil video yang baru tersimpan, collect komentar untuk 2 video pertama
     db.expire_all()             # synchronous — bukan await
     fresh_posts = list((await db.scalars(
         select(Post)
         .where(Post.keyword_id == kw_id, Post.platform == "youtube")
         .order_by(Post.collected_at.desc())
-        .limit(3)           # hanya 3 video agar respon tidak terlalu lama
+        .limit(2)           # hemat token: 2 video saja
     )).all())
 
     for post in fresh_posts:
@@ -720,7 +720,7 @@ async def smart_search_youtube(
                 db=db,
                 post_id=post.id,
                 keyword_id=kw_id,
-                max_comments=20,    # 20 komentar per video untuk respon cepat
+                max_comments=5,     # hemat token: 5 komentar per video
                 max_pages=1,
             )
         except Exception:
