@@ -238,10 +238,12 @@ async def scraping_status_page():
   .red { color: #f87171; }
   .blue { color: #60a5fa; }
   .pill { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.7rem; font-weight: 600; }
-  .pill-success { background: #14532d; color: #4ade80; }
-  .pill-failed  { background: #450a0a; color: #f87171; }
-  .pill-running { background: #1e3a5f; color: #60a5fa; }
-  .pill-fallback{ background: #451a03; color: #fbbf24; }
+  .pill-success  { background: #14532d; color: #4ade80; }
+  .pill-failed   { background: #450a0a; color: #f87171; }
+  .pill-running  { background: #1e3a5f; color: #60a5fa; }
+  .pill-fallback { background: #451a03; color: #fbbf24; }
+  .pill-online   { background: #14532d; color: #4ade80; }
+  .pill-offline  { background: #450a0a; color: #f87171; }
   table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
   th { text-align: left; padding: 8px 10px; color: #64748b; border-bottom: 1px solid #1e293b; font-weight: 600; font-size: 0.72rem; text-transform: uppercase; }
   td { padding: 9px 10px; border-bottom: 1px solid #1e293b; vertical-align: middle; }
@@ -253,6 +255,21 @@ async def scraping_status_page():
   .alive-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
   .alive-dot.on  { background: #4ade80; box-shadow: 0 0 8px #4ade80; }
   .alive-dot.off { background: #f87171; }
+  .worker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .worker-card { background: #1e293b; border-radius: 10px; padding: 16px; border-left: 3px solid #4ade80; }
+  .worker-card.offline { border-left-color: #f87171; }
+  .worker-name { font-size: 0.85rem; font-weight: 600; margin-bottom: 10px; color: #e2e8f0; word-break: break-all; }
+  .worker-meta { display: flex; gap: 16px; margin-bottom: 10px; flex-wrap: wrap; }
+  .worker-meta-item { font-size: 0.75rem; color: #64748b; }
+  .worker-meta-item span { color: #94a3b8; font-weight: 600; }
+  .worker-pids { font-size: 0.72rem; color: #475569; margin-bottom: 8px; }
+  .active-tasks { margin-top: 8px; }
+  .active-tasks-title { font-size: 0.72rem; color: #64748b; text-transform: uppercase; margin-bottom: 4px; }
+  .task-item { background: #0f172a; border-radius: 6px; padding: 6px 8px; margin-bottom: 4px; font-size: 0.75rem; }
+  .task-name { color: #60a5fa; }
+  .task-id { color: #475569; font-size: 0.68rem; }
+  .no-tasks { font-size: 0.75rem; color: #475569; font-style: italic; }
+  .no-workers { color: #475569; font-size: 0.82rem; font-style: italic; padding: 12px 0; }
 </style>
 </head>
 <body>
@@ -260,14 +277,17 @@ async def scraping_status_page():
 <div class="subtitle">Social Intelligence Platform &mdash; Auto-refresh tiap 15 detik</div>
 <div class="refresh-bar">Terakhir update: <span id="last-update">-</span> &nbsp;|&nbsp; Refresh dalam <span id="countdown">15</span>s</div>
 
-<div class="grid" id="stats-grid">
-  <div class="card"><div class="label">Worker</div><div class="value" id="worker-status">-</div></div>
+<div class="grid">
+  <div class="card"><div class="label">Status</div><div class="value" id="worker-status">-</div></div>
   <div class="card"><div class="label">Sedang Jalan</div><div class="value blue" id="running">-</div></div>
   <div class="card"><div class="label">Total Posts</div><div class="value" id="total-posts">-</div></div>
   <div class="card"><div class="label">Total Komentar</div><div class="value" id="total-comments">-</div></div>
   <div class="card"><div class="label">Keywords</div><div class="value" id="total-keywords">-</div></div>
   <div class="card"><div class="label">Run 24 Jam</div><div class="value green" id="runs-24h">-</div><div class="sub" id="videos-24h">-</div></div>
 </div>
+
+<div class="section-title">Celery Workers</div>
+<div class="worker-grid" id="workers-grid"><div class="no-workers">Memuat...</div></div>
 
 <div class="section-title">Riwayat Scraping (50 terbaru)</div>
 <table>
@@ -303,6 +323,46 @@ function fmt(dt) {
     month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+function fmtTaskName(name) {
+  if (!name) return '-';
+  const parts = name.split('.');
+  return parts[parts.length - 1];
+}
+
+function renderWorkers(workers) {
+  const grid = document.getElementById('workers-grid');
+  if (!workers || workers.length === 0) {
+    grid.innerHTML = '<div class="no-workers">Tidak ada worker online</div>';
+    return;
+  }
+  grid.innerHTML = workers.map(w => {
+    const isOnline = w.status === 'online';
+    const activeTasks = w.active_tasks || [];
+    const pids = (w.processes || []).join(', ');
+    return `<div class="worker-card ${isOnline ? '' : 'offline'}">
+      <div class="worker-name">
+        <span class="alive-dot ${isOnline ? 'on' : 'off'}"></span>${w.name}
+      </div>
+      <div class="worker-meta">
+        <div class="worker-meta-item">Status: <span>${isOnline ? 'Online' : 'Offline'}</span></div>
+        <div class="worker-meta-item">Concurrency: <span>${w.concurrency ?? '-'}</span></div>
+        <div class="worker-meta-item">Task aktif: <span class="${activeTasks.length > 0 ? 'green' : ''}">${activeTasks.length}</span></div>
+      </div>
+      ${pids ? `<div class="worker-pids">PID: ${pids}</div>` : ''}
+      <div class="active-tasks">
+        <div class="active-tasks-title">Task Berjalan</div>
+        ${activeTasks.length === 0
+          ? '<div class="no-tasks">Idle — tidak ada task</div>'
+          : activeTasks.map(t => `<div class="task-item">
+              <div class="task-name">${fmtTaskName(t.name)}</div>
+              <div class="task-id">ID: ${(t.id || '').substring(0, 16)}…</div>
+            </div>`).join('')
+        }
+      </div>
+    </div>`;
+  }).join('');
+}
+
 async function load() {
   try {
     const base = window.location.origin;
@@ -318,10 +378,11 @@ async function load() {
     document.getElementById('total-keywords').textContent = (d.totals?.keywords || 0).toLocaleString();
 
     const s = d.last_24h?.success;
-    const f = d.last_24h?.failed;
-    const total24 = (s?.total || 0) + (f?.total || 0) + (d.last_24h?.fallback?.total || 0);
+    const total24 = (s?.total || 0) + (d.last_24h?.failed?.total || 0) + (d.last_24h?.fallback?.total || 0);
     document.getElementById('runs-24h').textContent = total24;
     document.getElementById('videos-24h').textContent = s ? `${s.videos_new} video baru` : '-';
+
+    renderWorkers(d.workers);
 
     const tbody = document.getElementById('runs-table');
     tbody.innerHTML = d.runs.map(r => `<tr>

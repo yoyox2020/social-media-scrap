@@ -1961,6 +1961,42 @@ async def scrape_monitor_public(
         ) or 0
     ) > 0
 
+    # ── Celery worker info via inspect ────────────────────────────────────────
+    import asyncio
+    from app.workers.celery_app import celery_app as _celery
+
+    def _inspect_workers():
+        insp = _celery.control.inspect(timeout=3)
+        ping    = insp.ping()    or {}
+        active  = insp.active()  or {}
+        stats   = insp.stats()   or {}
+        workers = []
+        for node, _ in ping.items():
+            node_stats = stats.get(node, {})
+            pool       = node_stats.get("pool", {})
+            active_tasks = active.get(node, [])
+            workers.append({
+                "name":        node,
+                "status":      "online",
+                "concurrency": pool.get("max-concurrency"),
+                "processes":   pool.get("processes", []),
+                "active_tasks": [
+                    {
+                        "id":   t.get("id"),
+                        "name": t.get("name"),
+                        "args": t.get("args"),
+                        "time_start": t.get("time_start"),
+                    }
+                    for t in active_tasks
+                ],
+            })
+        return workers
+
+    try:
+        workers = await asyncio.get_event_loop().run_in_executor(None, _inspect_workers)
+    except Exception:
+        workers = []
+
     return build_success_response({
         "worker_alive": is_alive,
         "currently_running": running_count,
@@ -1971,6 +2007,7 @@ async def scrape_monitor_public(
             "keywords": total_keywords,
         },
         "last_24h": stats_by_status,
+        "workers": workers,
         "runs": runs,
     })
 
