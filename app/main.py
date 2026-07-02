@@ -4,7 +4,7 @@ import json
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 
 def _fix_leading_zeros(s: str) -> str:
@@ -111,7 +111,7 @@ app.add_middleware(RequestIDMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -212,6 +212,149 @@ async def health_check():
             },
         },
     )
+
+
+@app.get("/scraping-status", response_class=HTMLResponse, include_in_schema=False)
+async def scraping_status_page():
+    """Halaman monitoring scraping — tidak perlu login, bisa dibuka langsung di browser."""
+    html = """<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scraping Monitor</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; padding: 24px; }
+  h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 4px; }
+  .subtitle { color: #64748b; font-size: 0.85rem; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card { background: #1e293b; border-radius: 10px; padding: 16px; }
+  .card .label { font-size: 0.75rem; color: #64748b; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px; }
+  .card .value { font-size: 1.8rem; font-weight: 700; }
+  .card .sub { font-size: 0.75rem; color: #94a3b8; margin-top: 2px; }
+  .green { color: #4ade80; }
+  .yellow { color: #fbbf24; }
+  .red { color: #f87171; }
+  .blue { color: #60a5fa; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.7rem; font-weight: 600; }
+  .pill-success { background: #14532d; color: #4ade80; }
+  .pill-failed  { background: #450a0a; color: #f87171; }
+  .pill-running { background: #1e3a5f; color: #60a5fa; }
+  .pill-fallback{ background: #451a03; color: #fbbf24; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th { text-align: left; padding: 8px 10px; color: #64748b; border-bottom: 1px solid #1e293b; font-weight: 600; font-size: 0.72rem; text-transform: uppercase; }
+  td { padding: 9px 10px; border-bottom: 1px solid #1e293b; vertical-align: middle; }
+  tr:hover td { background: #1e293b44; }
+  .section-title { font-size: 0.85rem; font-weight: 600; color: #94a3b8; margin: 20px 0 10px; text-transform: uppercase; letter-spacing: .05em; }
+  .refresh-bar { font-size: 0.75rem; color: #475569; margin-bottom: 16px; }
+  #countdown { color: #60a5fa; }
+  .error-text { color: #f87171; font-size: 0.75rem; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .alive-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .alive-dot.on  { background: #4ade80; box-shadow: 0 0 8px #4ade80; }
+  .alive-dot.off { background: #f87171; }
+</style>
+</head>
+<body>
+<h1>Scraping Monitor</h1>
+<div class="subtitle">Social Intelligence Platform &mdash; Auto-refresh tiap 15 detik</div>
+<div class="refresh-bar">Terakhir update: <span id="last-update">-</span> &nbsp;|&nbsp; Refresh dalam <span id="countdown">15</span>s</div>
+
+<div class="grid" id="stats-grid">
+  <div class="card"><div class="label">Worker</div><div class="value" id="worker-status">-</div></div>
+  <div class="card"><div class="label">Sedang Jalan</div><div class="value blue" id="running">-</div></div>
+  <div class="card"><div class="label">Total Posts</div><div class="value" id="total-posts">-</div></div>
+  <div class="card"><div class="label">Total Komentar</div><div class="value" id="total-comments">-</div></div>
+  <div class="card"><div class="label">Keywords</div><div class="value" id="total-keywords">-</div></div>
+  <div class="card"><div class="label">Run 24 Jam</div><div class="value green" id="runs-24h">-</div><div class="sub" id="videos-24h">-</div></div>
+</div>
+
+<div class="section-title">Riwayat Scraping (50 terbaru)</div>
+<table>
+  <thead>
+    <tr>
+      <th>Keyword</th>
+      <th>Status</th>
+      <th>Trigger</th>
+      <th>API</th>
+      <th>Video</th>
+      <th>Baru</th>
+      <th>Komentar</th>
+      <th>Durasi</th>
+      <th>Waktu Mulai</th>
+      <th>Error</th>
+    </tr>
+  </thead>
+  <tbody id="runs-table"></tbody>
+</table>
+
+<script>
+let countdown = 15;
+
+function statusPill(s) {
+  const map = { success: 'pill-success', failed: 'pill-failed', running: 'pill-running', fallback: 'pill-fallback' };
+  return `<span class="pill ${map[s] || ''}">${s}</span>`;
+}
+
+function fmt(dt) {
+  if (!dt) return '-';
+  const d = new Date(dt);
+  return d.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta', hour12: false,
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+async function load() {
+  try {
+    const base = window.location.origin;
+    const r = await fetch(base + '/api/v1/youtube/monitor-public');
+    const json = await r.json();
+    const d = json.data;
+
+    document.getElementById('worker-status').innerHTML =
+      `<span class="alive-dot ${d.worker_alive ? 'on' : 'off'}"></span>${d.worker_alive ? 'AKTIF' : 'MATI'}`;
+    document.getElementById('running').textContent = d.currently_running;
+    document.getElementById('total-posts').textContent = (d.totals?.posts || 0).toLocaleString();
+    document.getElementById('total-comments').textContent = (d.totals?.comments || 0).toLocaleString();
+    document.getElementById('total-keywords').textContent = (d.totals?.keywords || 0).toLocaleString();
+
+    const s = d.last_24h?.success;
+    const f = d.last_24h?.failed;
+    const total24 = (s?.total || 0) + (f?.total || 0) + (d.last_24h?.fallback?.total || 0);
+    document.getElementById('runs-24h').textContent = total24;
+    document.getElementById('videos-24h').textContent = s ? `${s.videos_new} video baru` : '-';
+
+    const tbody = document.getElementById('runs-table');
+    tbody.innerHTML = d.runs.map(r => `<tr>
+      <td><b>${r.keyword || '-'}</b></td>
+      <td>${statusPill(r.status)}</td>
+      <td style="color:#94a3b8">${r.triggered_by || '-'}</td>
+      <td style="color:#94a3b8;font-size:.75rem">${r.api_source || '-'}</td>
+      <td>${r.videos_fetched ?? '-'}</td>
+      <td class="green">${r.videos_new ?? '-'}</td>
+      <td>${r.comments_new ?? '-'}</td>
+      <td style="color:#94a3b8">${r.duration_sec ? r.duration_sec + 's' : '-'}</td>
+      <td style="color:#94a3b8;font-size:.75rem">${fmt(r.started_at)}</td>
+      <td class="error-text" title="${r.error || ''}">${r.error || ''}</td>
+    </tr>`).join('');
+
+    document.getElementById('last-update').textContent = new Date().toLocaleTimeString('id-ID');
+    countdown = 15;
+  } catch(e) {
+    console.error(e);
+  }
+}
+
+load();
+setInterval(load, 15000);
+setInterval(() => {
+  countdown--;
+  if (countdown < 0) countdown = 15;
+  document.getElementById('countdown').textContent = countdown;
+}, 1000);
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 # ── API v1 Routers ─────────────────────────────────────────────────────────────

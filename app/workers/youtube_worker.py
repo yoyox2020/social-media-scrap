@@ -255,6 +255,11 @@ async def _run_youtube_pipeline(
         kw = await db.get(Keyword, kw_uuid)
         keyword_text = kw.keyword if kw else keyword_id
 
+    if not kw:
+        logger.error("[Worker/Pipeline] Keyword tidak ditemukan di DB — id=%s", keyword_id)
+        await fresh_engine.dispose()
+        return {"error": f"Keyword {keyword_id} tidak ada di DB", "keyword_id": keyword_id}
+
     logger.info("[Worker/Pipeline] MULAI — keyword=%r triggered_by=%s", keyword_text, triggered_by)
 
     # Catat ke scrape_runs

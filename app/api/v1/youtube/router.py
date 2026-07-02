@@ -1880,6 +1880,101 @@ async def pipeline_status(
     return build_success_response(result.model_dump())
 
 
+@router.get("/monitor-public", response_model=dict, tags=["monitor"])
+async def scrape_monitor_public(
+    db: AsyncSession = Depends(get_db),
+):
+    """Status scraping tanpa auth — untuk dashboard publik."""
+    running_count: int = await db.scalar(
+        text("SELECT COUNT(*) FROM scrape_runs WHERE status = 'running'")
+    ) or 0
+
+    stale_count: int = await db.scalar(
+        text("""
+            SELECT COUNT(*) FROM scrape_runs
+            WHERE status = 'running'
+              AND started_at < NOW() - INTERVAL '30 minutes'
+        """)
+    ) or 0
+
+    stats = (await db.execute(text("""
+        SELECT status, COUNT(*) AS total,
+               SUM(videos_fetched) AS videos_fetched,
+               SUM(videos_new) AS videos_new,
+               SUM(comments_new) AS comments_new,
+               AVG(duration_seconds) AS avg_duration_sec
+        FROM scrape_runs
+        WHERE started_at >= NOW() - INTERVAL '24 hours'
+        GROUP BY status
+    """))).mappings().all()
+
+    stats_by_status = {
+        r["status"]: {
+            "total": r["total"],
+            "videos_fetched": int(r["videos_fetched"] or 0),
+            "videos_new": int(r["videos_new"] or 0),
+            "comments_new": int(r["comments_new"] or 0),
+            "avg_duration_sec": round(float(r["avg_duration_sec"] or 0), 1),
+        }
+        for r in stats
+    }
+
+    rows = (await db.execute(text("""
+        SELECT sr.id, sr.keyword_text, sr.api_source, sr.status, sr.triggered_by,
+               sr.videos_fetched, sr.videos_new, sr.videos_duplicate,
+               sr.comments_fetched, sr.comments_new,
+               sr.duration_seconds, sr.error_message,
+               sr.started_at, sr.finished_at,
+               k.keyword AS kw_name
+        FROM scrape_runs sr
+        LEFT JOIN keywords k ON sr.keyword_id = k.id
+        ORDER BY sr.started_at DESC
+        LIMIT 50
+    """))).mappings().all()
+
+    total_posts: int = await db.scalar(text("SELECT COUNT(*) FROM posts")) or 0
+    total_comments: int = await db.scalar(text("SELECT COUNT(*) FROM comments")) or 0
+    total_keywords: int = await db.scalar(text("SELECT COUNT(*) FROM keywords")) or 0
+
+    runs = []
+    for r in rows:
+        runs.append({
+            "run_id": str(r["id"]),
+            "keyword": r["kw_name"] or r["keyword_text"],
+            "api_source": r["api_source"],
+            "status": r["status"],
+            "triggered_by": r["triggered_by"],
+            "videos_fetched": r["videos_fetched"],
+            "videos_new": r["videos_new"],
+            "videos_duplicate": r["videos_duplicate"],
+            "comments_fetched": r["comments_fetched"],
+            "comments_new": r["comments_new"],
+            "duration_sec": round(float(r["duration_seconds"]), 1) if r["duration_seconds"] else None,
+            "error": r["error_message"],
+            "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+            "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
+        })
+
+    is_alive = running_count > 0 or (
+        await db.scalar(
+            text("SELECT COUNT(*) FROM scrape_runs WHERE started_at >= NOW() - INTERVAL '2 hours'")
+        ) or 0
+    ) > 0
+
+    return build_success_response({
+        "worker_alive": is_alive,
+        "currently_running": running_count,
+        "stale_runs": stale_count,
+        "totals": {
+            "posts": total_posts,
+            "comments": total_comments,
+            "keywords": total_keywords,
+        },
+        "last_24h": stats_by_status,
+        "runs": runs,
+    })
+
+
 @router.get("/monitor", response_model=dict)
 async def scrape_monitor(
     limit: int = Query(default=20, ge=1, le=100),
