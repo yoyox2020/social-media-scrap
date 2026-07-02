@@ -1,0 +1,204 @@
+﻿# Cara Kerja Scraping — End-to-End
+
+---
+
+## Siapa yang Memulai Scraping?
+
+Ada **dua cara** scraping bisa dimulai:
+
+| Cara | Trigger | Kapan |
+|---|---|---|
+| **Otomatis** | Celery Beat | Setiap hari jam 12.00 WIB |
+| **Manual** | API `POST /api/v1/youtube/collect` | Kapan saja user trigger |
+
+---
+
+## Alur Otomatis (Celery Beat jam 12.00 WIB)
+
+### Stage 1 — Fetch Trending Google Indonesia
+
+**File:** `app/workers/youtube_worker.py` -> `fetch_trending_youtube_task`
+**Service:** `app/services/youtube/pipeline_service.py` -> `fetch_and_store_trending()`
+
+```
+Celery Beat (jam 12:00 WIB)
+  -> fetch_trending_youtube_task
+  -> pytrends: ambil 10 topik trending Indonesia (geo=ID, period=24h)
+  -> simpan ke tabel: trending_topics
+  -> buat/update baris di tabel: keywords (1 keyword per trending topic)
+  -> queue: collect_youtube_pipeline_task(keyword_id) per keyword baru
+```
+
+**Contoh data trending_topics yang tersimpan:**
+
+| id | rank | title | traffic | geo | period |
+|---|---|---|---|---|---|
+| `23d09931-3a73-4a98-b23b-0a858f6f0e21` | 1 | gta | 200+ | ID | 24h |
+
+---
+
+### Stage 2 — Pipeline Per Keyword
+
+**File:** `app/workers/youtube_worker.py` -> `collect_youtube_pipeline_task`
+
+```
+collect_youtube_pipeline_task(keyword_id)
+  -> ambil Keyword dari tabel keywords
+  -> INSERT ke tabel scrape_runs (status='running')  <- TANDA MULAI
+  -> CollectorService -> YouTubeConnector
+  -> EnsembleData API: GET /youtube/search/keyword?keyword=...&depth=2
+      - Jika HTTP 495 (quota habis) -> fallback ke YouTube Data API v3
+  -> normalize hasil -> INSERT ke tabel posts
+  -> UPDATE scrape_runs (status='success'/'failed', video count, durasi)  <- TANDA SELESAI
+  -> queue: collect_youtube_comments_task(post_id, keyword_id) per video baru
+```
+
+**Cara tahu berhasil atau tidak — cek tabel scrape_runs:**
+
+Contoh baris nyata di DB server:
+
+```
+id:               750fc668-5504-4e6c-8bc0-5d65f9df7023
+keyword_text:     ahok
+status:           success           <- success / failed / fallback
+api_source:       ensembledata      <- ensembledata / youtube_data_api
+videos_fetched:   19
+videos_new:       18
+comments_fetched: 0
+comments_new:     0
+started_at:       2026-07-02 00:12:30 UTC
+duration_seconds: 2.45
+error_message:    (null)
+```
+
+**Nilai status:**
+- `running`  — sedang berjalan sekarang
+- `success`  — selesai normal
+- `fallback` — selesai tapi ada error parsial
+- `failed`   — gagal total
+
+---
+
+### Stage 3 — Komentar Per Video
+
+**File:** `app/workers/youtube_worker.py` -> `collect_youtube_comments_task`
+
+```
+collect_youtube_comments_task(post_id, keyword_id, run_id)
+  -> EnsembleData API: GET /youtube/comments?id=VIDEO_ID&cursor=...
+  -> pagination via cursor sampai habis atau max_pages (5)
+  -> INSERT ke tabel comments
+  -> lexicon sentiment -> INSERT ke tabel lexicon_analyses
+  -> UPDATE scrape_runs.comments_fetched + comments_new
+```
+
+---
+
+## Cara Tahu Apakah Scraping Berhasil Ditandai
+
+### 1. Monitor Web (tanpa login)
+
+```
+http://187.77.125.10:8000/scraping-status
+```
+
+Menampilkan: status worker, riwayat scraping 24 jam, jumlah post/komentar/keyword.
+
+---
+
+### 2. Via API (butuh Bearer token)
+
+```
+GET /api/v1/youtube/monitor
+```
+
+Response:
+```json
+{
+  "data": {
+    "recent_runs": [
+      {
+        "id": "750fc668-5504-4e6c-8bc0-5d65f9df7023",
+        "keyword_text": "ahok",
+        "status": "success",
+        "api_source": "ensembledata",
+        "videos_fetched": 19,
+        "videos_new": 18,
+        "comments_fetched": 0,
+        "comments_new": 0,
+        "duration_seconds": 2.45,
+        "started_at": "2026-07-02T00:12:30Z",
+        "error_message": null
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 3. Langsung ke DB
+
+```sql
+-- Scraping terbaru
+SELECT keyword_text, status, api_source, videos_new, comments_new, error_message, duration_seconds
+FROM scrape_runs ORDER BY started_at DESC LIMIT 10;
+
+-- Total post tersimpan
+SELECT COUNT(*) FROM posts WHERE platform = 'youtube';
+```
+
+---
+
+## Peta Tabel yang Diisi
+
+```
+pytrends (Google Trends)
+        |
+        v
+trending_topics      id, rank, title, traffic, geo, period
+        |
+        v
+keywords             id, keyword, platform, is_active
+        |
+        v
+scrape_runs          id, keyword_id, status, api_source, videos_*, comments_*, duration_seconds
+        |
+        |---> posts        id, external_id, keyword_id, platform, content, url, metadata (JSONB)
+        |          |              metadata: views, likes, channel_id, channel_name, dll
+        |          v
+        |     comments     id, post_id, author, content, metadata
+        |          |
+        |          v
+        |     lexicon_analyses   id, comment_id, sentiment, score
+        |
+        +---> scrape_runs  UPDATE: status=success, videos_new=N, comments_new=N
+```
+
+---
+
+## Alur Manual (via API)
+
+```
+POST /api/v1/youtube/collect
+Body: { "keyword": "...", "keyword_id": "uuid", "max_pages": 2 }
+
+-> langsung queue collect_youtube_pipeline_task(keyword_id)
+-> alur sama mulai Stage 2
+-> TIDAK ikut jadwal jam 12 WIB
+```
+
+---
+
+## Fallback EnsembleData ke YouTube Data API
+
+Jika EnsembleData respons HTTP 495 (quota habis):
+
+```
+Connector deteksi error 495
+  -> gunakan YOUTUBE_DATA_API_KEY dari .env
+  -> panggil YouTubeDataAPIClient.search_videos(keyword, max_results=50)
+  -> scrape_run.api_source = 'youtube_data_api'
+```
+
+Fallback aktif untuk: search_by_keyword, search_by_hashtag, get_video_comments.

@@ -2576,11 +2576,18 @@ async def retry_failed_trackers(
     from sqlalchemy import select, update
     from app.workers.viral_tracking_worker import viral_channel_daily_scrape_task
 
+    # Retry tracker yang: (1) belum punya data sama sekali, ATAU (2) last log-nya error
     result = await db.execute(
         select(ViralChannelTracker.id, ViralChannelTracker.channel_name)
         .where(
             ViralChannelTracker.status == "active",
-            ViralChannelTracker.posts_collected == 0,
+            text("""(
+                posts_collected = 0
+                OR (
+                    jsonb_array_length(COALESCE(scrape_logs, '[]'::jsonb)) > 0
+                    AND (scrape_logs -> (jsonb_array_length(scrape_logs) - 1) ->> 'error') IS NOT NULL
+                )
+            )"""),
         )
     )
     rows = result.all()
