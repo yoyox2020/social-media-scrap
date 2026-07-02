@@ -1,6 +1,7 @@
 """
 Instagram API endpoints.
 
+GET  /instagram/profile — profil + recent posts dari username (Instagram internal API)
 GET  /instagram/posts   — scrape + ambil post dari username (maks 10)
 """
 from __future__ import annotations
@@ -9,7 +10,8 @@ import uuid
 from collections import Counter
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Query
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +21,109 @@ from app.services.auth.dependencies import get_current_user
 from app.shared.utils import build_success_response
 
 router = APIRouter(prefix="/instagram", tags=["instagram"])
+
+_IG_HEADERS = {
+    "User-Agent": "Instagram 219.0.0.12.117 Android (26/8.0.0; 480dpi; 1080x1920; OnePlus; ONEPLUS A3010; OnePlus3T; qcom; id_ID; 314665256)",
+    "x-ig-app-id": "936619743392459",
+    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
+    "Accept": "*/*",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /instagram/profile  (public, no EnsembleData)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/profile", response_model=dict, summary="Profil Instagram dari username (tanpa EnsembleData)")
+async def get_instagram_profile(
+    username: str = Query(..., min_length=1, max_length=100, description="Username Instagram (tanpa @)"),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Ambil profil Instagram berdasarkan username menggunakan Instagram internal API.
+
+    Tidak memerlukan EnsembleData — langsung ke Instagram.
+
+    **Response:**
+    - `profile` : info lengkap (followers, bio, verified, post_count, dll)
+    - `recent_posts` : list post terbaru (thumbnail, likes, comments)
+    """
+    username = username.strip().lstrip("@").lower()
+
+    try:
+        async with httpx.AsyncClient(headers=_IG_HEADERS, timeout=20, follow_redirects=True) as client:
+            r = await client.get(
+                "https://i.instagram.com/api/v1/users/web_profile_info/",
+                params={"username": username},
+            )
+            if r.status_code == 404:
+                raise HTTPException(status_code=404, detail=f"Username @{username} tidak ditemukan")
+            if r.status_code == 429:
+                raise HTTPException(status_code=429, detail="Instagram rate limit — coba lagi sebentar")
+            if r.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Instagram error: HTTP {r.status_code}")
+            data = r.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Gagal menghubungi Instagram: {exc}")
+
+    user = data.get("data", {}).get("user") or {}
+    if not user:
+        raise HTTPException(status_code=404, detail=f"Username @{username} tidak ditemukan atau akun private")
+
+    # ── Profile info ──────────────────────────────────────────────────────────
+    edge_media = user.get("edge_owner_to_timeline_media") or {}
+    timeline_edges = edge_media.get("edges", [])
+
+    profile = {
+        "user_id":        user.get("id", ""),
+        "username":       user.get("username", username),
+        "full_name":      user.get("full_name", ""),
+        "biography":      user.get("biography", ""),
+        "followers":      (user.get("edge_followed_by") or {}).get("count", 0),
+        "following":      (user.get("edge_follow") or {}).get("count", 0),
+        "post_count":     edge_media.get("count", 0),
+        "profile_pic_url": user.get("profile_pic_url_hd") or user.get("profile_pic_url", ""),
+        "is_verified":    user.get("is_verified", False),
+        "is_private":     user.get("is_private", False),
+        "is_business":    user.get("is_business_account", False),
+        "business_category": user.get("business_category_name", ""),
+        "external_url":   user.get("external_url", ""),
+        "instagram_url":  f"https://www.instagram.com/{username}/",
+    }
+
+    # ── Recent posts ──────────────────────────────────────────────────────────
+    recent_posts = []
+    for edge in timeline_edges[:12]:
+        node = edge.get("node", {})
+        shortcode = node.get("shortcode", "")
+        thumb = node.get("thumbnail_src") or node.get("display_url", "")
+        cap_edges = (node.get("edge_media_to_caption") or {}).get("edges", [])
+        caption = cap_edges[0]["node"]["text"] if cap_edges else ""
+        likes = (node.get("edge_liked_by") or node.get("edge_media_preview_like") or {}).get("count", 0)
+        cmts = (node.get("edge_media_to_comment") or {}).get("count", 0)
+
+        recent_posts.append({
+            "shortcode":     shortcode,
+            "url":           f"https://www.instagram.com/p/{shortcode}/" if shortcode else "",
+            "thumbnail":     thumb,
+            "caption":       caption[:200],
+            "likes":         likes,
+            "comment_count": cmts,
+            "media_type":    node.get("__typename", ""),
+            "is_video":      node.get("is_video", False),
+            "views":         node.get("video_view_count") if node.get("is_video") else None,
+            "taken_at":      node.get("taken_at_timestamp"),
+        })
+
+    return build_success_response({
+        "platform": "instagram",
+        "username":  username,
+        "profile":   profile,
+        "recent_posts": recent_posts,
+        "total_shown": len(recent_posts),
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
