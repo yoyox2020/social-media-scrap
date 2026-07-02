@@ -18,15 +18,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.domain.users.models import User
 from app.infrastructure.database.connection import get_db
 from app.services.auth.dependencies import get_current_user
+from app.shared.config import settings
 from app.shared.utils import build_success_response
 
 router = APIRouter(prefix="/instagram", tags=["instagram"])
 
 _IG_HEADERS = {
-    "User-Agent": "Instagram 219.0.0.12.117 Android (26/8.0.0; 480dpi; 1080x1920; OnePlus; ONEPLUS A3010; OnePlus3T; qcom; id_ID; 314665256)",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "x-ig-app-id": "936619743392459",
+    "X-Requested-With": "XMLHttpRequest",
     "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
     "Accept": "*/*",
+    "Referer": "https://www.instagram.com/",
+    "Origin": "https://www.instagram.com",
 }
 
 
@@ -50,16 +54,33 @@ async def get_instagram_profile(
     """
     username = username.strip().lstrip("@").lower()
 
+    # Bangun cookies dari settings (sessionid wajib agar tidak di-block Instagram)
+    cookies: dict = {}
+    if settings.instagram_session_id:
+        cookies["sessionid"] = settings.instagram_session_id
+    if settings.instagram_csrf_token:
+        cookies["csrftoken"] = settings.instagram_csrf_token
+
+    if not cookies.get("sessionid"):
+        raise HTTPException(
+            status_code=503,
+            detail="Instagram session belum dikonfigurasi. Set INSTAGRAM_SESSION_ID di .env server.",
+        )
+
     try:
-        async with httpx.AsyncClient(headers=_IG_HEADERS, timeout=20, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            headers=_IG_HEADERS, cookies=cookies, timeout=20, follow_redirects=True
+        ) as client:
             r = await client.get(
-                "https://i.instagram.com/api/v1/users/web_profile_info/",
+                "https://www.instagram.com/api/v1/users/web_profile_info/",
                 params={"username": username},
             )
             if r.status_code == 404:
                 raise HTTPException(status_code=404, detail=f"Username @{username} tidak ditemukan")
             if r.status_code == 429:
                 raise HTTPException(status_code=429, detail="Instagram rate limit — coba lagi sebentar")
+            if r.status_code == 401:
+                raise HTTPException(status_code=503, detail="Instagram session expired — perbarui INSTAGRAM_SESSION_ID")
             if r.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"Instagram error: HTTP {r.status_code}")
             data = r.json()

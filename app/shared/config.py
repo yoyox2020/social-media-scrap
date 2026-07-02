@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     # Facebook / Meta Graph API
     facebook_access_token: str = ""
 
+    # Instagram session (dari browser cookies — untuk scraping tanpa EnsembleData)
+    instagram_session_id: str = ""
+    instagram_csrf_token: str = ""
+
     # Celery
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend: str = "redis://localhost:6379/1"
