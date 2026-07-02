@@ -34,7 +34,7 @@ class YouTubeConnector:
     ) -> dict[str, Any]:
         """
         Cari video YouTube berdasarkan keyword.
-        Jika EnsembleData quota habis (HTTP 495), otomatis fallback ke YouTube Data API v3.
+        Jika EnsembleData tidak tersedia (495 quota / 493 expired), fallback ke YouTube Data API v3.
         """
         from app.shared.exceptions import ExternalAPIError
 
@@ -48,9 +48,10 @@ class YouTubeConnector:
             logger.info("[YouTube] search_by_keyword: %d item diterima dari EnsembleData", len(posts))
             return result
         except ExternalAPIError as exc:
-            if "495" not in str(exc):
+            exc_str = str(exc)
+            if "495" not in exc_str and "493" not in exc_str:
                 raise
-            logger.warning("[YouTube] EnsembleData quota habis (495), fallback ke YouTube Data API v3")
+            logger.warning("[YouTube] EnsembleData tidak tersedia (%s), fallback ke YouTube Data API v3", exc_str[:60])
             from app.shared.config import settings
             from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
 
