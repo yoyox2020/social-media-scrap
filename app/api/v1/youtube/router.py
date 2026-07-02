@@ -2566,13 +2566,12 @@ async def trigger_viral_detect(
 
 @router.post("/viral-tracking/retry-failed", response_model=dict, status_code=202, summary="Retry semua tracker yang gagal atau belum scrape")
 async def retry_failed_trackers(
-    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
+    Public endpoint — tidak perlu auth karena monitor juga public.
     Reset last_scraped_date → null untuk semua tracker aktif yang posts_collected=0,
     lalu queue viral_channel_daily_scrape_task sekarang juga (tidak tunggu jadwal 03:00).
-    Berguna setelah perbaikan bug / API key pulih.
     """
     from sqlalchemy import select, update
     from app.workers.viral_tracking_worker import viral_channel_daily_scrape_task

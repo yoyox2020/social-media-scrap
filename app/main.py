@@ -420,7 +420,6 @@ async function retryFailed() {
     const base = window.location.origin;
     const r = await fetch(base + '/api/v1/youtube/viral-tracking/retry-failed', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (localStorage.getItem('token') || '') },
     });
     const json = await r.json();
     if (r.ok) {
@@ -434,7 +433,7 @@ async function retryFailed() {
     }
   } catch(e) {
     msg.style.color = '#f87171';
-    msg.textContent = 'Gagal. Cek apakah Bearer token tersedia.';
+    msg.textContent = 'Gagal terhubung ke server.';
   }
   setTimeout(() => { btn.disabled = false; msg.textContent = ''; msg.style.color = '#60a5fa'; }, 8000);
 }
