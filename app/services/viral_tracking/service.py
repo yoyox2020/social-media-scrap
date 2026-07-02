@@ -132,59 +132,74 @@ async def run_daily_channel_scrape(db: AsyncSession, tracker_id: uuid.UUID) -> i
     post_repo = PostRepository(db)
     normalizer = YouTubeNormalizer()
     new_count = 0
+    items: list = []  # pastikan selalu terdefinisi untuk after-try code
 
     try:
         async with EnsembleDataClient() as client:
             connector = YouTubeConnector(client)
             raw = await connector.get_channel_videos(tracker.channel_id, cursor="")
             items = connector.extract_posts(raw)
-
             items = items[:POSTS_PER_DAY]
-            if not items:
-                return 0
 
-            posts = normalizer.normalize(items, tracker.keyword_id or uuid.UUID(int=0))
-            ext_ids = [p.external_id for p in posts]
-            existing = await post_repo.get_existing_external_ids(ext_ids, "youtube")
-            new_posts = [p for p in posts if p.external_id not in existing]
+            # Jika channel tidak punya video → tetap lanjut ke after-try
+            # agar last_scraped_date di-set dan scrape_log ditulis (tidak loop selamanya)
+            if items:
+                posts = normalizer.normalize(items, tracker.keyword_id or uuid.UUID(int=0))
+                ext_ids = [p.external_id for p in posts]
+                existing = await post_repo.get_existing_external_ids(ext_ids, "youtube")
+                new_posts = [p for p in posts if p.external_id not in existing]
 
-            for post in new_posts:
-                meta = post.metadata_ or {}
-                meta["tracker_id"] = str(tracker_id)
-                meta["source"] = "viral_tracking"
-                post.metadata_ = meta
-
-            if new_posts:
-                new_count = await post_repo.bulk_create(new_posts)
-
-            # Collect komentar untuk setiap post baru agar check_flagged_commenters
-            # punya data komentar yang bisa dianalisis
-            if new_posts:
-                from app.services.youtube.pipeline_service import collect_comments_for_video
                 for post in new_posts:
-                    if post.id and tracker.keyword_id:
-                        try:
-                            await collect_comments_for_video(
-                                db=db,
-                                post_id=post.id,
-                                keyword_id=tracker.keyword_id,
-                                max_comments=50,
-                                max_pages=1,
-                            )
-                        except Exception:
-                            pass  # lanjut ke post berikutnya
+                    meta = post.metadata_ or {}
+                    meta["tracker_id"] = str(tracker_id)
+                    meta["source"] = "viral_tracking"
+                    post.metadata_ = meta
+
+                if new_posts:
+                    from app.services.processing.cleaner import default_cleaner
+                    for post in new_posts:
+                        if post.content:
+                            post.cleaned_content = default_cleaner.clean(post.content)
+                            post.is_processed = True
+                    new_count = await post_repo.bulk_create(new_posts)
+                    if new_count > 0:
+                        from app.workers.ai_worker import analyze_post_task
+                        for post in new_posts:
+                            if post.id:
+                                analyze_post_task.delay(
+                                    str(post.id),
+                                    run_sentiment=False,
+                                    run_ner=False,
+                                    run_embedding=True,
+                                )
+
+                if new_posts:
+                    from app.services.youtube.pipeline_service import collect_comments_for_video
+                    for post in new_posts:
+                        if post.id and tracker.keyword_id:
+                            try:
+                                await collect_comments_for_video(
+                                    db=db,
+                                    post_id=post.id,
+                                    keyword_id=tracker.keyword_id,
+                                    max_comments=50,
+                                    max_pages=1,
+                                )
+                            except Exception:
+                                pass  # lanjut ke post berikutnya
 
     except Exception as exc:
-        # Tetap catat log meski gagal
         _append_scrape_log(tracker, today, posts_new=0, posts_skipped=0, error=str(exc))
         tracker.last_scraped_date = today
         await db.commit()
         return 0
 
+    # Hitung skipped = video ditemukan tapi sudah ada di DB (dedup)
+    # posts_collected += new + skipped → mencerminkan total video channel yang kita punya
     skipped = len(items) - new_count if items else 0
     _append_scrape_log(tracker, today, posts_new=new_count, posts_skipped=skipped)
     tracker.last_scraped_date = today
-    tracker.posts_collected = (tracker.posts_collected or 0) + new_count
+    tracker.posts_collected = (tracker.posts_collected or 0) + new_count + skipped
     await db.commit()
     return new_count
 

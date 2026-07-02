@@ -74,6 +74,9 @@ class PostRepository:
                 "raw_data": p.raw_data,
                 "published_at": p.published_at,
                 "collected_at": p.collected_at,
+                "cleaned_content": p.cleaned_content,
+                "language": p.language,
+                "is_processed": p.is_processed,
             }
             for p in posts
         ]
