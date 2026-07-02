@@ -36,6 +36,10 @@ def analyze_post_task(
         dict AIAnalysisResult
     """
     try:
+        # Dispose pool sebelum asyncio.run() baru — asyncpg connections tidak boleh
+        # dibawa dari event loop sebelumnya ke event loop baru dalam Celery prefork.
+        from app.infrastructure.database.connection import engine
+        engine.dispose()
         return asyncio.run(
             _analyze_post(post_id, run_sentiment, run_ner, run_embedding, force)
         )
@@ -66,6 +70,8 @@ def analyze_keyword_task(
         run_sentiment/ner/embedding: toggle per komponen
     """
     try:
+        from app.infrastructure.database.connection import engine
+        engine.dispose()
         return asyncio.run(
             _analyze_keyword(
                 keyword_id, force_reanalyze, run_sentiment, run_ner, run_embedding
