@@ -673,62 +673,95 @@ async def viral_videos(
 
     rows = (await db.execute(sql, params)).mappings().all()
 
-    items = [
-        {
-            "rank": i + 1,
-            "video_id": r["external_id"],
-            "url": r["url"] or f"https://youtube.com/watch?v={r['external_id']}",
-            "title": r["content"],
-            "channel": r["author"],
-            "view_count": r["view_count"] or 0,
-            "thumbnail_url": (r["metadata"] or {}).get("thumbnail", ""),
-            "duration": (r["metadata"] or {}).get("duration", ""),
-            "published_at": r["published_at"].isoformat() if r["published_at"] else None,
-            "keyword": r["keyword"],
-        }
-        for i, r in enumerate(rows)
-    ]
+    from collections import Counter as _Counter
 
-    comments = []
-    if limit_comments > 0:
-        c_filters = ["p.platform = 'youtube'"]
-        c_params: dict = {"lc": limit_comments}
-        if keyword_id:
-            c_filters.append("p.keyword_id = :keyword_id_c")
-            c_params["keyword_id_c"] = str(keyword_id)
-        elif q:
-            c_filters.append("(k.keyword ILIKE :q_like_c OR p.author ILIKE :q_like_c)")
-            c_params["q_like_c"] = f"%{q.strip()}%"
-        c_where = " AND ".join(c_filters)
-        comment_rows = (await db.execute(text(f"""
-            SELECT c.id, c.content, c.author,
-                   la.label AS sentiment, la.score,
-                   p.url AS video_url, p.external_id
+    # Batch-fetch semua komentar sekaligus, dikelompokkan by post_id
+    post_ids = [str(r["id"]) for r in rows]
+    comments_by_post: dict[str, list] = {pid: [] for pid in post_ids}
+    all_labels: list[str] = []
+
+    if post_ids and limit_comments > 0:
+        ids_sql = ", ".join(f"'{pid}'" for pid in post_ids)
+        cmt_rows = (await db.execute(text(f"""
+            SELECT c.id, c.content, c.author, c.post_id::text AS post_id,
+                   la.label AS sentiment, la.score
             FROM comments c
-            JOIN posts p ON c.post_id = p.id
             LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
-            LEFT JOIN keywords k ON p.keyword_id = k.id
-            WHERE {c_where}
+            WHERE c.post_id::text IN ({ids_sql})
             ORDER BY c.created_at DESC
-            LIMIT :lc
-        """), c_params)).mappings().all()
-        comments = [
-            {
-                "id": str(r["id"]),
-                "content": r["content"],
-                "author": r["author"],
-                "sentiment": r["sentiment"],
-                "score": round(float(r["score"]), 3) if r["score"] is not None else None,
-                "video_url": r["video_url"] or f"https://www.youtube.com/watch?v={r['external_id']}",
-            }
-            for r in comment_rows
-        ]
+        """))).mappings().all()
+
+        for r in cmt_rows:
+            pid = r["post_id"]
+            if r["sentiment"]:
+                all_labels.append(r["sentiment"])
+            bucket = comments_by_post.setdefault(pid, [])
+            if len(bucket) < limit_comments:
+                bucket.append({
+                    "id":        str(r["id"]),
+                    "content":   r["content"],
+                    "author":    r["author"],
+                    "sentiment": r["sentiment"],
+                    "score":     round(float(r["score"]), 3) if r["score"] is not None else None,
+                })
+
+    # Build items dengan komentar nested per video + sentiment_summary per video
+    items = []
+    for i, r in enumerate(rows):
+        pid      = str(r["id"])
+        vid_cmts = comments_by_post.get(pid, [])
+        vid_lbls = [c["sentiment"] for c in vid_cmts if c["sentiment"]]
+        sc       = _Counter(vid_lbls)
+        total_sc = sum(sc.values())
+        items.append({
+            "rank":         i + 1,
+            "video_id":     r["external_id"],
+            "url":          r["url"] or f"https://youtube.com/watch?v={r['external_id']}",
+            "title":        r["content"],
+            "channel":      r["author"],
+            "view_count":   r["view_count"] or 0,
+            "thumbnail_url": (r["metadata"] or {}).get("thumbnail", ""),
+            "duration":     (r["metadata"] or {}).get("duration", ""),
+            "published_at": r["published_at"].isoformat() if r["published_at"] else None,
+            "keyword":      r["keyword"],
+            "comment_count": len(vid_cmts),
+            "sentiment_summary": {
+                lbl: {
+                    "count":      sc.get(lbl, 0),
+                    "percentage": round(sc.get(lbl, 0) / total_sc * 100, 1) if total_sc else 0.0,
+                }
+                for lbl in ["positif", "negatif", "netral"]
+            },
+            "comments": vid_cmts,
+        })
+
+    # Distribusi sentimen global
+    counter        = _Counter(all_labels)
+    total_analyzed = sum(counter.values())
+    total_cmts     = sum(len(v) for v in comments_by_post.values())
+    sentiment_dist = {
+        lbl: {
+            "count":      counter.get(lbl, 0),
+            "percentage": round(counter.get(lbl, 0) / total_analyzed * 100, 1) if total_analyzed else 0.0,
+        }
+        for lbl in ["positif", "negatif", "netral"]
+    }
 
     return build_success_response({
-        "total": len(items),
-        "note": "Diurutkan berdasarkan view count tertinggi dari semua data di DB",
+        "total":  len(items),
+        "note":   "Diurutkan berdasarkan view count tertinggi dari semua data di DB",
         "filter": {"keyword_id": str(keyword_id) if keyword_id else None, "q": q},
-        "comments": comments,
+        "stats": {
+            "total_videos":   len(items),
+            "total_comments": total_cmts,
+            "total_analyzed": total_analyzed,
+            "coverage_pct":   round(total_analyzed / total_cmts * 100, 1) if total_cmts else 0.0,
+        },
+        "sentiment": {
+            **sentiment_dist,
+            "dominant":       counter.most_common(1)[0][0] if counter else "netral",
+            "total_analyzed": total_analyzed,
+        },
         "items": items,
     })
 
@@ -802,8 +835,14 @@ async def viral_videos_post(
     """)
     rows = (await db.execute(sql, params)).mappings().all()
 
-    items = [
-        {
+    from collections import Counter as _Counter
+
+    # Build items sementara, simpan _pid untuk grouping komentar
+    post_ids_raw = [str(r["id"]) for r in rows]
+    items_raw = []
+    for i, r in enumerate(rows):
+        items_raw.append({
+            "_pid":          str(r["id"]),
             "rank":          i + 1 + body.offset,
             "video_id":      r["external_id"],
             "url":           r["url"] or f"https://youtube.com/watch?v={r['external_id']}",
@@ -816,51 +855,55 @@ async def viral_videos_post(
             "collected_at":  r["collected_at"].isoformat() if r["collected_at"] else None,
             "keyword":       r["keyword"],
             "keyword_id":    str(r["keyword_id"]) if r["keyword_id"] else None,
-        }
-        for i, r in enumerate(rows)
-    ]
+        })
 
-    # ── Komentar ──────────────────────────────────────────────────────────────
-    comments = []
-    if body.limit_comments > 0 and total > 0:
-        c_filters = ["p.platform = 'youtube'"]
-        c_params: dict = {"lc": body.limit_comments}
-        if body.keyword_id:
-            c_filters.append("p.keyword_id = :keyword_id_c")
-            c_params["keyword_id_c"] = str(body.keyword_id)
-        elif body.q:
-            c_filters.append("(k.keyword ILIKE :q_like_c OR p.author ILIKE :q_like_c)")
-            c_params["q_like_c"] = f"%{body.q.strip()}%"
-        if body.date_from:
-            c_filters.append("p.published_at >= :date_from_c")
-            c_params["date_from_c"] = datetime(body.date_from.year, body.date_from.month, body.date_from.day, tzinfo=timezone.utc)
-        if body.date_to:
-            c_filters.append("p.published_at <= :date_to_c")
-            c_params["date_to_c"] = datetime(body.date_to.year, body.date_to.month, body.date_to.day, 23, 59, 59, tzinfo=timezone.utc)
-        c_where = " AND ".join(c_filters)
-        comment_rows = (await db.execute(text(f"""
-            SELECT c.id, c.content, c.author,
-                   la.label AS sentiment, la.score,
-                   p.url AS video_url, p.external_id
+    # ── Komentar nested per video (batch query → group by post_id) ────────────
+    comments_by_post: dict[str, list] = {pid: [] for pid in post_ids_raw}
+    all_labels: list[str] = []
+
+    if post_ids_raw and body.limit_comments > 0 and total > 0:
+        ids_sql = ", ".join(f"'{pid}'" for pid in post_ids_raw)
+        cmt_rows = (await db.execute(text(f"""
+            SELECT c.id, c.content, c.author, c.post_id::text AS post_id,
+                   la.label AS sentiment, la.score
             FROM comments c
-            JOIN posts p ON c.post_id = p.id
             LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
-            LEFT JOIN keywords k ON p.keyword_id = k.id
-            WHERE {c_where}
+            WHERE c.post_id::text IN ({ids_sql})
             ORDER BY c.created_at DESC
-            LIMIT :lc
-        """), c_params)).mappings().all()
-        comments = [
-            {
-                "id": str(r["id"]),
-                "content": r["content"],
-                "author": r["author"],
-                "sentiment": r["sentiment"],
-                "score": round(float(r["score"]), 3) if r["score"] is not None else None,
-                "video_url": r["video_url"] or f"https://www.youtube.com/watch?v={r['external_id']}",
+        """))).mappings().all()
+
+        for r in cmt_rows:
+            pid = r["post_id"]
+            if r["sentiment"]:
+                all_labels.append(r["sentiment"])
+            bucket = comments_by_post.setdefault(pid, [])
+            if len(bucket) < body.limit_comments:
+                bucket.append({
+                    "id":        str(r["id"]),
+                    "content":   r["content"],
+                    "author":    r["author"],
+                    "sentiment": r["sentiment"],
+                    "score":     round(float(r["score"]), 3) if r["score"] is not None else None,
+                })
+
+    # Inject komentar nested + sentiment_summary ke setiap item
+    items = []
+    for item in items_raw:
+        pid      = item.pop("_pid")
+        vid_cmts = comments_by_post.get(pid, [])
+        vid_lbls = [c["sentiment"] for c in vid_cmts if c["sentiment"]]
+        sc       = _Counter(vid_lbls)
+        total_sc = sum(sc.values())
+        item["comment_count"] = len(vid_cmts)
+        item["sentiment_summary"] = {
+            lbl: {
+                "count":      sc.get(lbl, 0),
+                "percentage": round(sc.get(lbl, 0) / total_sc * 100, 1) if total_sc else 0.0,
             }
-            for r in comment_rows
-        ]
+            for lbl in ["positif", "negatif", "netral"]
+        }
+        item["comments"] = vid_cmts
+        items.append(item)
 
     # ── Fallback ke YouTube Data API v3 jika DB kosong ────────────────────────
     if total == 0 and body.auto_search:
@@ -999,6 +1042,18 @@ async def viral_videos_post(
                     "items":  yt_items,
                 })
 
+    # Distribusi sentimen global
+    counter        = _Counter(all_labels)
+    total_analyzed = sum(counter.values())
+    total_cmts     = sum(len(v) for v in comments_by_post.values())
+    sentiment_dist = {
+        lbl: {
+            "count":      counter.get(lbl, 0),
+            "percentage": round(counter.get(lbl, 0) / total_analyzed * 100, 1) if total_analyzed else 0.0,
+        }
+        for lbl in ["positif", "negatif", "netral"]
+    }
+
     return build_success_response({
         "sort_by": body.sort_by,
         "filter": {
@@ -1010,7 +1065,17 @@ async def viral_videos_post(
         "total":  total,
         "offset": body.offset,
         "limit":  body.limit,
-        "comments": comments,
+        "stats": {
+            "total_videos":   len(items),
+            "total_comments": total_cmts,
+            "total_analyzed": total_analyzed,
+            "coverage_pct":   round(total_analyzed / total_cmts * 100, 1) if total_cmts else 0.0,
+        },
+        "sentiment": {
+            **sentiment_dist,
+            "dominant":       counter.most_common(1)[0][0] if counter else "netral",
+            "total_analyzed": total_analyzed,
+        },
         "items":  items,
     })
 
