@@ -1936,6 +1936,46 @@ async def scrape_monitor_public(
     total_comments: int = await db.scalar(text("SELECT COUNT(*) FROM comments")) or 0
     total_keywords: int = await db.scalar(text("SELECT COUNT(*) FROM keywords")) or 0
 
+    # ── Viral tracking stats ──────────────────────────────────────────────────
+    vt_stats = (await db.execute(text("""
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'active')    AS active_trackers,
+            COUNT(*) FILTER (WHERE status = 'completed') AS completed_trackers,
+            COALESCE(SUM(posts_collected), 0)            AS total_posts_collected
+        FROM viral_channel_trackers
+    """))).mappings().first()
+
+    flagged_count: int = await db.scalar(text("SELECT COUNT(*) FROM flagged_accounts")) or 0
+
+    posts_via_tracker: int = await db.scalar(
+        text("SELECT COUNT(*) FROM posts WHERE metadata->>'source' = 'viral_tracking'")
+    ) or 0
+
+    # Tracker yang baru-baru ini scraping (10 terakhir)
+    vt_recent_rows = (await db.execute(text("""
+        SELECT id, channel_name, tracker_type, status, posts_collected,
+               last_scraped_date,
+               jsonb_array_length(COALESCE(scrape_logs, '[]'::jsonb)) AS log_count,
+               scrape_logs -> (jsonb_array_length(COALESCE(scrape_logs, '[]'::jsonb)) - 1) AS last_log
+        FROM viral_channel_trackers
+        WHERE last_scraped_date IS NOT NULL
+        ORDER BY last_scraped_date DESC, updated_at DESC
+        LIMIT 10
+    """))).mappings().all()
+
+    viral_recent = []
+    for vt in vt_recent_rows:
+        last_log = vt["last_log"] or {}
+        viral_recent.append({
+            "tracker_id": str(vt["id"]),
+            "channel_name": vt["channel_name"],
+            "tracker_type": vt["tracker_type"],
+            "status": vt["status"],
+            "posts_collected": vt["posts_collected"],
+            "last_scraped_date": vt["last_scraped_date"].isoformat() if vt["last_scraped_date"] else None,
+            "last_log": last_log,
+        })
+
     runs = []
     for r in rows:
         runs.append({
@@ -2007,6 +2047,14 @@ async def scrape_monitor_public(
         "last_24h": stats_by_status,
         "workers": workers,
         "runs": runs,
+        "viral_tracking": {
+            "active_trackers": int(vt_stats["active_trackers"] or 0),
+            "completed_trackers": int(vt_stats["completed_trackers"] or 0),
+            "total_posts_collected": int(vt_stats["total_posts_collected"] or 0),
+            "posts_in_db": posts_via_tracker,
+            "flagged_accounts": flagged_count,
+            "recent_activity": viral_recent,
+        },
     })
 
 

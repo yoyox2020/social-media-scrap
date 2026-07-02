@@ -270,6 +270,15 @@ async def scraping_status_page():
   .task-id { color: #475569; font-size: 0.68rem; }
   .no-tasks { font-size: 0.75rem; color: #475569; font-style: italic; }
   .no-workers { color: #475569; font-size: 0.82rem; font-style: italic; padding: 12px 0; }
+  .vt-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .vt-card { background: #1e293b; border-radius: 8px; padding: 14px; border-left: 3px solid #818cf8; }
+  .vt-card .label { font-size: 0.72rem; color: #64748b; text-transform: uppercase; margin-bottom: 4px; }
+  .vt-card .value { font-size: 1.5rem; font-weight: 700; color: #818cf8; }
+  .vt-card .sub { font-size: 0.72rem; color: #64748b; margin-top: 2px; }
+  .pill-viral    { background: #2e1065; color: #a78bfa; }
+  .pill-flagged  { background: #450a0a; color: #fca5a5; }
+  .pill-active   { background: #14532d; color: #4ade80; }
+  .pill-completed { background: #1e293b; color: #64748b; }
 </style>
 </head>
 <body>
@@ -289,7 +298,28 @@ async def scraping_status_page():
 <div class="section-title">Celery Workers</div>
 <div class="worker-grid" id="workers-grid"><div class="no-workers">Memuat...</div></div>
 
-<div class="section-title">Riwayat Scraping (50 terbaru)</div>
+<div class="section-title">Viral Tracking</div>
+<div class="vt-grid">
+  <div class="vt-card"><div class="label">Tracker Aktif</div><div class="value" id="vt-active">-</div><div class="sub">channel dipantau</div></div>
+  <div class="vt-card"><div class="label">Tracker Selesai</div><div class="value" id="vt-completed">-</div><div class="sub">7 hari berakhir</div></div>
+  <div class="vt-card"><div class="label">Post Terkumpul</div><div class="value" id="vt-posts">-</div><div class="sub">via tracking</div></div>
+  <div class="vt-card"><div class="label">Akun Diflag</div><div class="value" id="vt-flagged">-</div><div class="sub">komentar &gt;10x</div></div>
+</div>
+<table>
+  <thead>
+    <tr>
+      <th>Channel</th>
+      <th>Tipe</th>
+      <th>Status Tracker</th>
+      <th>Post Terkumpul</th>
+      <th>Terakhir Scrape</th>
+      <th>Log Terakhir</th>
+    </tr>
+  </thead>
+  <tbody id="vt-table"></tbody>
+</table>
+
+<div class="section-title" style="margin-top:24px">Riwayat Scraping Keyword (50 terbaru)</div>
 <table>
   <thead>
     <tr>
@@ -384,6 +414,43 @@ async function load() {
 
     renderWorkers(d.workers);
 
+    // Viral tracking section
+    const vt = d.viral_tracking || {};
+    document.getElementById('vt-active').textContent    = vt.active_trackers ?? '-';
+    document.getElementById('vt-completed').textContent = vt.completed_trackers ?? '-';
+    document.getElementById('vt-posts').textContent     = vt.posts_in_db ?? '-';
+    document.getElementById('vt-flagged').textContent   = vt.flagged_accounts ?? '-';
+
+    const vtTbody = document.getElementById('vt-table');
+    const vtRows = vt.recent_activity || [];
+    if (vtRows.length === 0) {
+      vtTbody.innerHTML = '<tr><td colspan="6" style="color:#475569;font-style:italic;padding:12px">Belum ada aktivitas scraping tracker</td></tr>';
+    } else {
+      vtTbody.innerHTML = vtRows.map(r => {
+        const ll = r.last_log || {};
+        const logText = ll.error
+          ? `<span class="red">Error: ${ll.error.substring(0,40)}...</span>`
+          : ll.posts_new !== undefined
+            ? `<span class="green">+${ll.posts_new} post</span> (skip: ${ll.posts_skipped ?? 0})`
+            : '-';
+        const typePill = r.tracker_type === 'viral'
+          ? '<span class="pill pill-viral">viral</span>'
+          : '<span class="pill pill-flagged">flagged</span>';
+        const statusPillVt = r.status === 'active'
+          ? '<span class="pill pill-active">active</span>'
+          : '<span class="pill pill-completed">completed</span>';
+        return `<tr>
+          <td><b>${r.channel_name || '-'}</b><br><span style="color:#475569;font-size:.7rem">${r.tracker_id.substring(0,8)}...</span></td>
+          <td>${typePill}</td>
+          <td>${statusPillVt}</td>
+          <td class="${r.posts_collected > 0 ? 'green' : ''}">${r.posts_collected ?? 0}</td>
+          <td style="color:#94a3b8;font-size:.75rem">${r.last_scraped_date || '-'}</td>
+          <td style="font-size:.75rem">${logText}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    // Keyword scraping runs
     const tbody = document.getElementById('runs-table');
     tbody.innerHTML = d.runs.map(r => `<tr>
       <td><b>${r.keyword || '-'}</b></td>
