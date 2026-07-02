@@ -154,7 +154,7 @@ async def get_instagram_profile(
 @router.get("/posts", response_model=dict, summary="Scrape + ambil post Instagram dari username")
 async def get_instagram_posts(
     username: str = Query(..., min_length=1, max_length=100, description="Username Instagram (tanpa @)"),
-    max_comments: int = Query(default=20, ge=0, le=50, description="Jumlah komentar per post (maks 50)"),
+    max_comments: int = Query(default=5, ge=0, le=5, description="Jumlah komentar terpopuler per post (maks 5)"),
     force_refresh: bool = Query(default=False, description="Paksa scrape ulang (tetap dibatasi 1x per hari)"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
