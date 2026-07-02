@@ -59,7 +59,7 @@ class YouTubeConnector:
                 raise  # Tidak ada fallback key, teruskan error asli
 
             yt_client = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
-            return await yt_client.search_videos(keyword, max_results=5)
+            return await yt_client.search_videos(keyword, max_results=50)
 
     async def search_by_hashtag(
         self,
@@ -69,16 +69,31 @@ class YouTubeConnector:
     ) -> dict[str, Any]:
         """
         Cari video berdasarkan hashtag.
+        Jika EnsembleData quota habis (HTTP 495), fallback ke keyword search via YouTube Data API v3.
 
         Args:
             hashtag:     Nama hashtag (tanpa #)
             depth:       Jumlah halaman
             only_shorts: Hanya ambil Shorts
         """
-        return await self.client.get(
-            YouTubeEndpoints.HASHTAG_SEARCH.path,
-            params={"name": hashtag, "depth": min(depth, MAX_DEPTH), "only_shorts": only_shorts},
-        )
+        from app.shared.exceptions import ExternalAPIError
+
+        try:
+            return await self.client.get(
+                YouTubeEndpoints.HASHTAG_SEARCH.path,
+                params={"name": hashtag, "depth": min(depth, MAX_DEPTH), "only_shorts": only_shorts},
+            )
+        except ExternalAPIError as exc:
+            if "495" not in str(exc):
+                raise
+            logger.warning("[YouTube] EnsembleData quota habis (495) untuk hashtag=%r, fallback ke YouTube Data API v3", hashtag)
+            from app.shared.config import settings
+            from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
+
+            if not settings.youtube_data_api_key:
+                raise
+            yt_client = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
+            return await yt_client.search_videos(f"#{hashtag}", max_results=50)
 
     async def get_featured_categories(self, keyword: str) -> dict[str, Any]:
         """Ambil kategori unggulan berdasarkan keyword."""

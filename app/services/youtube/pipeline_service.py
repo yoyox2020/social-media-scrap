@@ -179,10 +179,12 @@ async def collect_comments_for_video(
         async with EnsembleDataClient() as client:
             connector = YouTubeConnector(client)
             cursor: str = ""
+            last_source: str | None = None
             all_raw_comments: list[dict] = []
 
             for _page in range(max_pages):
                 raw = await connector.get_video_comments(video_id, cursor=cursor)
+                current_source = raw.get("_source")  # None=EnsembleData, "youtube_data_api"=fallback
                 page_comments = connector.extract_comments(raw)
 
                 if not page_comments:
@@ -195,7 +197,15 @@ async def collect_comments_for_video(
                 next_cursor = connector.extract_cursor(raw)
                 if not next_cursor:
                     break
+
+                # Jika sumber berubah di tengah pagination (EnsembleData → YouTube Data API),
+                # cursor lama tidak kompatibel — hentikan pagination agar tidak kirim
+                # EnsembleData cursor ke YouTube Data API atau sebaliknya.
+                if last_source is not None and current_source != last_source:
+                    break
+
                 cursor = next_cursor
+                last_source = current_source
 
                 # Berhenti jika sudah melebihi max_comments
                 if result.comments_fetched >= max_comments:
