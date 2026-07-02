@@ -154,18 +154,18 @@ async def get_instagram_profile(
 @router.get("/posts", response_model=dict, summary="Scrape + ambil post Instagram dari username")
 async def get_instagram_posts(
     username: str = Query(..., min_length=1, max_length=100, description="Username Instagram (tanpa @)"),
-    max_posts: int = Query(default=10, ge=1, le=10, description="Jumlah post yang di-scrape (maks 10)"),
     max_comments: int = Query(default=20, ge=0, le=50, description="Jumlah komentar per post (maks 50)"),
-    force_refresh: bool = Query(default=False, description="Paksa scrape ulang meski data sudah ada di DB"),
+    force_refresh: bool = Query(default=False, description="Paksa scrape ulang (tetap dibatasi 1x per hari)"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Scrape post Instagram dari username, simpan ke DB, analisis sentimen komentar.
+    Scrape post Instagram dari username via EnsembleData, simpan ke DB, analisis sentimen komentar.
 
     **Behaviour:**
-    - Jika data sudah ada di DB dan `force_refresh=false` → langsung return dari DB
-    - Jika belum ada atau `force_refresh=true` → scrape dari EnsembleData Instagram API
+    - Maksimal **5 post per username per hari** untuk hemat EnsembleData token
+    - Jika sudah di-scrape hari ini → langsung return dari DB (tidak hit EnsembleData lagi)
+    - `force_refresh=true` tetap dibatasi 1x per hari per username
 
     **Yang di-scrape per post:**
     - Info post: caption, likes, comments_count, media_type, thumbnail, shortcode
@@ -173,29 +173,42 @@ async def get_instagram_posts(
 
     **Response:**
     - `user_info` : profil Instagram (followers, bio, dll)
-    - `items`     : list post, masing-masing dengan `comments` nested + `sentiment_summary`
+    - `items`     : list post dengan nested `comments` + `sentiment_summary`
     - `stats`     : total post, komentar, coverage sentimen
     - `sentiment` : distribusi global positif/negatif/netral
     """
+    MAX_POSTS_PER_DAY = 5
     username = username.strip().lstrip("@")
 
-    # ── Cek apakah data sudah ada di DB ──────────────────────────────────────
-    existing_count: int = await db.scalar(
+    # ── Cek apakah sudah di-scrape hari ini ──────────────────────────────────
+    scraped_today: bool = await db.scalar(
         text("""
-            SELECT COUNT(*) FROM posts
-            WHERE platform = 'instagram' AND author = :username
+            SELECT EXISTS(
+                SELECT 1 FROM posts
+                WHERE platform = 'instagram'
+                  AND author = :username
+                  AND collected_at::date = CURRENT_DATE
+            )
         """),
+        {"username": username},
+    ) or False
+
+    existing_count: int = await db.scalar(
+        text("SELECT COUNT(*) FROM posts WHERE platform = 'instagram' AND author = :username"),
         {"username": username},
     ) or 0
 
     scrape_result: dict | None = None
 
-    if existing_count == 0 or force_refresh:
+    # Scrape hanya jika: belum ada data ATAU (force_refresh DAN belum scrape hari ini)
+    should_scrape = (existing_count == 0) or (force_refresh and not scraped_today)
+
+    if should_scrape:
         from app.services.instagram.pipeline_service import scrape_instagram_posts
         scrape_result = await scrape_instagram_posts(
             db=db,
             username=username,
-            max_posts=max_posts,
+            max_posts=MAX_POSTS_PER_DAY,
             max_comments=max_comments,
             keyword_id=None,
         )
@@ -210,7 +223,7 @@ async def get_instagram_posts(
           AND p.author = :username
         ORDER BY p.published_at DESC NULLS LAST
         LIMIT :limit
-    """), {"username": username, "limit": max_posts})).mappings().all()
+    """), {"username": username, "limit": MAX_POSTS_PER_DAY})).mappings().all()
 
     # ── Build user_info (dari scrape atau minimal dari DB) ────────────────────
     user_info: dict = {}
@@ -325,13 +338,14 @@ async def get_instagram_posts(
         for lbl in ["positif", "negatif", "netral"]
     }
 
-    scrape_info = None
-    if scrape_result:
-        scrape_info = {
-            "posts_scraped": scrape_result.get("posts_scraped", 0),
-            "posts_new":     scrape_result.get("posts_saved", 0),
-            "errors":        scrape_result.get("errors", []),
-        }
+    scrape_info = {
+        "executed":     should_scrape,
+        "skipped_reason": "sudah di-scrape hari ini" if (not should_scrape and scraped_today) else None,
+        "posts_scraped": scrape_result.get("posts_scraped", 0) if scrape_result else 0,
+        "posts_new":     scrape_result.get("posts_saved", 0) if scrape_result else 0,
+        "daily_limit":   MAX_POSTS_PER_DAY,
+        "errors":        scrape_result.get("errors", []) if scrape_result else [],
+    }
 
     return build_success_response({
         "platform": "instagram",
