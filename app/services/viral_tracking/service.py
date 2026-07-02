@@ -15,6 +15,7 @@ from typing import Any
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.domain.posts.models import Post
 from app.domain.viral_tracking.models import FlaggedAccount, ViralChannelTracker
@@ -61,6 +62,7 @@ async def detect_and_create_trackers(db: AsyncSession) -> list[uuid.UUID]:
     viral_posts: list[Post] = list(viral_posts_result.scalars().all())
 
     new_tracker_ids: list[uuid.UUID] = []
+    newly_tagged_posts: list[Post] = []
     now = datetime.now(timezone.utc)
 
     for post in viral_posts:
@@ -99,9 +101,34 @@ async def detect_and_create_trackers(db: AsyncSession) -> list[uuid.UUID]:
         db.add(tracker)
         await db.flush()
         new_tracker_ids.append(tracker.id)
-        tracked_channels.add(channel_id)  # prevent duplicates within this run
+        tracked_channels.add(channel_id)
+
+        # Tag trigger post langsung di DB — tidak perlu tunggu daily scrape
+        meta = post.metadata_ or {}
+        meta["tracker_id"] = str(tracker.id)
+        meta["source"] = "viral_tracking"
+        post.metadata_ = meta
+        flag_modified(post, "metadata_")
+        if post.content and not post.cleaned_content:
+            from app.services.processing.cleaner import default_cleaner
+            post.cleaned_content = default_cleaner.clean(post.content)
+            post.is_processed = True
+        newly_tagged_posts.append(post)
 
     await db.commit()
+
+    # Dispatch embedding untuk trigger post yang baru di-tag (di luar transaction)
+    if newly_tagged_posts:
+        from app.workers.ai_worker import analyze_post_task
+        for post in newly_tagged_posts:
+            if post.id and post.embedding is None:
+                analyze_post_task.delay(
+                    str(post.id),
+                    run_sentiment=False,
+                    run_ner=False,
+                    run_embedding=True,
+                )
+
     return new_tracker_ids
 
 

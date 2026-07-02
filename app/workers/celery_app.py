@@ -62,10 +62,10 @@ celery_app.conf.update(
             "schedule": crontab(minute=0, hour="0,6,12,18"),
             "options": {"queue": "default"},
         },
-        # Viral tracking: resume semua tracker aktif setiap hari jam 03:00
-        "viral-tracking-daily-check-03:00": {
+        # Viral tracking: resume semua tracker aktif setiap hari jam 12:00 WIB
+        "viral-tracking-daily-check-12:00": {
             "task": "workers.viral_tracking.daily_check",
-            "schedule": crontab(hour=3, minute=0),
+            "schedule": crontab(hour=12, minute=0),
             "options": {"queue": "default"},
         },
         # YouTube: fetch trending Indonesia setiap hari jam 12.00 WIB

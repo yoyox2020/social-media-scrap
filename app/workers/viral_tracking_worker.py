@@ -6,7 +6,7 @@ Flow otomatis:
     → detect_and_create_trackers()
     → queue viral_channel_daily_scrape_task per tracker baru
 
-  viral_tracking_daily_check_task (setiap hari jam 03:00)
+  viral_tracking_daily_check_task (setiap hari jam 12:00 WIB)
     → resume_active_trackers() — tandai expired, cari yang belum scraping hari ini
     → queue viral_channel_daily_scrape_task per tracker aktif
 
