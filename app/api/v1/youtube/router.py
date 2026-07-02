@@ -636,7 +636,7 @@ async def viral_videos(
     limit: int = Query(default=20, ge=1, le=100, description="Jumlah video teratas"),
     keyword_id: uuid.UUID | None = Query(default=None, description="Filter per keyword UUID (opsional)"),
     q: str | None = Query(default=None, max_length=200, description="Filter nama keyword (ILIKE, opsional — alternatif keyword_id)"),
-    limit_comments: int = Query(default=10, ge=0, le=200, description="Jumlah sample komentar (0 = tidak ambil)"),
+    limit_comments: int = Query(default=20, ge=0, le=20, description="Jumlah komentar per video (max 20)"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
