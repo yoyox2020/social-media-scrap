@@ -760,7 +760,7 @@ async def viral_videos_post(
         filters.append("p.keyword_id = :keyword_id")
         params["keyword_id"] = str(body.keyword_id)
     elif body.q:
-        filters.append("k.keyword ILIKE :q_like")
+        filters.append("(p.content ILIKE :q_like OR p.author ILIKE :q_like OR k.keyword ILIKE :q_like)")
         params["q_like"] = f"%{body.q.strip()}%"
 
     if body.date_from:
@@ -1465,7 +1465,7 @@ async def date_range_search_post(
             filters.append("p.keyword_id = :kw_id")
             p["kw_id"] = str(kw_id)
         elif q_like:
-            filters.append("k.keyword ILIKE :q_like")
+            filters.append("(p.content ILIKE :q_like OR p.author ILIKE :q_like OR k.keyword ILIKE :q_like)")
             p["q_like"] = q_like
 
         order = {

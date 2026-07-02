@@ -171,7 +171,7 @@ async def run_daily_channel_scrape(db: AsyncSession, tracker_id: uuid.UUID) -> i
             # Jika channel tidak punya video → tetap lanjut ke after-try
             # agar last_scraped_date di-set dan scrape_log ditulis (tidak loop selamanya)
             if items:
-                posts = normalizer.normalize(items, tracker.keyword_id or uuid.UUID(int=0))
+                posts = normalizer.normalize(items, tracker.keyword_id)
                 ext_ids = [p.external_id for p in posts]
                 existing = await post_repo.get_existing_external_ids(ext_ids, "youtube")
                 new_posts = [p for p in posts if p.external_id not in existing]
