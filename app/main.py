@@ -279,6 +279,22 @@ async def scraping_status_page():
   .pill-flagged  { background: #450a0a; color: #fca5a5; }
   .pill-active   { background: #14532d; color: #4ade80; }
   .pill-completed { background: #1e293b; color: #64748b; }
+  .pill-belum    { background: #1e293b; color: #64748b; }
+  .pill-error-scrape { background: #431407; color: #fb923c; }
+  .pill-ok-scrape    { background: #14532d; color: #4ade80; }
+  tr.vt-belum td { border-left: 2px solid #334155; }
+  tr.vt-error  td:first-child { border-left: 2px solid #f97316 !important; }
+  tr.vt-ok     td:first-child { border-left: 2px solid #4ade80 !important; }
+  tr.vt-error { background: rgba(249,115,22,0.04); }
+  tr.vt-ok    { background: rgba(74,222,128,0.04); }
+  .retry-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .retry-btn { background: #1d4ed8; border: none; color: #fff; padding: 6px 16px; border-radius: 6px; cursor: pointer; font-size: 0.8rem; font-weight: 600; transition: background 0.15s; }
+  .retry-btn:hover { background: #1e40af; }
+  .retry-btn:disabled { opacity: 0.5; cursor: default; }
+  .retry-msg { font-size: 0.78rem; color: #60a5fa; }
+  .legend { display: flex; gap: 14px; align-items: center; font-size: 0.75rem; color: #64748b; margin-left: auto; }
+  .legend-item { display: flex; align-items: center; gap: 4px; }
+  .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
   .pagination { display: flex; align-items: center; gap: 10px; margin-top: 10px; justify-content: flex-end; }
   .page-btn { background: #1e293b; border: 1px solid #334155; color: #94a3b8; padding: 5px 14px; border-radius: 6px; cursor: pointer; font-size: 0.8rem; transition: background 0.15s; }
   .page-btn:hover:not([disabled]) { background: #334155; color: #e2e8f0; }
@@ -311,14 +327,24 @@ async def scraping_status_page():
   <div class="vt-card"><div class="label">Post Terkumpul</div><div class="value" id="vt-posts">-</div><div class="sub">via tracking</div></div>
   <div class="vt-card"><div class="label">Akun Diflag</div><div class="value" id="vt-flagged">-</div><div class="sub">komentar &gt;10x</div></div>
 </div>
+<div class="retry-bar">
+  <button class="retry-btn" id="retry-btn" onclick="retryFailed()">&#9654; Retry Semua Gagal</button>
+  <span class="retry-msg" id="retry-msg"></span>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#64748b"></div>Belum scrape</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f97316"></div>Error</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#4ade80"></div>Sukses</div>
+  </div>
+</div>
 <table>
   <thead>
     <tr>
       <th>Channel</th>
       <th>Tipe</th>
-      <th>Status Tracker</th>
-      <th>Post Terkumpul</th>
-      <th>Terakhir Scrape</th>
+      <th>Status</th>
+      <th>Hasil Scrape</th>
+      <th>Post</th>
+      <th>Tgl Scrape</th>
       <th>Log Terakhir</th>
     </tr>
   </thead>
@@ -384,6 +410,34 @@ function renderPagination(containerId, page, totalPages, total, navFn) {
 
 function navVT(p) { vtPage = p; load(); }
 function navRuns(p) { runsPage = p; load(); }
+
+async function retryFailed() {
+  const btn = document.getElementById('retry-btn');
+  const msg = document.getElementById('retry-msg');
+  btn.disabled = true;
+  msg.textContent = 'Mengirim...';
+  try {
+    const base = window.location.origin;
+    const r = await fetch(base + '/api/v1/youtube/viral-tracking/retry-failed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (localStorage.getItem('token') || '') },
+    });
+    const json = await r.json();
+    if (r.ok) {
+      const n = json.data?.retried ?? 0;
+      msg.style.color = '#4ade80';
+      msg.textContent = n > 0 ? `${n} tracker di-queue. Refresh dalam 2-5 menit.` : 'Tidak ada tracker gagal.';
+      setTimeout(load, 3000);
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.detail || 'Error. Pastikan sudah login di Swagger dulu.';
+    }
+  } catch(e) {
+    msg.style.color = '#f87171';
+    msg.textContent = 'Gagal. Cek apakah Bearer token tersedia.';
+  }
+  setTimeout(() => { btn.disabled = false; msg.textContent = ''; msg.style.color = '#60a5fa'; }, 8000);
+}
 
 function renderWorkers(workers) {
   const grid = document.getElementById('workers-grid');
@@ -451,25 +505,37 @@ async function load() {
     const vtTbody = document.getElementById('vt-table');
     const vtRows = vt.recent_activity || [];
     if (vtRows.length === 0) {
-      vtTbody.innerHTML = '<tr><td colspan="6" style="color:#475569;font-style:italic;padding:12px">Belum ada data tracker</td></tr>';
+      vtTbody.innerHTML = '<tr><td colspan="7" style="color:#475569;font-style:italic;padding:12px">Belum ada data tracker</td></tr>';
     } else {
       vtTbody.innerHTML = vtRows.map(r => {
         const ll = r.last_log || {};
-        const logText = ll.error
-          ? `<span class="red">Error: ${ll.error.substring(0,40)}...</span>`
-          : ll.posts_new !== undefined
-            ? `<span class="green">+${ll.posts_new} post</span> (skip: ${ll.posts_skipped ?? 0})`
-            : '-';
+        const hasLog = ll.posts_new !== undefined || ll.error !== undefined;
+        const kondisi = !hasLog ? 'belum' : (ll.error ? 'error' : 'ok');
+
+        const hasilPill = kondisi === 'belum'
+          ? '<span class="pill pill-belum">Belum Scrape</span>'
+          : kondisi === 'error'
+            ? '<span class="pill pill-error-scrape">&#9888; Error</span>'
+            : '<span class="pill pill-ok-scrape">&#10003; Sukses</span>';
+
+        const logText = kondisi === 'error'
+          ? `<span class="red" title="${ll.error || ''}">${(ll.error || '').substring(0,50)}${(ll.error||'').length>50?'...':''}</span>`
+          : kondisi === 'ok'
+            ? `<span class="green">+${ll.posts_new} baru</span>&nbsp;<span style="color:#475569">(skip:${ll.posts_skipped ?? 0})</span>`
+            : '<span style="color:#475569">-</span>';
+
         const typePill = r.tracker_type === 'viral'
           ? '<span class="pill pill-viral">viral</span>'
           : '<span class="pill pill-flagged">flagged</span>';
         const statusPillVt = r.status === 'active'
           ? '<span class="pill pill-active">active</span>'
           : '<span class="pill pill-completed">completed</span>';
-        return `<tr>
+
+        return `<tr class="vt-${kondisi}">
           <td><b>${r.channel_name || '-'}</b><br><span style="color:#475569;font-size:.7rem">${r.tracker_id.substring(0,8)}...</span></td>
           <td>${typePill}</td>
           <td>${statusPillVt}</td>
+          <td>${hasilPill}</td>
           <td class="${r.posts_collected > 0 ? 'green' : ''}">${r.posts_collected ?? 0}</td>
           <td style="color:#94a3b8;font-size:.75rem">${r.last_scraped_date || '-'}</td>
           <td style="font-size:.75rem">${logText}</td>
