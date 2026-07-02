@@ -68,6 +68,12 @@ celery_app.conf.update(
             "schedule": crontab(hour=12, minute=0),
             "options": {"queue": "default"},
         },
+        # Auto-retry embedding untuk posts yang belum punya embedding (setiap 6 jam)
+        "retry-missing-embeddings-every-6h": {
+            "task": "workers.retry_missing_embeddings",
+            "schedule": crontab(minute=30, hour="1,7,13,19"),
+            "options": {"queue": "default"},
+        },
         # YouTube: fetch trending Indonesia setiap hari jam 12.00 WIB
         # project_id kosong → task otomatis pilih project pertama dari DB
         "youtube-trending-daily-12:00": {
