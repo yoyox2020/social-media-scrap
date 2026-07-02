@@ -147,7 +147,7 @@ async def fetch_and_store_trending(
 async def collect_comments_for_video(
     db: AsyncSession,
     post_id: uuid.UUID,
-    keyword_id: uuid.UUID,
+    keyword_id: uuid.UUID | None,
     max_comments: int = 50,
     max_pages: int = 1,
 ) -> CommentCollectionResult:
@@ -257,7 +257,7 @@ async def collect_comments_for_video(
 async def _analyze_comments_lexicon(
     db: AsyncSession,
     comments: list[Comment],
-    keyword_id: uuid.UUID,
+    keyword_id: uuid.UUID | None,
 ) -> int:
     from app.ai.lexicon.service import analyze
 

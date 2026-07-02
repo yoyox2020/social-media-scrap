@@ -25,10 +25,10 @@ class LexiconAnalysis(Base, UUIDMixin, TimestampMixin):
         nullable=False,
         index=True,
     )
-    keyword_id: Mapped[uuid.UUID] = mapped_column(
+    keyword_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("keywords.id", ondelete="CASCADE"),
-        nullable=False,
+        ForeignKey("keywords.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
 

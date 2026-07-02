@@ -675,6 +675,29 @@ async def viral_videos(
 
     from collections import Counter as _Counter
 
+    # ── Auto-scrape komentar untuk video yang belum punya komentar ────────────
+    if rows and limit_comments > 0:
+        from app.services.youtube.pipeline_service import collect_comments_for_video
+        ids_check = ", ".join(f"'{r['id']}'" for r in rows)
+        existing_counts = dict((await db.execute(text(f"""
+            SELECT post_id::text, COUNT(*) FROM comments
+            WHERE post_id::text IN ({ids_check}) GROUP BY post_id::text
+        """))).all())
+        to_scrape = [r for r in rows if existing_counts.get(str(r["id"]), 0) == 0][:3]
+        for r in to_scrape:
+            try:
+                kw_raw = await db.scalar(
+                    text("SELECT keyword_id FROM posts WHERE id = :pid"),
+                    {"pid": str(r["id"])},
+                )
+                await collect_comments_for_video(
+                    db=db, post_id=r["id"],
+                    keyword_id=kw_raw,
+                    max_comments=20, max_pages=1,
+                )
+            except Exception:
+                pass
+
     # Batch-fetch semua komentar sekaligus, dikelompokkan by post_id
     post_ids = [str(r["id"]) for r in rows]
     comments_by_post: dict[str, list] = {pid: [] for pid in post_ids}
@@ -838,6 +861,25 @@ async def viral_videos_post(
     rows = (await db.execute(sql, params)).mappings().all()
 
     from collections import Counter as _Counter
+
+    # ── Auto-scrape komentar untuk video yang belum punya komentar ────────────
+    if rows and body.limit_comments > 0 and total > 0:
+        from app.services.youtube.pipeline_service import collect_comments_for_video
+        ids_check = ", ".join(f"'{r['id']}'" for r in rows)
+        existing_counts_p = dict((await db.execute(text(f"""
+            SELECT post_id::text, COUNT(*) FROM comments
+            WHERE post_id::text IN ({ids_check}) GROUP BY post_id::text
+        """))).all())
+        to_scrape_p = [r for r in rows if existing_counts_p.get(str(r["id"]), 0) == 0][:3]
+        for r in to_scrape_p:
+            try:
+                await collect_comments_for_video(
+                    db=db, post_id=r["id"],
+                    keyword_id=r["keyword_id"],
+                    max_comments=20, max_pages=1,
+                )
+            except Exception:
+                pass
 
     # Build items sementara, simpan _pid untuk grouping komentar
     post_ids_raw = [str(r["id"]) for r in rows]
