@@ -51,13 +51,11 @@ class YouTubeConnector:
             if "495" not in str(exc):
                 raise
             logger.warning("[YouTube] EnsembleData quota habis (495), fallback ke YouTube Data API v3")
-            # Quota EnsembleData habis — coba YouTube Data API v3
             from app.shared.config import settings
             from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
 
             if not settings.youtube_data_api_key:
-                raise  # Tidak ada fallback key, teruskan error asli
-
+                raise
             yt_client = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
             return await yt_client.search_videos(keyword, max_results=50)
 
@@ -195,16 +193,36 @@ class YouTubeConnector:
     ) -> dict[str, Any]:
         """
         Ambil video dari channel.
+        Jika EnsembleData tidak tersedia (493 expired / 495 quota), fallback ke
+        YouTube Data API v3 search?channelId= yang memberikan video terbaru dari channel.
 
         Args:
             browse_id: Channel ID (UCxxxxxxxxxxxxxxx)
             cursor:    Token halaman berikutnya, "" untuk halaman pertama
             depth:     Jumlah halaman yang diambil (1 = ~20 video, min 1)
         """
-        return await self.client.get(
-            YouTubeEndpoints.CHANNEL_VIDEOS.path,
-            params={"browseId": browse_id, "cursor": cursor, "depth": min(depth, MAX_DEPTH)},
-        )
+        from app.shared.exceptions import ExternalAPIError
+
+        try:
+            return await self.client.get(
+                YouTubeEndpoints.CHANNEL_VIDEOS.path,
+                params={"browseId": browse_id, "cursor": cursor, "depth": min(depth, MAX_DEPTH)},
+            )
+        except ExternalAPIError as exc:
+            exc_str = str(exc)
+            if "495" not in exc_str and "493" not in exc_str:
+                raise
+            logger.warning(
+                "[YouTube] EnsembleData tidak tersedia (%s) untuk channel %s, fallback ke YouTube Data API v3",
+                exc_str[:60], browse_id,
+            )
+            from app.shared.config import settings
+            from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
+
+            if not settings.youtube_data_api_key:
+                raise
+            yt_client = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
+            return await yt_client.search_videos_by_channel(browse_id, max_results=10, order="date")
 
     async def get_channel_id_to_name(self, browse_id: str) -> dict[str, Any]:
         """Konversi channel browseId ke username. Param: browseId."""

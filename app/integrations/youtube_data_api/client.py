@@ -84,6 +84,32 @@ class YouTubeDataAPIClient:
         resp = await _get("videos", params)
         return resp.json()
 
+    async def search_videos_by_channel(
+        self,
+        channel_id: str,
+        max_results: int = 10,
+        order: str = "date",
+    ) -> dict[str, Any]:
+        """
+        Ambil video terbaru dari channel spesifik via YouTube Data API v3.
+        Dipakai sebagai fallback viral tracking ketika EnsembleData tidak tersedia.
+        order: date | viewCount | relevance | rating
+        """
+        params = {
+            "part": "snippet",
+            "channelId": channel_id,
+            "type": "video",
+            "order": order,
+            "maxResults": min(max_results, 50),
+            "key": self.api_key,
+        }
+        resp = await _get("search", params)
+        items = resp.json().get("items") or []
+        return {
+            "_source": _SOURCE_MARKER,
+            "data": {"items": items},
+        }
+
     async def list_comment_threads(
         self,
         video_id: str,
