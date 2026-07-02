@@ -896,10 +896,77 @@ async def viral_videos_post(
                         "keyword":       body.q,
                         "keyword_id":    None,
                     })
+
+                # Simpan ke DB agar GET /videos/viral bisa menemukan hasil ini
+                saved_count = 0
+                if yt_items:
+                    from app.domain.projects.models import Project
+                    from app.domain.posts.models import Post as PostModel
+
+                    # Cari atau buat keyword
+                    auto_kw = await db.scalar(
+                        select(Keyword).where(func.lower(Keyword.keyword) == body.q.strip().lower()).limit(1)
+                    )
+                    if not auto_kw:
+                        project_id = await db.scalar(
+                            select(Project.id).where(Project.is_active == True).limit(1)  # noqa: E712
+                        )
+                        if not project_id:
+                            from app.domain.users.models import User as UserModel
+                            first_user = await db.scalar(select(UserModel.id).limit(1))
+                            auto_project = Project(user_id=first_user, name="Default Project", description="Auto-created", is_active=True)
+                            db.add(auto_project)
+                            await db.flush()
+                            project_id = auto_project.id
+                        auto_kw = Keyword(project_id=project_id, keyword=body.q.strip(), is_active=True)
+                        db.add(auto_kw)
+                        await db.flush()
+
+                    # Cek video mana yang belum ada di DB
+                    vid_ids = [it["video_id"] for it in yt_items]
+                    existing_ids = set((await db.scalars(
+                        select(PostModel.external_id).where(
+                            PostModel.platform == "youtube",
+                            PostModel.external_id.in_(vid_ids),
+                        )
+                    )).all())
+
+                    now = datetime.now(timezone.utc)
+                    new_posts = []
+                    for it in yt_items:
+                        if it["video_id"] in existing_ids:
+                            continue
+                        new_posts.append(PostModel(
+                            id=uuid.uuid4(),
+                            keyword_id=auto_kw.id,
+                            external_id=it["video_id"],
+                            platform="youtube",
+                            content=it["title"],
+                            author=it["channel"],
+                            url=it["url"],
+                            metadata_={
+                                "views":     0,
+                                "thumbnail": it["thumbnail_url"],
+                                "source":    "youtube_data_api_viral_search",
+                            },
+                            raw_data={},
+                            published_at=_utc_from_iso(it["published_at"]),
+                            collected_at=now,
+                        ))
+                    if new_posts:
+                        db.add_all(new_posts)
+                        await db.commit()
+                        saved_count = len(new_posts)
+                        # Update keyword_id di yt_items agar response konsisten
+                        for it in yt_items:
+                            it["keyword_id"] = str(auto_kw.id)
+                            it["collected_at"] = now.isoformat()
+
                 return build_success_response({
-                    "source":  "youtube_data_api_v3",
-                    "note":    f"Data tidak ditemukan di DB — hasil langsung dari YouTube search (order=viewCount) untuk '{body.q}'",
-                    "sort_by": "viewCount",
+                    "source":     "youtube_data_api_v3",
+                    "note":       f"Data tidak ditemukan di DB — hasil dari YouTube search untuk '{body.q}', {saved_count} video baru disimpan ke DB",
+                    "sort_by":    "viewCount",
+                    "saved_to_db": saved_count,
                     "filter": {
                         "keyword_id": str(body.keyword_id) if body.keyword_id else None,
                         "q":          body.q,
