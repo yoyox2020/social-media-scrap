@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.domain.posts.models import Post
-from app.domain.viral_tracking.models import FlaggedAccount, ViralChannelTracker
+from app.domain.viral_tracking.models import FlaggedAccount, ViralChannelTracker, ViralKeywordTracker
 
 VIRAL_VIEW_THRESHOLD = 1_000_000
 TRACKER_DAYS = 7
@@ -344,6 +344,180 @@ async def check_and_flag_commenters(db: AsyncSession, tracker_id: uuid.UUID) -> 
 
     await db.commit()
     return new_flag_ids
+
+
+async def create_keyword_tracker(db: AsyncSession, search_query: str) -> ViralKeywordTracker:
+    """
+    Buat ViralKeywordTracker baru untuk search_query.
+    Jika sudah ada tracker aktif dengan query yang sama (case-insensitive), kembalikan yang sudah ada.
+    """
+    q_lower = search_query.strip().lower()
+    existing = await db.scalar(
+        select(ViralKeywordTracker)
+        .where(
+            func.lower(ViralKeywordTracker.search_query) == q_lower,
+            ViralKeywordTracker.status == "active",
+        )
+        .limit(1)
+    )
+    if existing:
+        return existing
+
+    now = datetime.now(timezone.utc)
+    tracker = ViralKeywordTracker(
+        search_query=search_query.strip(),
+        status="active",
+        started_at=now,
+        ends_at=now + timedelta(days=TRACKER_DAYS),
+        posts_collected=0,
+    )
+    db.add(tracker)
+    await db.commit()
+    await db.refresh(tracker)
+    return tracker
+
+
+async def run_daily_keyword_scrape(db: AsyncSession, tracker_id: uuid.UUID) -> int:
+    """
+    Scrape video YouTube berdasarkan search_query tracker. Skip jika sudah scraping hari ini.
+    Setelah scrape, kumpulkan komentar untuk setiap video baru.
+    Return jumlah post baru.
+    """
+    tracker = await db.get(ViralKeywordTracker, tracker_id)
+    if not tracker or tracker.status != "active":
+        return 0
+
+    today = date.today()
+    if tracker.last_scraped_date == today:
+        return 0
+
+    now = datetime.now(timezone.utc)
+    if tracker.ends_at < now:
+        tracker.status = "completed"
+        await db.commit()
+        return 0
+
+    from app.integrations.ensemble_data.client import EnsembleDataClient
+    from app.integrations.youtube.connector import YouTubeConnector
+    from app.repositories.post_repository import PostRepository
+    from app.services.processing.normalizer import YouTubeNormalizer
+
+    post_repo = PostRepository(db)
+    normalizer = YouTubeNormalizer()
+    new_count = 0
+    items: list = []
+
+    try:
+        async with EnsembleDataClient() as client:
+            connector = YouTubeConnector(client)
+            raw = await connector.search_by_keyword(tracker.search_query, depth=1)
+            items = connector.extract_posts(raw)
+            items = items[:POSTS_PER_DAY]
+
+        if items:
+            posts = normalizer.normalize(items, None)
+            ext_ids = [p.external_id for p in posts]
+            existing_set = await post_repo.get_existing_external_ids(ext_ids, "youtube")
+            new_posts = [p for p in posts if p.external_id not in existing_set]
+
+            for post in new_posts:
+                meta = post.metadata_ or {}
+                meta["keyword_tracker_id"] = str(tracker_id)
+                meta["source"] = "keyword_tracking"
+                post.metadata_ = meta
+
+            if new_posts:
+                from app.services.processing.cleaner import default_cleaner
+                for post in new_posts:
+                    if post.content:
+                        post.cleaned_content = default_cleaner.clean(post.content)
+                        post.is_processed = True
+                new_count = await post_repo.bulk_create(new_posts)
+
+            if new_posts:
+                from app.services.youtube.pipeline_service import collect_comments_for_video
+                for post in new_posts:
+                    if post.id:
+                        try:
+                            await collect_comments_for_video(
+                                db=db,
+                                post_id=post.id,
+                                keyword_id=None,
+                                max_comments=50,
+                                max_pages=1,
+                            )
+                        except Exception:
+                            pass
+
+    except Exception as exc:
+        _append_keyword_log(tracker, today, posts_new=0, posts_skipped=0, error=str(exc))
+        tracker.last_scraped_date = today
+        await db.commit()
+        return 0
+
+    skipped = len(items) - new_count if items else 0
+    _append_keyword_log(tracker, today, posts_new=new_count, posts_skipped=skipped)
+    tracker.last_scraped_date = today
+    tracker.posts_collected = (tracker.posts_collected or 0) + new_count
+    await db.commit()
+    return new_count
+
+
+async def resume_active_keyword_trackers(db: AsyncSession) -> dict[str, list[str]]:
+    """
+    Harian: tandai keyword tracker expired sebagai completed, kembalikan yang perlu scraping.
+    """
+    now = datetime.now(timezone.utc)
+    today = date.today()
+
+    expired_result = await db.execute(
+        select(ViralKeywordTracker).where(
+            ViralKeywordTracker.status == "active",
+            ViralKeywordTracker.ends_at < now,
+        )
+    )
+    expired = expired_result.scalars().all()
+    for t in expired:
+        t.status = "completed"
+
+    active_result = await db.execute(
+        select(ViralKeywordTracker).where(
+            ViralKeywordTracker.status == "active",
+            ViralKeywordTracker.ends_at >= now,
+        )
+    )
+    active = active_result.scalars().all()
+    needs_scrape = [str(t.id) for t in active if t.last_scraped_date != today]
+
+    if expired:
+        await db.commit()
+
+    return {"expired_completed": [str(t.id) for t in expired], "needs_scrape": needs_scrape}
+
+
+def _append_keyword_log(
+    tracker: "ViralKeywordTracker",
+    scrape_date: "date",
+    *,
+    posts_new: int,
+    posts_skipped: int,
+    error: str | None = None,
+) -> None:
+    from sqlalchemy.orm.attributes import flag_modified
+
+    logs: list = list(tracker.day_logs or [])
+    day_num = (scrape_date - tracker.started_at.date()).days + 1
+    entry: dict = {
+        "day": day_num,
+        "date": scrape_date.isoformat(),
+        "posts_new": posts_new,
+        "posts_skipped": posts_skipped,
+    }
+    if error:
+        entry["error"] = error[:300]
+    logs.append(entry)
+    tracker.day_logs = logs
+    flag_modified(tracker, "day_logs")
 
 
 async def resume_active_trackers(db: AsyncSession) -> dict[str, list[str]]:

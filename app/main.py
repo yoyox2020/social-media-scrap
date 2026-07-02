@@ -287,6 +287,14 @@ async def scraping_status_page():
   tr.vt-ok     td:first-child { border-left: 2px solid #4ade80 !important; }
   tr.vt-error { background: rgba(249,115,22,0.04); }
   tr.vt-ok    { background: rgba(74,222,128,0.04); }
+  .kt-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .kt-card { background: #1e293b; border-radius: 8px; padding: 14px; border-left: 3px solid #34d399; }
+  .kt-card .label { font-size: 0.72rem; color: #64748b; text-transform: uppercase; margin-bottom: 4px; }
+  .kt-card .value { font-size: 1.5rem; font-weight: 700; color: #34d399; }
+  .pill-keyword  { background: #064e3b; color: #34d399; }
+  .pill-done     { background: #1e293b; color: #64748b; }
+  .progress-bar  { background: #1e293b; border-radius: 99px; height: 6px; width: 100%; margin-top: 4px; }
+  .progress-fill { background: #34d399; border-radius: 99px; height: 6px; }
   .retry-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
   .retry-btn { background: #1d4ed8; border: none; color: #fff; padding: 6px 16px; border-radius: 6px; cursor: pointer; font-size: 0.8rem; font-weight: 600; transition: background 0.15s; }
   .retry-btn:hover { background: #1e40af; }
@@ -351,6 +359,29 @@ async def scraping_status_page():
   <tbody id="vt-table"></tbody>
 </table>
 <div class="pagination" id="vt-pagination"></div>
+
+<div class="section-title" style="margin-top:24px">Keyword Tracking (7 Hari)</div>
+<div class="kt-grid">
+  <div class="kt-card"><div class="label">Tracking Aktif</div><div class="value" id="kt-active">-</div></div>
+  <div class="kt-card"><div class="label">Selesai (Done)</div><div class="value" id="kt-done">-</div></div>
+  <div class="kt-card"><div class="label">Post Terkumpul</div><div class="value" id="kt-posts">-</div></div>
+</div>
+<table>
+  <thead>
+    <tr>
+      <th>Keyword Pencarian</th>
+      <th>Status</th>
+      <th>Hari ke-</th>
+      <th>Progress</th>
+      <th>Post</th>
+      <th>Tgl Scrape</th>
+      <th>Mulai</th>
+      <th>Berakhir</th>
+      <th>Log Terakhir</th>
+    </tr>
+  </thead>
+  <tbody id="kt-table"></tbody>
+</table>
 
 <div class="section-title" style="margin-top:24px">Riwayat Scraping Keyword</div>
 <table>
@@ -544,6 +575,47 @@ async function load() {
 
     const vtPag = vt.pagination || {};
     renderPagination('vt-pagination', vtPage, vtPag.total_pages || 1, vtPag.total || 0, 'navVT');
+
+    // Keyword tracking section
+    const kt = d.keyword_tracking || {};
+    document.getElementById('kt-active').textContent = kt.active_trackers ?? '-';
+    document.getElementById('kt-done').textContent   = kt.completed_trackers ?? '-';
+    document.getElementById('kt-posts').textContent  = kt.posts_collected ?? '-';
+
+    const ktTbody = document.getElementById('kt-table');
+    const ktRows = kt.recent_activity || [];
+    if (ktRows.length === 0) {
+      ktTbody.innerHTML = '<tr><td colspan="9" style="color:#475569;font-style:italic;padding:12px">Belum ada keyword tracker — lakukan POST /videos/viral dengan parameter q= untuk memulai</td></tr>';
+    } else {
+      ktTbody.innerHTML = ktRows.map(r => {
+        const daysDone = r.days_done || 0;
+        const pct = Math.min(100, Math.round(daysDone / 7 * 100));
+        const ll = r.last_log || {};
+        const hasLog = ll.posts_new !== undefined || ll.error !== undefined;
+        const kondisi = !hasLog ? 'belum' : (ll.error ? 'error' : 'ok');
+        const statusPill = r.status === 'active'
+          ? '<span class="pill pill-active">active</span>'
+          : '<span class="pill pill-done">done</span>';
+        const logText = kondisi === 'error'
+          ? `<span class="red" title="${ll.error||''}">${(ll.error||'').substring(0,50)}${(ll.error||'').length>50?'...':''}</span>`
+          : kondisi === 'ok'
+            ? `<span class="green">+${ll.posts_new} baru</span>`
+            : '<span style="color:#475569">-</span>';
+        return `<tr class="vt-${kondisi}">
+          <td><span class="pill pill-keyword">#</span> <b>${r.search_query}</b><br>
+              <span style="color:#475569;font-size:.7rem">${r.tracker_id.substring(0,8)}…</span></td>
+          <td>${statusPill}</td>
+          <td style="color:#94a3b8">${daysDone} / 7</td>
+          <td><div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
+              <span style="font-size:.7rem;color:#64748b">${pct}%</span></td>
+          <td class="${r.posts_collected > 0 ? 'green' : ''}">${r.posts_collected ?? 0}</td>
+          <td style="color:#94a3b8;font-size:.75rem">${r.last_scraped_date || '-'}</td>
+          <td style="color:#475569;font-size:.7rem">${fmt(r.started_at)}</td>
+          <td style="color:#475569;font-size:.7rem">${fmt(r.ends_at)}</td>
+          <td style="font-size:.75rem">${logText}</td>
+        </tr>`;
+      }).join('');
+    }
 
     // Keyword scraping runs
     const tbody = document.getElementById('runs-table');

@@ -9,6 +9,28 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.infrastructure.database.base import Base, TimestampMixin, UUIDMixin
 
 
+class ViralKeywordTracker(Base, UUIDMixin, TimestampMixin):
+    """
+    Melacak pencarian keyword YouTube selama 7 hari.
+    Dipicu otomatis oleh POST /videos/viral saat parameter q= ada.
+    Setiap hari mencari video baru dengan query yang sama, scrape komentar per video.
+    Setelah 7 hari → status = 'completed'.
+    """
+    __tablename__ = "viral_keyword_trackers"
+
+    search_query: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", server_default="active", index=True
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    posts_collected: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    last_scraped_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    day_logs: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
+
+
 class ViralChannelTracker(Base, UUIDMixin, TimestampMixin):
     """
     Melacak channel YouTube yang sedang dipantau karena salah satu postingannya viral.

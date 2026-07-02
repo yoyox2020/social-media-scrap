@@ -1100,6 +1100,20 @@ async def viral_videos_post(
         for lbl in ["positif", "negatif", "netral"]
     }
 
+    # ── Buat keyword tracker 7 hari jika q= ada dan hasil ditemukan ──────────
+    keyword_tracker_id: str | None = None
+    if body.q and total > 0:
+        try:
+            from app.services.viral_tracking.service import create_keyword_tracker
+            kt = await create_keyword_tracker(db, body.q.strip())
+            keyword_tracker_id = str(kt.id)
+            # Queue scrape hari ini jika belum pernah scraping
+            if kt.last_scraped_date != date.today():
+                from app.workers.viral_tracking_worker import viral_keyword_daily_scrape_task
+                viral_keyword_daily_scrape_task.delay(str(kt.id))
+        except Exception:
+            pass
+
     return build_success_response({
         "sort_by": body.sort_by,
         "filter": {
@@ -1108,6 +1122,11 @@ async def viral_videos_post(
             "date_from":  str(body.date_from) if body.date_from else None,
             "date_to":    str(body.date_to) if body.date_to else None,
         },
+        "tracking": {
+            "keyword_tracker_id": keyword_tracker_id,
+            "tracking_days": 7,
+            "note": f"Tracking aktif untuk '{body.q}' selama 7 hari" if keyword_tracker_id else None,
+        } if body.q else None,
         "total":  total,
         "offset": body.offset,
         "limit":  body.limit,
@@ -2133,6 +2152,17 @@ async def scrape_monitor_public(
         FROM viral_channel_trackers
     """))).mappings().first()
 
+    # ── Keyword tracker stats ─────────────────────────────────────────────────
+    kt_stats = (await db.execute(text("""
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'active')    AS active_trackers,
+            COUNT(*) FILTER (WHERE status = 'completed') AS completed_trackers,
+            COALESCE(SUM(posts_collected), 0)            AS total_posts_collected
+        FROM viral_keyword_trackers
+    """))).mappings().first()
+
+    kt_total: int = await db.scalar(text("SELECT COUNT(*) FROM viral_keyword_trackers")) or 0
+
     flagged_count: int = await db.scalar(text("SELECT COUNT(*) FROM flagged_accounts")) or 0
 
     posts_via_tracker: int = await db.scalar(
@@ -2165,6 +2195,35 @@ async def scrape_monitor_public(
             "status": vt["status"],
             "posts_collected": vt["posts_collected"],
             "last_scraped_date": vt["last_scraped_date"].isoformat() if vt["last_scraped_date"] else None,
+            "last_log": last_log,
+        })
+
+    # ── Keyword tracker rows ──────────────────────────────────────────────────
+    kt_rows = (await db.execute(text("""
+        SELECT id, search_query, status, posts_collected,
+               last_scraped_date, started_at, ends_at,
+               jsonb_array_length(COALESCE(day_logs, '[]'::jsonb)) AS day_count,
+               day_logs -> (jsonb_array_length(COALESCE(day_logs, '[]'::jsonb)) - 1) AS last_log
+        FROM viral_keyword_trackers
+        ORDER BY
+            CASE WHEN last_scraped_date IS NOT NULL THEN 0 ELSE 1 END,
+            last_scraped_date DESC NULLS LAST,
+            updated_at DESC
+        LIMIT 50
+    """))).mappings().all()
+
+    keyword_recent = []
+    for kt in kt_rows:
+        last_log = kt["last_log"] or {}
+        keyword_recent.append({
+            "tracker_id": str(kt["id"]),
+            "search_query": kt["search_query"],
+            "status": kt["status"],
+            "posts_collected": kt["posts_collected"],
+            "last_scraped_date": kt["last_scraped_date"].isoformat() if kt["last_scraped_date"] else None,
+            "started_at": kt["started_at"].isoformat() if kt["started_at"] else None,
+            "ends_at": kt["ends_at"].isoformat() if kt["ends_at"] else None,
+            "days_done": kt["day_count"] or 0,
             "last_log": last_log,
         })
 
@@ -2252,6 +2311,12 @@ async def scrape_monitor_public(
                 "total": vt_total,
                 "total_pages": max(1, (vt_total + vt_limit - 1) // vt_limit),
             },
+        },
+        "keyword_tracking": {
+            "active_trackers": int(kt_stats["active_trackers"] or 0),
+            "completed_trackers": int(kt_stats["completed_trackers"] or 0),
+            "posts_collected": int(kt_stats["total_posts_collected"] or 0),
+            "recent_activity": keyword_recent,
         },
         "runs_pagination": {
             "page": runs_page,

@@ -82,17 +82,23 @@ def detect_viral_posts_task(self):
     default_retry_delay=120,
 )
 def viral_tracking_daily_check_task(self):
-    """Resume semua tracker aktif yang belum scraping hari ini."""
-    from app.services.viral_tracking.service import resume_active_trackers
+    """Resume semua tracker aktif (channel + keyword) yang belum scraping hari ini."""
+    from app.services.viral_tracking.service import resume_active_trackers, resume_active_keyword_trackers
 
     async def _run():
         engine, factory = _get_fresh_session()
         try:
             async with factory() as db:
-                result = await resume_active_trackers(db)
-            for tid_str in result["needs_scrape"]:
+                ch_result = await resume_active_trackers(db)
+                kw_result = await resume_active_keyword_trackers(db)
+            for tid_str in ch_result["needs_scrape"]:
                 viral_channel_daily_scrape_task.delay(tid_str)
-            return result
+            for tid_str in kw_result["needs_scrape"]:
+                viral_keyword_daily_scrape_task.delay(tid_str)
+            return {
+                "channel": ch_result,
+                "keyword": kw_result,
+            }
         finally:
             await engine.dispose()
 
@@ -157,6 +163,35 @@ def check_flagged_commenters_task(self, tracker_id: str):
             if new_flagged_ids:
                 await _queue_analysis_trackers(new_flagged_ids)
             return {"tracker_id": tracker_id, "new_flagged": len(new_flagged_ids)}
+        finally:
+            await engine.dispose()
+
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:
+        raise self.retry(exc=exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  Keyword-based daily scrape (7 hari per keyword tracker)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@celery_app.task(
+    name="workers.viral_tracking.keyword_daily_scrape",
+    bind=True,
+    max_retries=3,
+    default_retry_delay=300,
+)
+def viral_keyword_daily_scrape_task(self, tracker_id: str):
+    """Scrape video YouTube berdasarkan keyword tracker, kumpulkan komentar per video."""
+    from app.services.viral_tracking.service import run_daily_keyword_scrape
+
+    async def _run():
+        engine, factory = _get_fresh_session()
+        try:
+            async with factory() as db:
+                new_posts = await run_daily_keyword_scrape(db, uuid.UUID(tracker_id))
+            return {"tracker_id": tracker_id, "new_posts": new_posts}
         finally:
             await engine.dispose()
 
