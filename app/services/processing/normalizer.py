@@ -201,31 +201,48 @@ class YouTubeNormalizer:
 class InstagramNormalizer:
     PLATFORM = "instagram"
 
-    def normalize(self, items: list[dict], keyword_id: uuid.UUID) -> list[Post]:
+    def normalize(self, items: list[dict], keyword_id: uuid.UUID | None) -> list[Post]:
         return [self._to_post(item, keyword_id) for item in items if self._get_post_id(item)]
 
     def _get_post_id(self, item: dict) -> str:
-        return str(item.get("id") or item.get("pk") or item.get("shortcode") or "")
+        raw = str(item.get("pk") or item.get("id") or item.get("shortcode") or "")
+        return raw.split("_")[0]  # pk kadang format "123456_userid"
 
-    def _to_post(self, item: dict, keyword_id: uuid.UUID) -> Post:
+    def _to_post(self, item: dict, keyword_id: uuid.UUID | None) -> Post:
         post_id = self._get_post_id(item)
-        owner = item.get("owner") or item.get("user") or {}
+        owner = item.get("user") or item.get("owner") or {}
         username = owner.get("username", "") or item.get("username", "")
-        shortcode = item.get("shortcode", "") or post_id
+        shortcode = item.get("shortcode") or item.get("code") or ""
+
+        # caption bisa nested {"text": "..."} atau string langsung
+        caption_raw = item.get("caption") or {}
+        if isinstance(caption_raw, dict):
+            caption = caption_raw.get("text", "")
+        else:
+            caption = str(caption_raw) if caption_raw else ""
+        caption = caption or item.get("accessibility_caption", "")
+
+        # thumbnail
+        img = item.get("image_versions2") or {}
+        candidates = img.get("candidates") or []
+        thumbnail = candidates[0].get("url", "") if candidates else item.get("thumbnail_url", "")
 
         return Post(
             id=uuid.uuid4(),
             keyword_id=keyword_id,
             external_id=post_id,
             platform=self.PLATFORM,
-            content=item.get("caption") or item.get("accessibility_caption", ""),
+            content=caption,
             author=username,
             url=item.get("permalink") or (f"https://www.instagram.com/p/{shortcode}/" if shortcode else None),
             metadata_={
-                "likes": _safe_int(item.get("like_count")),
-                "comments": _safe_int(item.get("comments_count") or item.get("comment_count")),
-                "media_type": item.get("media_type", ""),
-                "is_video": item.get("is_video", False),
+                "likes":       _safe_int(item.get("like_count")),
+                "comments":    _safe_int(item.get("comment_count") or item.get("comments_count")),
+                "media_type":  item.get("media_type", ""),
+                "is_video":    bool(item.get("is_video") or item.get("media_type") == 2),
+                "thumbnail":   thumbnail,
+                "shortcode":   shortcode,
+                "views":       _safe_int(item.get("view_count") or item.get("play_count")),
             },
             raw_data=item,
             published_at=_utc_from_timestamp(item.get("taken_at") or item.get("timestamp")),

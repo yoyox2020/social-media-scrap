@@ -48,17 +48,16 @@ class TikTokEndpoints:
 
 # ── Instagram ─────────────────────────────────────────────────────────────────
 class InstagramEndpoints:
-    USER_POSTS = Endpoint("/ig/user/posts", description="Post dari user")
-    USER_STATS = Endpoint("/ig/user/stats", description="Statistik dasar user")
-    USER_INFO = Endpoint("/ig/user/info", description="Profil user")
-    USER_INFO_DETAILED = Endpoint("/ig/user/info-detailed", description="Profil lengkap user")
-    USER_FOLLOWERS = Endpoint("/ig/user/followers", description="Jumlah follower")
-    USER_REELS = Endpoint("/ig/user/reels", description="Reels dari user")
-    USER_TAGGED_POSTS = Endpoint("/ig/user/tagged-posts", description="Post yang tag user")
-    POST_INFO_COMMENTS = Endpoint("/ig/post/info-comments", description="Post + komentar")
-    POST_COMMENTS = Endpoint("/ig/post/comments", description="Komentar post")
-    MUSIC_POSTS = Endpoint("/ig/music/posts", description="Post yang pakai musik")
-    SEARCH = Endpoint("/ig/search", description="Search umum Instagram")
+    USER_POSTS        = Endpoint("/instagram/user/posts",          description="Post dari user — param: user_id, depth")
+    USER_BASIC_INFO   = Endpoint("/instagram/user/basic-info",     description="Statistik dasar — param: user_id")
+    USER_INFO         = Endpoint("/instagram/user/info",           description="Profil user — param: username")
+    USER_INFO_DETAILED= Endpoint("/instagram/user/detailed-info",  description="Profil lengkap — param: username")
+    USER_FOLLOWERS    = Endpoint("/instagram/user/followers",      description="Jumlah follower — param: user_id")
+    USER_REELS        = Endpoint("/instagram/user/reels",          description="Reels — param: user_id, depth")
+    USER_TAGGED_POSTS = Endpoint("/instagram/user/tagged-posts",   description="Post tag user — param: user_id, cursor")
+    POST_DETAILS      = Endpoint("/instagram/post/details",        description="Detail post + komentar inline — param: code, n_comments_to_fetch")
+    POST_COMMENTS     = Endpoint("/instagram/post/comments",       description="Komentar post — param: media_id, cursor, sorting")
+    SEARCH            = Endpoint("/instagram/search",              description="Search — param: text")
 
 
 # ── YouTube ───────────────────────────────────────────────────────────────────
