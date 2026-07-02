@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     # YouTube Data API v3 (fallback saat EnsembleData quota habis)
     youtube_data_api_key: str = ""
 
+    # Facebook / Meta Graph API
+    facebook_access_token: str = ""
+
     # Celery
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend: str = "redis://localhost:6379/1"
