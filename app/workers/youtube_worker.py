@@ -111,20 +111,39 @@ async def _finish_scrape_run(
         await db.commit()
 
 
-async def _update_comments_count(session_factory, run_id: str, comments_fetched: int, comments_new: int) -> None:
+async def _update_comments_count(
+    session_factory,
+    run_id: str,
+    comments_fetched: int,
+    comments_new: int,
+    error: str | None = None,
+) -> None:
     """Update jumlah komentar di ScrapeRun setelah comment task selesai."""
     from sqlalchemy import update, text
     from app.domain.scrape_runs.models import ScrapeRun
 
+    run_uuid = uuid.UUID(run_id)
     async with session_factory() as db:
         await db.execute(
             update(ScrapeRun)
-            .where(ScrapeRun.id == uuid.UUID(run_id))
+            .where(ScrapeRun.id == run_uuid)
             .values(
                 comments_fetched=ScrapeRun.comments_fetched + comments_fetched,
                 comments_new=ScrapeRun.comments_new + comments_new,
             )
         )
+        if error:
+            await db.execute(
+                text("""
+                    UPDATE scrape_runs
+                    SET error_message = CASE
+                        WHEN error_message IS NULL THEN :err
+                        ELSE error_message || '; ' || :err
+                    END
+                    WHERE id = :run_id
+                """),
+                {"err": error[:500], "run_id": str(run_uuid)},
+            )
         await db.commit()
 
 
@@ -404,15 +423,20 @@ async def _run_comments(
         )
     data = result.model_dump()
 
-    comments_new = data.get("new_comments", data.get("comments_saved", 0)) or 0
-    comments_fetched = data.get("total_fetched", comments_new) or 0
+    comments_new     = data.get("comments_new", 0) or 0
+    comments_fetched = data.get("comments_fetched", 0) or 0
+    comment_errors   = data.get("errors") or []
 
-    logger.info("[Worker/Comments] SELESAI — post_id=%s komentar_baru=%d", post_id, comments_new)
+    logger.info("[Worker/Comments] SELESAI — post_id=%s komentar_baru=%d errors=%s",
+                post_id, comments_new, comment_errors)
 
     # Update hitungan komentar di ScrapeRun parent (jika ada run_id)
     if run_id:
         try:
-            await _update_comments_count(session_factory, run_id, comments_fetched, comments_new)
+            await _update_comments_count(
+                session_factory, run_id, comments_fetched, comments_new,
+                error="; ".join(comment_errors) if comment_errors else None,
+            )
         except Exception as exc:
             logger.warning("[Worker/Comments] Gagal update ScrapeRun comments: %s", exc)
 
