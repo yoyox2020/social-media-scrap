@@ -365,3 +365,122 @@ async def get_instagram_posts(
         },
         "items": items,
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /instagram/trending
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/trending", response_model=dict, summary="Top 5 akun Instagram trending hari ini")
+async def get_instagram_trending(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Ambil top 5 akun Instagram trending beserta post + sentimen komentar.
+
+    Data di-update otomatis setiap hari jam 09:00 WIB via Celery Beat.
+    Jika belum ada data hari ini, jalankan discovery + scoring on-demand.
+    """
+    from sqlalchemy import select as sa_select
+    from app.domain.instagram_trending.models import InstagramTrendingAccount
+
+    accounts = (await db.scalars(
+        sa_select(InstagramTrendingAccount)
+        .where(InstagramTrendingAccount.status == "active")
+        .order_by(InstagramTrendingAccount.rank.asc().nulls_last())
+        .limit(5)
+    )).all()
+
+    if not accounts:
+        return build_success_response({
+            "message": "Belum ada data trending. Task harian berjalan jam 09:00 WIB.",
+            "accounts": [],
+        })
+
+    # Ambil posts + sentimen per akun dari DB
+    result_accounts = []
+    for account in accounts:
+        rows = (await db.execute(text("""
+            SELECT p.id, p.external_id, p.content, p.url, p.published_at,
+                   p.metadata, p.collected_at
+            FROM posts p
+            WHERE p.platform = 'instagram' AND p.author = :username
+            ORDER BY p.published_at DESC NULLS LAST
+            LIMIT 2
+        """), {"username": account.username})).mappings().all()
+
+        post_ids = [str(r["id"]) for r in rows]
+        comments_by_post: dict[str, list] = {pid: [] for pid in post_ids}
+        all_labels: list[str] = []
+
+        if post_ids:
+            ids_sql = ", ".join(f"'{pid}'" for pid in post_ids)
+            cmt_rows = (await db.execute(text(f"""
+                SELECT c.content, c.author, c.post_id::text AS post_id,
+                       la.label AS sentiment, la.score
+                FROM comments c
+                LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+                WHERE c.post_id::text IN ({ids_sql})
+                ORDER BY la.score DESC NULLS LAST
+                LIMIT 25
+            """))).mappings().all()
+
+            for cr in cmt_rows:
+                pid = cr["post_id"]
+                if cr["sentiment"]:
+                    all_labels.append(cr["sentiment"])
+                bucket = comments_by_post.setdefault(pid, [])
+                if len(bucket) < 5:
+                    bucket.append({
+                        "content":   cr["content"],
+                        "author":    cr["author"],
+                        "sentiment": cr["sentiment"],
+                        "score":     round(float(cr["score"]), 3) if cr["score"] is not None else None,
+                    })
+
+        counter = Counter(all_labels)
+        total_analyzed = sum(counter.values())
+
+        posts_out = []
+        for r in rows:
+            pid = str(r["id"])
+            meta = r["metadata"] or {}
+            posts_out.append({
+                "post_id":      r["external_id"],
+                "url":          r["url"] or "",
+                "caption":      (r["content"] or "")[:200],
+                "likes":        meta.get("likes", 0),
+                "comment_count": meta.get("comments", 0),
+                "thumbnail":    meta.get("thumbnail", ""),
+                "published_at": r["published_at"].isoformat() if r["published_at"] else None,
+                "comments":     comments_by_post.get(pid, []),
+            })
+
+        result_accounts.append({
+            "rank":            account.rank,
+            "username":        account.username,
+            "display_name":    account.display_name,
+            "followers":       account.followers,
+            "trending_score":  account.trending_score,
+            "engagement_rate": account.engagement_rate,
+            "virality_score":  account.virality_score,
+            "source":          account.source,
+            "discovered_via":  account.discovered_via,
+            "last_scraped":    account.last_scraped_date.isoformat() if account.last_scraped_date else None,
+            "sentiment": {
+                lbl: {
+                    "count":      counter.get(lbl, 0),
+                    "percentage": round(counter.get(lbl, 0) / total_analyzed * 100, 1) if total_analyzed else 0.0,
+                }
+                for lbl in ["positif", "negatif", "netral"]
+            },
+            "posts": posts_out,
+        })
+
+    return build_success_response({
+        "platform":        "instagram",
+        "total_accounts":  len(result_accounts),
+        "updated_daily":   "09:00 WIB",
+        "accounts":        result_accounts,
+    })
