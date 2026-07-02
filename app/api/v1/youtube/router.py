@@ -655,7 +655,7 @@ async def viral_videos(
         filters.append("p.keyword_id = :keyword_id")
         params["keyword_id"] = str(keyword_id)
     elif q:
-        filters.append("k.keyword ILIKE :q_like")
+        filters.append("(k.keyword ILIKE :q_like OR p.author ILIKE :q_like OR p.content ILIKE :q_like)")
         params["q_like"] = f"%{q.strip()}%"
 
     where_clause = " AND ".join(filters)
@@ -697,7 +697,7 @@ async def viral_videos(
             c_filters.append("p.keyword_id = :keyword_id_c")
             c_params["keyword_id_c"] = str(keyword_id)
         elif q:
-            c_filters.append("k.keyword ILIKE :q_like_c")
+            c_filters.append("(k.keyword ILIKE :q_like_c OR p.author ILIKE :q_like_c)")
             c_params["q_like_c"] = f"%{q.strip()}%"
         c_where = " AND ".join(c_filters)
         comment_rows = (await db.execute(text(f"""
@@ -829,7 +829,7 @@ async def viral_videos_post(
             c_filters.append("p.keyword_id = :keyword_id_c")
             c_params["keyword_id_c"] = str(body.keyword_id)
         elif body.q:
-            c_filters.append("k.keyword ILIKE :q_like_c")
+            c_filters.append("(k.keyword ILIKE :q_like_c OR p.author ILIKE :q_like_c)")
             c_params["q_like_c"] = f"%{body.q.strip()}%"
         if body.date_from:
             c_filters.append("p.published_at >= :date_from_c")
