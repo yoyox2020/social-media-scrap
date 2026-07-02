@@ -1,5 +1,6 @@
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import worker_process_init
 
 # Import semua domain models agar SQLAlchemy mapper bisa resolve relationship
 import app.domain.users.models  # noqa: F401
@@ -90,3 +91,32 @@ celery_app.conf.update(
         },
     },
 )
+
+
+@worker_process_init.connect
+def configure_worker_db(**kwargs):
+    """Reconfigure DB engine with NullPool setelah fork.
+
+    asyncpg connections terikat ke event loop yang menciptakannya.
+    Ketika Celery mem-fork worker, connections dari parent process diwarisi
+    oleh child processes → InterfaceError saat asyncio.run() membuat event loop baru.
+    Solusi: recreate engine dengan NullPool di tiap worker process sehingga
+    setiap asyncio.run() selalu membuat fresh connection tanpa pool lama.
+    """
+    from sqlalchemy.pool import NullPool
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+    import app.infrastructure.database.connection as db_module
+    from app.shared.config import settings
+
+    db_module.engine = create_async_engine(
+        settings.database_url,
+        poolclass=NullPool,
+        echo=settings.app_debug,
+    )
+    db_module.AsyncSessionLocal = async_sessionmaker(
+        bind=db_module.engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autocommit=False,
+        autoflush=False,
+    )
