@@ -1955,12 +1955,6 @@ async def scrape_monitor_public(
             "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
         })
 
-    is_alive = running_count > 0 or (
-        await db.scalar(
-            text("SELECT COUNT(*) FROM scrape_runs WHERE started_at >= NOW() - INTERVAL '2 hours'")
-        ) or 0
-    ) > 0
-
     # ── Celery worker info via inspect ────────────────────────────────────────
     import asyncio
     from app.workers.celery_app import celery_app as _celery
@@ -1996,6 +1990,10 @@ async def scrape_monitor_public(
         workers = await asyncio.get_event_loop().run_in_executor(None, _inspect_workers)
     except Exception:
         workers = []
+
+    # Worker dianggap hidup jika ada node yang menjawab ping Celery.
+    # Jangan pakai scrape_run timestamp — worker idle pun tetap hidup.
+    is_alive = len(workers) > 0
 
     return build_success_response({
         "worker_alive": is_alive,
