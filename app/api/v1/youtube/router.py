@@ -2246,6 +2246,63 @@ async def scrape_monitor_public(
             "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
         })
 
+    # ── Instagram trending stats ──────────────────────────────────────────────
+    ig_posts_total: int = await db.scalar(
+        text("SELECT COUNT(*) FROM posts WHERE platform = 'instagram'")
+    ) or 0
+
+    ig_comments_total: int = await db.scalar(
+        text("""
+            SELECT COUNT(*) FROM comments c
+            JOIN posts p ON c.post_id = p.id
+            WHERE p.platform = 'instagram'
+        """)
+    ) or 0
+
+    ig_scraped_today: int = await db.scalar(
+        text("""
+            SELECT COUNT(DISTINCT author) FROM posts
+            WHERE platform = 'instagram'
+              AND collected_at::date = CURRENT_DATE
+        """)
+    ) or 0
+
+    ig_trending_rows = (await db.execute(text("""
+        SELECT username, rank, trending_score, engagement_rate, virality_score,
+               followers, posts_collected, status, last_scraped_date,
+               discovered_via, source,
+               (scrape_logs->-1) AS last_log
+        FROM instagram_trending_accounts
+        WHERE status = 'active'
+        ORDER BY rank ASC NULLS LAST
+        LIMIT 10
+    """))).mappings().all()
+
+    ig_last_discovery = (await db.scalar(
+        text("""
+            SELECT MAX(((scrape_logs->-1)->>'date')::date)
+            FROM instagram_trending_accounts
+            WHERE scrape_logs != '[]'::jsonb
+        """)
+    ))
+
+    ig_trending_accounts = []
+    for row in ig_trending_rows:
+        last_log = row["last_log"] or {}
+        ig_trending_accounts.append({
+            "rank":           row["rank"],
+            "username":       row["username"],
+            "followers":      row["followers"],
+            "trending_score": float(row["trending_score"] or 0),
+            "engagement_rate": float(row["engagement_rate"] or 0),
+            "virality_score": float(row["virality_score"] or 0),
+            "posts_collected": row["posts_collected"],
+            "last_scraped":   row["last_scraped_date"].isoformat() if row["last_scraped_date"] else None,
+            "discovered_via": row["discovered_via"],
+            "source":         row["source"],
+            "last_scrape_log": last_log,
+        })
+
     # ── Celery worker info via inspect ────────────────────────────────────────
     import asyncio
     from app.workers.celery_app import celery_app as _celery
@@ -2317,6 +2374,20 @@ async def scrape_monitor_public(
             "completed_trackers": int(kt_stats["completed_trackers"] or 0),
             "posts_collected": int(kt_stats["total_posts_collected"] or 0),
             "recent_activity": keyword_recent,
+        },
+        "instagram": {
+            "total_posts":     ig_posts_total,
+            "total_comments":  ig_comments_total,
+            "accounts_scraped_today": ig_scraped_today,
+            "trending": {
+                "total_accounts":  len(ig_trending_accounts),
+                "last_discovery":  ig_last_discovery.isoformat() if ig_last_discovery else None,
+                "schedule":        "09:00 WIB (daily, Celery Beat)",
+                "provider":        "ensembledata",
+                "max_posts_per_account": 2,
+                "max_comments_per_post": 5,
+                "accounts": ig_trending_accounts,
+            },
         },
         "runs_pagination": {
             "page": runs_page,
