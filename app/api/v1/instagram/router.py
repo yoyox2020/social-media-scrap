@@ -6,6 +6,7 @@ GET  /instagram/profile      — profil + recent posts dari username (Instagram 
 GET  /instagram/posts        — scrape + ambil post dari username (manual, tanpa budget cap)
 GET  /instagram/search       — [nonaktif] Apify tidak punya fitur discovery-by-keyword
 GET  /instagram/trending     — topik viral Instagram dari trend_recommendations + hasil scrape
+GET  /instagram/analysis/summary — ringkasan MENYELURUH hasil analisis sentimen (semua akun, bukan cuma trend_recommendations)
 GET  /instagram/comments     — list komentar Instagram (filter username/post/sentimen/tanggal)
 POST /instagram/scrape       — trigger scrape username manual via Celery (tanpa budget cap)
 POST /instagram/trend-scrape/run — trigger manual batch harian trend_recommendations (maks N topik/hari)
@@ -534,6 +535,91 @@ async def get_instagram_trending(
         "updated_daily":   "09:00 WIB",
         "daily_budget":    settings.instagram_trend_daily_budget,
         "topics":          result_topics,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /instagram/analysis/summary — ringkasan MENYELURUH hasil analisis sentimen
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/analysis/summary", response_model=dict,
+            summary="Ringkasan menyeluruh hasil analisis sentimen Instagram (semua akun)")
+async def get_instagram_analysis_summary(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Ringkasan MENYELURUH hasil scrape + analisis sentimen Instagram, lintas SEMUA
+    akun/topik yang pernah discrape — baik dari pipeline `trend_recommendations`
+    maupun scrape manual (`POST /instagram/scrape`). Beda dengan `/trending` yang
+    cuma menampilkan topik dari `trend_recommendations` per tanggal tertentu.
+
+    - `overall`: total post/komentar/sudah dianalisis + breakdown sentimen keseluruhan
+    - `per_account`: breakdown yang sama, dipecah per akun (urut jumlah komentar terbanyak)
+    """
+    overall_row = (await db.execute(text("""
+        SELECT
+            count(DISTINCT p.id) AS total_posts,
+            count(c.id)          AS total_comments,
+            count(la.id)         AS total_analyzed,
+            count(*) FILTER (WHERE la.label = 'positif') AS positif,
+            count(*) FILTER (WHERE la.label = 'negatif') AS negatif,
+            count(*) FILTER (WHERE la.label = 'netral')  AS netral
+        FROM posts p
+        LEFT JOIN comments c ON c.post_id = p.id
+        LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+        WHERE p.platform = 'instagram'
+    """))).mappings().first()
+
+    per_account_rows = (await db.execute(text("""
+        SELECT
+            p.author AS username,
+            count(DISTINCT p.id) AS post_count,
+            count(c.id)          AS comment_count,
+            count(la.id)         AS analyzed_count,
+            count(*) FILTER (WHERE la.label = 'positif') AS positif,
+            count(*) FILTER (WHERE la.label = 'negatif') AS negatif,
+            count(*) FILTER (WHERE la.label = 'netral')  AS netral
+        FROM posts p
+        LEFT JOIN comments c ON c.post_id = p.id
+        LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+        WHERE p.platform = 'instagram'
+        GROUP BY p.author
+        ORDER BY comment_count DESC
+    """))).mappings().all()
+
+    def _pct(count: int, total: int) -> float:
+        return round(count / total * 100, 1) if total else 0.0
+
+    total_comments = overall_row["total_comments"] or 0
+
+    return build_success_response({
+        "overall": {
+            "total_posts":    overall_row["total_posts"],
+            "total_comments": total_comments,
+            "total_analyzed": overall_row["total_analyzed"],
+            "fully_analyzed": overall_row["total_analyzed"] == total_comments,
+            "sentiment": {
+                "positif": {"count": overall_row["positif"], "percentage": _pct(overall_row["positif"], total_comments)},
+                "negatif": {"count": overall_row["negatif"], "percentage": _pct(overall_row["negatif"], total_comments)},
+                "netral":  {"count": overall_row["netral"],  "percentage": _pct(overall_row["netral"], total_comments)},
+            },
+        },
+        "per_account": [
+            {
+                "username":       r["username"],
+                "post_count":     r["post_count"],
+                "comment_count":  r["comment_count"],
+                "analyzed_count": r["analyzed_count"],
+                "fully_analyzed": r["analyzed_count"] == r["comment_count"],
+                "sentiment": {
+                    "positif": r["positif"],
+                    "negatif": r["negatif"],
+                    "netral":  r["netral"],
+                },
+            }
+            for r in per_account_rows
+        ],
     })
 
 
