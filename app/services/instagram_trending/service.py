@@ -78,9 +78,19 @@ async def run_discovery(
             )
         )
 
+        hint_log = {
+            "type":          "discovery_hint",
+            "date":          datetime.now(timezone.utc).date().isoformat(),
+            "likes_hint":    item.get("likes_hint", 0),
+            "comments_hint": item.get("comments_hint", 0),
+            "views_hint":    item.get("views_hint", 0),
+            "discovered_via": item.get("discovered_via"),
+        }
+
         if existing:
             existing.followers      = item.get("followers", existing.followers)
             existing.discovered_via = item.get("discovered_via", existing.discovered_via)
+            existing.scrape_logs    = (existing.scrape_logs or []) + [hint_log]
             results.append(existing)
         else:
             account = InstagramTrendingAccount(
@@ -90,6 +100,7 @@ async def run_discovery(
                 discovered_via=item.get("discovered_via"),
                 followers=item.get("followers", 0),
                 status="active",
+                scrape_logs=[hint_log],
             )
             db.add(account)
             results.append(account)
@@ -126,6 +137,22 @@ async def run_scoring(db: AsyncSession) -> list[InstagramTrendingAccount]:
         """), {"username": account.username})).mappings().all()
 
         posts_meta = [r["metadata"] or {} for r in rows]
+
+        # Bootstrap fallback: gunakan discovery hints jika belum ada post di DB
+        if not posts_meta:
+            hint = next(
+                (log for log in reversed(account.scrape_logs or [])
+                 if log.get("type") == "discovery_hint"),
+                None,
+            )
+            if hint:
+                posts_meta = [{
+                    "likes":    hint.get("likes_hint", 0),
+                    "comments": hint.get("comments_hint", 0),
+                    "views":    hint.get("views_hint", 0),
+                }]
+                logger.debug("run_scoring: %s pakai bootstrap hint (belum ada post di DB)", account.username)
+
         score = calc_score(posts_meta, account.followers)
 
         account.engagement_rate = score.engagement_rate
