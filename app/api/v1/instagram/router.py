@@ -422,10 +422,10 @@ async def search_instagram_posts(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Cari post Instagram berdasarkan keyword di caption, dari data yang SUDAH ADA
-    di database (akun yang sudah pernah discrape). Beda dengan `GET /instagram/search`
-    (dinonaktifkan) yang tujuannya menemukan AKUN BARU — itu butuh fitur discovery
-    yang tidak dimiliki Apify.
+    Cari post Instagram berdasarkan keyword di **caption ATAU username**, dari data
+    yang SUDAH ADA di database (akun yang sudah pernah discrape). Beda dengan
+    `GET /instagram/search` (dinonaktifkan) yang tujuannya menemukan AKUN BARU —
+    itu butuh fitur discovery yang tidak dimiliki Apify.
 
     Default `limit=5` (cukup 5 post teratas) — naikkan lewat query param kalau butuh lebih.
 
@@ -437,7 +437,7 @@ async def search_instagram_posts(
     09:00 WIB) — TIDAK langsung discrape saat itu juga. Cek lagi nanti via endpoint
     ini, `GET /instagram/trending`, atau `GET /instagram/trend-scrape/status`.
     """
-    filters = ["p.platform = 'instagram'", "p.content ILIKE :keyword"]
+    filters = ["p.platform = 'instagram'", "(p.content ILIKE :keyword OR p.author ILIKE :keyword)"]
     params: dict = {"keyword": f"%{q}%", "limit": limit, "offset": offset}
 
     if username:
