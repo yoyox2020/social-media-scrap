@@ -104,6 +104,54 @@ GET /api/v1/trend-recommendations?recommendation_date=2026-07-03&platform=instag
 
 ---
 
+## Biar AI langsung eksekusi API-nya (tool calling), bukan cuma kasih teks
+
+Prompt di section sebelumnya menghasilkan **teks/JSON** yang masih harus
+di-copy-paste manual ke curl oleh manusia. Kalau mau AI **langsung mengeksekusi**
+`POST /trend-recommendations` begitu user ketik prompt (tanpa langkah manual),
+itu butuh **tool calling / function calling** — bukan sekadar prompt teks biasa.
+
+Bedanya:
+| | Prompt biasa (section di atas) | Tool calling (script ini) |
+|---|---|---|
+| Output AI | Teks/JSON yang harus di-copy manual | AI memanggil fungsi, fungsi itu yang eksekusi HTTP request |
+| Butuh apa | Cuma chat biasa (ChatGPT/Claude web) | Akses API developer (Anthropic/OpenAI/Ollama) + kode harness |
+| Siapa yang submit API | Manusia (curl manual) | Program (script) atas perintah AI |
+
+Contoh implementasi: [scripts/ai_trend_submit.py](../scripts/ai_trend_submit.py)
+— mendukung 3 provider:
+
+```bash
+pip install anthropic openai  # sesuai provider yang dipakai
+
+# Claude — punya web search bawaan, bisa cari topik trending beneran
+python scripts/ai_trend_submit.py --provider claude --prompt "cari 10 topik trending soal starbucks hari ini dan submit ke trend-recommendations"
+
+# OpenAI — function calling, tidak ada browsing bawaan di Chat Completions API
+python scripts/ai_trend_submit.py --provider openai --prompt "..."
+
+# Ollama (lokal, mis. qwen3:8b yang sudah dipakai project ini) — function calling,
+# TAPI TIDAK ADA akses internet sama sekali kecuali kamu tambahkan tool search sendiri
+python scripts/ai_trend_submit.py --provider ollama --model qwen3:8b --prompt "..."
+```
+
+**Penting soal Ollama/model lokal:** tidak punya browsing bawaan seperti Claude/OpenAI
+hosted tools — kalau ditanya "trending hari ini", jawabannya cuma dari pengetahuan
+training model (bisa basi), bukan data real-time. Untuk hasil akurat, pakai Claude
+(web search bawaan) atau tambahkan tool search eksternal (SerpAPI/Bing) untuk Ollama.
+
+### Versi Next.js (frontend chat, provider-agnostic)
+
+`scripts/ai_trend_submit.py` di atas adalah script CLI standalone. Kalau mau fitur
+yang sama tapi terpasang di **frontend Next.js** (user ketik prompt di chat box,
+AI otomatis eksekusi submit), pakai referensi di
+[scripts/nextjs-trend-chat/](../scripts/nextjs-trend-chat/) — App Router API route
++ 3 provider (Claude/OpenAI/Ollama) yang semuanya berbagi satu definisi tool
+(`lib/submit-trend-tool.ts`), plus contoh komponen React yang baca progress-nya
+secara live via NDJSON stream. Lihat `README.md` di folder itu untuk cara pasang.
+
+---
+
 ## Contoh pakai lengkap (curl)
 
 ```bash
