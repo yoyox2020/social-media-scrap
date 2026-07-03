@@ -1,14 +1,16 @@
 """
 Instagram API endpoints.
 
-GET  /instagram/profile — profil + recent posts dari username (Instagram internal API)
-GET  /instagram/posts   — scrape + ambil post dari username (maks 10)
+GET  /instagram/profile  — profil + recent posts dari username (Instagram internal API)
+GET  /instagram/posts    — scrape + ambil post dari username (maks 10)
+GET  /instagram/trending — top 5 akun trending hari ini
+GET  /instagram/comments — list komentar Instagram (filter username/post/sentimen/tanggal)
 """
 from __future__ import annotations
 
 import uuid
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -489,4 +491,134 @@ async def get_instagram_trending(
         "total_accounts":  len(result_accounts),
         "updated_daily":   "09:00 WIB",
         "accounts":        result_accounts,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /instagram/comments
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/comments", response_model=dict, summary="List komentar Instagram dengan filter")
+async def list_instagram_comments(
+    username: str | None = Query(default=None, description="Filter per username pemilik post"),
+    post_id: str | None = Query(default=None, description="Instagram post_id (external_id, mis. 3123456789)"),
+    post_uuid: uuid.UUID | None = Query(default=None, description="UUID internal post di DB"),
+    sentiment: str | None = Query(default=None, description="positif | negatif | netral"),
+    date_from: date | None = Query(default=None, description="Filter dari tanggal (created_at)"),
+    date_to: date | None = Query(default=None, description="Filter sampai tanggal (created_at)"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    List komentar Instagram yang sudah di-scrape.
+
+    Setiap komentar terikat ke satu post spesifik melalui `post_id` (FK).
+    Filter tersedia:
+    - `username`  — pemilik post (bukan author komentar)
+    - `post_id`   — Instagram post external_id (pk post dari platform)
+    - `post_uuid` — UUID internal post di DB
+    - `sentiment` — positif | negatif | netral
+    - `date_from` / `date_to` — rentang tanggal scrape komentar
+
+    Response setiap item menyertakan info post induknya (`post_id`, `post_url`, `caption`)
+    sehingga relasi komentar → post selalu jelas.
+    """
+    filters = ["p.platform = 'instagram'"]
+    params: dict = {"limit": limit, "offset": offset}
+
+    if username:
+        filters.append("p.author = :username")
+        params["username"] = username.strip().lstrip("@").lower()
+    if post_uuid:
+        filters.append("c.post_id = :post_uuid")
+        params["post_uuid"] = str(post_uuid)
+    elif post_id:
+        filters.append("p.external_id = :post_ext_id")
+        params["post_ext_id"] = post_id.strip()
+    if sentiment:
+        filters.append("la.label = :sentiment")
+        params["sentiment"] = sentiment
+    if date_from:
+        filters.append("c.created_at >= :date_from")
+        params["date_from"] = datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc)
+    if date_to:
+        filters.append("c.created_at <= :date_to")
+        params["date_to"] = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59, tzinfo=timezone.utc)
+
+    where_clause = " AND ".join(filters)
+    join_type = "JOIN" if sentiment else "LEFT JOIN"
+
+    count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
+    total: int = (await db.scalar(text(f"""
+        SELECT COUNT(*)
+        FROM comments c
+        JOIN posts p ON c.post_id = p.id
+        {join_type} lexicon_analyses la ON la.comment_id = c.id
+        WHERE {where_clause}
+    """), count_params)) or 0
+
+    rows = (await db.execute(text(f"""
+        SELECT
+            c.id,
+            c.external_id          AS comment_id,
+            c.content,
+            c.author               AS comment_author,
+            c.created_at           AS scraped_at,
+            c.metadata,
+            p.id                   AS post_uuid,
+            p.external_id          AS post_id,
+            p.author               AS post_owner,
+            p.content              AS caption,
+            p.url                  AS post_url,
+            p.published_at         AS post_published_at,
+            la.label               AS sentiment,
+            la.score               AS sentiment_score
+        FROM comments c
+        JOIN posts p ON c.post_id = p.id
+        {join_type} lexicon_analyses la ON la.comment_id = c.id
+        WHERE {where_clause}
+        ORDER BY c.created_at DESC
+        OFFSET :offset LIMIT :limit
+    """), params)).mappings().all()
+
+    items = []
+    for r in rows:
+        meta = r["metadata"] or {}
+        items.append({
+            "id":             str(r["id"]),
+            "comment_id":     r["comment_id"],
+            "content":        r["content"],
+            "author":         r["comment_author"],
+            "sentiment":      r["sentiment"],
+            "sentiment_score": round(float(r["sentiment_score"]), 3) if r["sentiment_score"] is not None else None,
+            "like_count":     meta.get("like_count", 0),
+            "child_comment_count": meta.get("child_comment_count", 0),
+            "author_user_id": meta.get("author_user_id"),
+            "scraped_at":     r["scraped_at"].isoformat() if r["scraped_at"] else None,
+            "post": {
+                "post_uuid":    str(r["post_uuid"]),
+                "post_id":      r["post_id"],
+                "post_owner":   r["post_owner"],
+                "caption":      (r["caption"] or "")[:200],
+                "post_url":     r["post_url"] or f"https://www.instagram.com/p/{r['post_id']}/",
+                "published_at": r["post_published_at"].isoformat() if r["post_published_at"] else None,
+            },
+        })
+
+    return build_success_response({
+        "platform": "instagram",
+        "filter": {
+            "username":  username,
+            "post_id":   post_id,
+            "post_uuid": str(post_uuid) if post_uuid else None,
+            "sentiment": sentiment,
+            "date_from": str(date_from) if date_from else None,
+            "date_to":   str(date_to) if date_to else None,
+        },
+        "total":  total,
+        "offset": offset,
+        "limit":  limit,
+        "items":  items,
     })
