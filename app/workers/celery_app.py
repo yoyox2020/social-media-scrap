@@ -77,11 +77,11 @@ celery_app.conf.update(
             "schedule": crontab(minute=30, hour="1,7,13,19"),
             "options": {"queue": "default"},
         },
-        # Instagram: discovery + scoring + auto-scrape top 5 trending setiap hari jam 09:00 WIB
-        "instagram-trending-daily-09:00": {
-            "task": "workers.instagram_trending.daily",
+        # Instagram: scrape topik trend_recommendations (via Apify) setiap hari jam 09:00 WIB
+        # Maks settings.instagram_trend_daily_budget topik/hari, lihat docs/trend-recommendations.md
+        "instagram-trend-recommendation-daily-09:00": {
+            "task": "workers.instagram_trend_recommendation.daily",
             "schedule": crontab(hour=9, minute=0),
-            "kwargs": {"provider": "ensembledata"},
             "options": {"queue": "default"},
         },
         # YouTube: fetch trending Indonesia setiap hari jam 12.00 WIB

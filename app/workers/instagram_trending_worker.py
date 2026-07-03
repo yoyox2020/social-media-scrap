@@ -1,12 +1,11 @@
 """
-Celery tasks untuk Instagram trending discovery + scoring + auto-scrape.
+Celery tasks untuk Instagram — scraping via Apify.
 
 Beat schedule (di celery_app.py):
-  instagram-trending-daily-09:00 → instagram_trending_daily_task
+  instagram-trend-recommendation-daily-09:00 → instagram_trend_recommendation_daily_task
 
 On-demand tasks:
-  workers.instagram_trending.scrape_account — scrape 1 akun trending (by UUID)
-  workers.instagram.scrape_username         — scrape sembarang username (generic)
+  workers.instagram.scrape_username — scrape sembarang username (manual, tanpa budget cap)
 """
 from __future__ import annotations
 
@@ -19,55 +18,35 @@ logger = logging.getLogger(__name__)
 
 
 @celery_app.task(
-    name="workers.instagram_trending.daily",
+    name="workers.instagram_trend_recommendation.daily",
     bind=True,
     max_retries=2,
     default_retry_delay=300,
 )
-def instagram_trending_daily_task(self, provider: str = "ensembledata"):
+def instagram_trend_recommendation_daily_task(self):
     """
-    Task harian: discover → score → scrape top 5 Instagram trending accounts.
+    Task harian: scrape topik Instagram dari `trend_recommendations`.
+
+    Ambil maks `settings.instagram_trend_daily_budget` topik dengan
+    status='pending' (urut score tertinggi) yang punya related_account
+    platform instagram, scrape 1 post + komentar + sentimen per topik via
+    Apify. Verifikasi hasil sebelum tandai status='used' — kalau gagal/0 post,
+    tetap 'pending' untuk dicoba lagi besok (lihat docs/trend-recommendations.md).
     """
     from app.infrastructure.database.connection import AsyncSessionLocal
-    from app.services.instagram_trending.service import run_daily_trending
+    from app.services.instagram_trending.trend_scrape_service import run_daily_trend_scrape
 
     async def _run():
         async with AsyncSessionLocal() as db:
-            result = await run_daily_trending(db, provider_name=provider)
-            return result
+            return await run_daily_trend_scrape(db)
 
     try:
         result = asyncio.run(_run())
-        logger.info("instagram_trending_daily done: %s", result)
+        logger.info("instagram_trend_recommendation_daily done: %s", result)
         return result
     except Exception as exc:
-        logger.error("instagram_trending_daily error: %s", exc)
+        logger.error("instagram_trend_recommendation_daily error: %s", exc)
         raise self.retry(exc=exc)
-
-
-@celery_app.task(name="workers.instagram_trending.scrape_account")
-def instagram_trending_scrape_account_task(account_id: str):
-    """
-    Scrape satu akun trending secara on-demand (by UUID).
-    """
-    import uuid
-    from app.infrastructure.database.connection import AsyncSessionLocal
-    from app.domain.instagram_trending.models import InstagramTrendingAccount
-    from app.services.instagram_trending.service import run_scrape_account
-    from sqlalchemy import select
-
-    async def _run():
-        async with AsyncSessionLocal() as db:
-            account = await db.scalar(
-                select(InstagramTrendingAccount).where(
-                    InstagramTrendingAccount.id == uuid.UUID(account_id)
-                )
-            )
-            if not account:
-                return {"error": f"account {account_id} tidak ditemukan"}
-            return await run_scrape_account(db, account)
-
-    return asyncio.run(_run())
 
 
 @celery_app.task(
@@ -83,7 +62,8 @@ def instagram_scrape_username_task(
     max_comments: int = 5,
 ):
     """
-    Scrape sembarang username Instagram secara async (background).
+    Scrape sembarang username Instagram secara async (background), via Apify.
+    Manual/on-demand — tidak kena budget harian trend_recommendations.
     Simpan posts + comments + lexicon ke DB.
     Bisa dipanggil dari POST /instagram/scrape.
     """

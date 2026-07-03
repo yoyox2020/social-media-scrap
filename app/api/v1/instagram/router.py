@@ -1,10 +1,14 @@
 """
-Instagram API endpoints.
+Instagram API endpoints. Scraping via Apify (pengganti EnsembleData — lihat
+docs/apify-instagram-method.md, docs/trend-recommendations.md).
 
-GET  /instagram/profile  — profil + recent posts dari username (Instagram internal API)
-GET  /instagram/posts    — scrape + ambil post dari username (maks 10)
-GET  /instagram/trending — top 5 akun trending hari ini
-GET  /instagram/comments — list komentar Instagram (filter username/post/sentimen/tanggal)
+GET  /instagram/profile      — profil + recent posts dari username (Instagram internal API, bukan Apify)
+GET  /instagram/posts        — scrape + ambil post dari username (manual, tanpa budget cap)
+GET  /instagram/search       — [nonaktif] Apify tidak punya fitur discovery-by-keyword
+GET  /instagram/trending     — topik viral Instagram dari trend_recommendations + hasil scrape
+GET  /instagram/comments     — list komentar Instagram (filter username/post/sentimen/tanggal)
+POST /instagram/scrape       — trigger scrape username manual via Celery (tanpa budget cap)
+POST /instagram/trend-scrape/run — trigger manual batch harian trend_recommendations (maks N topik/hari)
 """
 from __future__ import annotations
 
@@ -374,297 +378,89 @@ async def get_instagram_posts(
 # GET /instagram/search
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/search", response_model=dict, summary="Cari akun Instagram by keyword + scrape posts dari hasil")
+@router.get("/search", response_model=dict, summary="[Nonaktif] Cari akun Instagram by keyword")
 async def search_instagram_keyword(
     q: str = Query(..., min_length=1, max_length=200, description="Keyword, nama akun, atau topik"),
-    max_accounts: int = Query(default=2, ge=1, le=5, description="Maks akun teratas yang di-scrape postnya (maks 5)"),
-    max_posts: int = Query(default=5, ge=1, le=5, description="Maks post per akun"),
-    max_comments: int = Query(default=5, ge=0, le=5, description="Maks komentar per post"),
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
 ):
     """
-    Cari akun Instagram berdasarkan keyword, lalu scrape posts dari akun teratas yang ditemukan.
+    **Sudah tidak aktif sejak migrasi EnsembleData → Apify.**
 
-    **Flow:**
-    1. Hit EnsembleData `/instagram/search?text=q` → dapat list akun + hashtag
-    2. Ambil maks `max_accounts` akun dari hasil (diurutkan by followers)
-    3. Per akun: scrape posts + komentar + analisis sentimen (sama seperti GET /instagram/posts)
-    4. Return hasil gabungan: akun ditemukan + posts + sentimen global
+    Apify tidak punya fitur cari-akun-by-keyword/hashtag (hanya bisa scrape
+    username yang sudah diketahui) — jadi fitur discovery-by-keyword ini tidak
+    bisa direplikasi. Gunakan `GET /instagram/posts?username=...` kalau sudah
+    tahu username-nya, atau submit topik+akun via `POST /trend-recommendations`
+    supaya diproses otomatis oleh pipeline trend recommendation.
 
-    **Batasan:**
-    - Maks 5 akun per request (hemat EnsembleData token)
-    - Posts per akun: maks 5 (sama dengan endpoint /posts)
-    - Akun yang sudah di-scrape hari ini → diambil dari DB, tidak re-scrape
+    Detail: docs/apify-instagram-method.md, docs/trend-recommendations.md
     """
-    from app.integrations.ensemble_data.client import EnsembleDataClient
-    from app.integrations.instagram.connector import InstagramConnector
-    from app.services.instagram.pipeline_service import scrape_instagram_posts
-    from collections import Counter
-
-    q_clean = q.strip().lstrip("#")
-    errors: list[str] = []
-    accounts_found: list[dict] = []
-
-    # ── Step 1: EnsembleData search ───────────────────────────────────────────
-    try:
-        async with EnsembleDataClient() as client:
-            connector = InstagramConnector(client)
-            raw = await connector.search(text=q_clean)
-    except Exception as exc:
-        errors.append(f"search API: {exc}")
-        raw = {}
-
-    # ── Step 2: Ekstrak akun dari response (handle berbagai format) ───────────
-    raw_data = raw.get("data") or {}
-
-    def _extract_user(u: dict) -> dict | None:
-        uname = (u.get("username") or "").strip().lower()
-        if not uname:
-            return None
-        return {
-            "username":    uname,
-            "full_name":   u.get("full_name", ""),
-            "followers":   int(u.get("follower_count") or u.get("edge_followed_by", {}).get("count", 0) or 0),
-            "is_verified": bool(u.get("is_verified", False)),
-            "profile_pic": u.get("profile_pic_url", ""),
-        }
-
-    if isinstance(raw_data, list):
-        # Format A: [{type:"user", user:{...}}, {type:"hashtag",...}]
-        for item in raw_data:
-            if item.get("type") == "user":
-                parsed = _extract_user(item.get("user") or {})
-                if parsed:
-                    accounts_found.append(parsed)
-    elif isinstance(raw_data, dict):
-        # Format B: {users:[...], hashtags:[...]}  or  {collector:[...]}
-        users_list = raw_data.get("users") or raw_data.get("collector") or []
-        for u in users_list:
-            # collector items sometimes wrap with {user:{...}} or flat
-            user_obj = u.get("user") or u if isinstance(u, dict) else {}
-            parsed = _extract_user(user_obj)
-            if parsed:
-                accounts_found.append(parsed)
-
-    # Urutkan by followers descending, ambil top max_accounts
-    accounts_found.sort(key=lambda x: x["followers"], reverse=True)
-    accounts_to_scrape = accounts_found[:max_accounts]
-
-    # ── Step 3: Scrape posts per akun ─────────────────────────────────────────
-    scrape_summary: list[dict] = []
-    for acc in accounts_to_scrape:
-        uname = acc["username"]
-
-        # Cek apakah sudah di-scrape hari ini
-        scraped_today: bool = await db.scalar(
-            text("""
-                SELECT EXISTS(
-                    SELECT 1 FROM posts
-                    WHERE platform = 'instagram'
-                      AND author = :username
-                      AND collected_at::date = CURRENT_DATE
-                )
-            """),
-            {"username": uname},
-        ) or False
-
-        result: dict = {}
-        if not scraped_today:
-            try:
-                result = await scrape_instagram_posts(
-                    db=db,
-                    username=uname,
-                    max_posts=max_posts,
-                    max_comments=max_comments,
-                    keyword_id=None,
-                )
-                if result.get("errors"):
-                    errors.extend([f"[{uname}] {e}" for e in result["errors"]])
-            except Exception as exc:
-                errors.append(f"scrape [{uname}]: {exc}")
-
-        scrape_summary.append({
-            "username":     uname,
-            "scraped_now":  not scraped_today,
-            "posts_saved":  result.get("posts_saved", 0),
-            "user_info":    result.get("user_info", {}),
-        })
-
-    # ── Step 4: Baca posts + komentar dari DB per akun ────────────────────────
-    all_items: list[dict] = []
-    total_posts = 0
-    total_comments = 0
-    all_labels: list[str] = []
-
-    for summary in scrape_summary:
-        uname = summary["username"]
-        ui = summary.get("user_info") or {}
-
-        rows = (await db.execute(text("""
-            SELECT p.id, p.external_id, p.content, p.author, p.url,
-                   p.published_at, p.collected_at, p.metadata
-            FROM posts p
-            WHERE p.platform = 'instagram' AND p.author = :username
-            ORDER BY p.published_at DESC NULLS LAST
-            LIMIT :limit
-        """), {"username": uname, "limit": max_posts})).mappings().all()
-
-        post_ids = [str(r["id"]) for r in rows]
-        comments_by_post: dict[str, list] = {pid: [] for pid in post_ids}
-        total_per_post: dict[str, int] = {}
-
-        if post_ids:
-            ids_sql = ", ".join(f"'{pid}'" for pid in post_ids)
-            cmt_rows = (await db.execute(text(f"""
-                SELECT c.id, c.external_id, c.content, c.author,
-                       c.post_id::text AS post_id,
-                       la.label AS sentiment, la.score
-                FROM comments c
-                LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
-                WHERE c.post_id::text IN ({ids_sql})
-                ORDER BY c.created_at DESC
-            """))).mappings().all()
-
-            for cr in cmt_rows:
-                pid = cr["post_id"]
-                total_per_post[pid] = total_per_post.get(pid, 0) + 1
-                if cr["sentiment"]:
-                    all_labels.append(cr["sentiment"])
-                bucket = comments_by_post.setdefault(pid, [])
-                if len(bucket) < max_comments:
-                    bucket.append({
-                        "comment_id": cr["external_id"],
-                        "content":    cr["content"],
-                        "author":     cr["author"],
-                        "sentiment":  cr["sentiment"],
-                        "score":      round(float(cr["score"]), 3) if cr["score"] is not None else None,
-                    })
-                total_comments += 1
-
-        account_posts = []
-        for r in rows:
-            pid = str(r["id"])
-            meta = r["metadata"] or {}
-            shortcode = meta.get("shortcode", r["external_id"])
-            cmts = comments_by_post.get(pid, [])
-            labels = [c["sentiment"] for c in cmts if c["sentiment"]]
-            sc = Counter(labels)
-            total_sc = sum(sc.values())
-
-            account_posts.append({
-                "post_id":       r["external_id"],
-                "shortcode":     shortcode,
-                "url":           r["url"] or f"https://www.instagram.com/p/{shortcode}/",
-                "caption":       r["content"] or "",
-                "author":        r["author"],
-                "likes":         meta.get("likes", 0),
-                "comment_count": total_per_post.get(pid, meta.get("comments", 0)),
-                "media_type":    meta.get("media_type", ""),
-                "thumbnail":     meta.get("thumbnail", ""),
-                "published_at":  r["published_at"].isoformat() if r["published_at"] else None,
-                "sentiment_summary": {
-                    lbl: {
-                        "count": sc.get(lbl, 0),
-                        "percentage": round(sc.get(lbl, 0) / total_sc * 100, 1) if total_sc else 0.0,
-                    }
-                    for lbl in ["positif", "negatif", "netral"]
-                },
-                "comments": cmts,
-            })
-            total_posts += 1
-
-        # Cari info followers dari akun_found atau scrape result
-        acc_meta = next((a for a in accounts_found if a["username"] == uname), {})
-        followers = ui.get("followers") or acc_meta.get("followers", 0)
-
-        all_items.append({
-            "username":   uname,
-            "full_name":  ui.get("full_name") or acc_meta.get("full_name", ""),
-            "followers":  followers,
-            "is_verified": ui.get("is_verified") or acc_meta.get("is_verified", False),
-            "scraped_now": summary["scraped_now"],
-            "posts":      account_posts,
-        })
-
-    # ── Sentimen global ───────────────────────────────────────────────────────
-    counter = Counter(all_labels)
-    total_analyzed = sum(counter.values())
-    sentiment_global = {
-        lbl: {
-            "count": counter.get(lbl, 0),
-            "percentage": round(counter.get(lbl, 0) / total_analyzed * 100, 1) if total_analyzed else 0.0,
-        }
-        for lbl in ["positif", "negatif", "netral"]
-    }
-
-    return build_success_response({
-        "platform":         "instagram",
-        "query":            q_clean,
-        "accounts_found":   len(accounts_found),
-        "accounts_list":    accounts_found,
-        "accounts_scraped": len([s for s in scrape_summary if s["scraped_now"]]),
-        "stats": {
-            "total_posts":    total_posts,
-            "total_comments": total_comments,
-            "total_analyzed": total_analyzed,
-            "coverage_pct":   round(total_analyzed / total_comments * 100, 1) if total_comments else 0.0,
-        },
-        "sentiment": {
-            **sentiment_global,
-            "dominant":       counter.most_common(1)[0][0] if counter else "netral",
-            "total_analyzed": total_analyzed,
-        },
-        "items":  all_items,
-        "errors": errors,
-    })
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            "GET /instagram/search dinonaktifkan — Apify (pengganti EnsembleData) "
+            "tidak punya fitur cari-akun-by-keyword/hashtag. Gunakan GET /instagram/posts "
+            "dengan username yang sudah diketahui, atau submit ke POST /trend-recommendations."
+        ),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GET /instagram/trending
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/trending", response_model=dict, summary="Top 5 akun Instagram trending hari ini")
+@router.get("/trending", response_model=dict, summary="Topik trending Instagram dari trend_recommendations")
 async def get_instagram_trending(
+    recommendation_date: date | None = Query(default=None, description="Default: hari ini"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Ambil top 5 akun Instagram trending beserta post + sentimen komentar.
+    Ambil topik viral Instagram (dari `trend_recommendations`, diisi AI eksternal
+    via `POST /trend-recommendations`) beserta post + sentimen komentar hasil scrape.
 
-    Data di-update otomatis setiap hari jam 09:00 WIB via Celery Beat.
-    Jika belum ada data hari ini, jalankan discovery + scoring on-demand.
+    Scraping otomatis berjalan tiap hari jam 09:00 WIB (Celery Beat), maksimal
+    `settings.instagram_trend_daily_budget` topik/hari (urut score tertinggi,
+    lihat docs/trend-recommendations.md). `status='used'` berarti sudah discrape,
+    `status='pending'` berarti masih menunggu giliran.
     """
-    from sqlalchemy import select as sa_select
-    from app.domain.instagram_trending.models import InstagramTrendingAccount
+    from app.domain.trend_recommendations.models import TrendRecommendation
 
-    accounts = (await db.scalars(
-        sa_select(InstagramTrendingAccount)
-        .where(InstagramTrendingAccount.status == "active")
-        .order_by(InstagramTrendingAccount.rank.asc().nulls_last())
-        .limit(5)
+    target_date = recommendation_date or date.today()
+    topics = (await db.scalars(
+        select(TrendRecommendation)
+        .where(TrendRecommendation.recommendation_date == target_date)
+        .order_by(TrendRecommendation.score.desc())
     )).all()
 
-    if not accounts:
+    # Filter topik yang punya related_account di platform instagram
+    ig_topics = []
+    for t in topics:
+        ig_account = next(
+            (a for a in (t.related_accounts or []) if a.get("platform") == "instagram"),
+            None,
+        )
+        if ig_account:
+            ig_topics.append((t, ig_account["username"]))
+
+    if not ig_topics:
         return build_success_response({
-            "platform":       "instagram",
-            "total_accounts": 0,
-            "updated_daily":  "09:00 WIB",
-            "message": "Belum ada data trending. Task harian berjalan jam 09:00 WIB.",
-            "accounts": [],
+            "platform":      "instagram",
+            "date":          target_date.isoformat(),
+            "total_topics":  0,
+            "updated_daily": "09:00 WIB",
+            "message": "Belum ada topik trending Instagram untuk tanggal ini. Submit via POST /trend-recommendations.",
+            "topics": [],
         })
 
-    # Ambil posts + sentimen per akun dari DB
-    result_accounts = []
-    for account in accounts:
+    result_topics = []
+    for topic, username in ig_topics:
         rows = (await db.execute(text("""
-            SELECT p.id, p.external_id, p.content, p.url, p.published_at,
-                   p.metadata, p.collected_at
+            SELECT p.id, p.external_id, p.content, p.url, p.published_at, p.metadata
             FROM posts p
             WHERE p.platform = 'instagram' AND p.author = :username
             ORDER BY p.published_at DESC NULLS LAST
             LIMIT 2
-        """), {"username": account.username})).mappings().all()
+        """), {"username": username})).mappings().all()
 
         post_ids = [str(r["id"]) for r in rows]
         comments_by_post: dict[str, list] = {pid: [] for pid in post_ids}
@@ -710,22 +506,16 @@ async def get_instagram_trending(
                 "caption":      (r["content"] or "")[:200],
                 "likes":        meta.get("likes", 0),
                 "comment_count": meta.get("comments", 0),
-                "thumbnail":    meta.get("thumbnail", ""),
+                "hashtags":     meta.get("hashtags", []),
                 "published_at": r["published_at"].isoformat() if r["published_at"] else None,
                 "comments":     comments_by_post.get(pid, []),
             })
 
-        result_accounts.append({
-            "rank":            account.rank,
-            "username":        account.username,
-            "display_name":    account.display_name,
-            "followers":       account.followers,
-            "trending_score":  account.trending_score,
-            "engagement_rate": account.engagement_rate,
-            "virality_score":  account.virality_score,
-            "source":          account.source,
-            "discovered_via":  account.discovered_via,
-            "last_scraped":    account.last_scraped_date.isoformat() if account.last_scraped_date else None,
+        result_topics.append({
+            "topic":          topic.topic,
+            "score":          topic.score,
+            "status":         topic.status,
+            "instagram_username": username,
             "sentiment": {
                 lbl: {
                     "count":      counter.get(lbl, 0),
@@ -738,9 +528,11 @@ async def get_instagram_trending(
 
     return build_success_response({
         "platform":        "instagram",
-        "total_accounts":  len(result_accounts),
+        "date":            target_date.isoformat(),
+        "total_topics":    len(result_topics),
         "updated_daily":   "09:00 WIB",
-        "accounts":        result_accounts,
+        "daily_budget":    settings.instagram_trend_daily_budget,
+        "topics":          result_topics,
     })
 
 
@@ -927,50 +719,28 @@ async def trigger_instagram_scrape(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# POST /instagram/trending/{username}/scrape  — trigger scrape akun trending
+# POST /instagram/trend-scrape/run — trigger manual batch harian (trend_recommendations)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.post("/trending/{username}/scrape", response_model=dict, status_code=202,
-             summary="Trigger scraping on-demand untuk akun trending terdaftar")
-async def trigger_trending_account_scrape(
-    username: str,
+@router.post("/trend-scrape/run", response_model=dict, status_code=202,
+             summary="Trigger manual batch scrape trend_recommendations (tanpa nunggu jadwal 09:00)")
+async def trigger_trend_scrape_run(
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
 ):
     """
-    Trigger scraping on-demand untuk satu akun yang sudah terdaftar di tabel
-    `instagram_trending_accounts`.
+    Trigger manual proses scraping batch harian Instagram dari `trend_recommendations`
+    (sama seperti yang jalan otomatis jam 09:00 WIB via Celery Beat).
 
-    Berbeda dengan `POST /instagram/scrape` (username sembarang), endpoint ini
-    khusus untuk akun trending — menggunakan `run_scrape_account()` yang juga
-    update `last_scraped_date` dan `posts_collected` di tabel trending.
-
-    Return 404 jika username tidak terdaftar sebagai akun trending aktif.
+    Tetap mengikuti budget `settings.instagram_trend_daily_budget` — topik yang
+    sudah `status='used'` hari ini tidak di-scrape ulang. Gunakan ini untuk
+    testing atau kalau tidak mau menunggu jadwal harian.
     """
-    from app.domain.instagram_trending.models import InstagramTrendingAccount
-    from app.workers.instagram_trending_worker import instagram_trending_scrape_account_task
-    from sqlalchemy import select
+    from app.workers.instagram_trending_worker import instagram_trend_recommendation_daily_task
 
-    clean_username = username.strip().lstrip("@").lower()
-    account = await db.scalar(
-        select(InstagramTrendingAccount).where(
-            InstagramTrendingAccount.username == clean_username,
-            InstagramTrendingAccount.status == "active",
-        )
-    )
-    if not account:
-        raise HTTPException(
-            status_code=404,
-            detail=f"@{clean_username} tidak ditemukan di daftar akun trending aktif.",
-        )
-
-    task = instagram_trending_scrape_account_task.delay(account_id=str(account.id))
+    task = instagram_trend_recommendation_daily_task.delay()
 
     return build_success_response({
-        "status":   "queued",
-        "task_id":  task.id,
-        "username": clean_username,
-        "account_id": str(account.id),
-        "rank":     account.rank,
-        "message":  f"Scraping trending @{clean_username} (rank #{account.rank}) dijadwalkan di background.",
+        "status":  "queued",
+        "task_id": task.id,
+        "message": "Batch scrape trend_recommendations dijadwalkan di background.",
     })

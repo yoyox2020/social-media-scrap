@@ -124,4 +124,7 @@ PLATFORM_ENDPOINTS: dict[str, type] = {
     "snapchat": SnapchatEndpoints,
 }
 
-SUPPORTED_COLLECTION_PLATFORMS = ["tiktok", "youtube", "instagram", "reddit", "threads"]
+SUPPORTED_COLLECTION_PLATFORMS = ["tiktok", "youtube", "reddit", "threads"]
+# Instagram dihapus dari daftar ini — Apify (pengganti EnsembleData) tidak
+# punya fitur cari-by-keyword/hashtag yang dibutuhkan collector generik ini.
+# Lihat docs/trend-recommendations.md untuk alur Instagram yang baru.

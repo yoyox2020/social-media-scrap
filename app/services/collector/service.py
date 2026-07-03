@@ -172,14 +172,12 @@ def _get_connector(platform: str):
     """Kembalikan kelas connector berdasarkan nama platform."""
     from app.integrations.tiktok.connector import TikTokConnector
     from app.integrations.youtube.connector import YouTubeConnector
-    from app.integrations.instagram.connector import InstagramConnector
     from app.integrations.reddit.connector import RedditConnector
     from app.integrations.threads.connector import ThreadsConnector
 
     mapping = {
         "tiktok": TikTokConnector,
         "youtube": YouTubeConnector,
-        "instagram": InstagramConnector,
         "reddit": RedditConnector,
         "threads": ThreadsConnector,
     }
@@ -197,8 +195,6 @@ async def _fetch_page(connector, platform: str, keyword: str, cursor, max_pages:
         # YouTube menggunakan depth (jumlah halaman per call) bukan cursor.
         # Kita set depth=max_pages agar satu call = semua halaman yang diinginkan.
         return await connector.search_by_keyword(keyword, depth=max_pages)
-    elif platform == "instagram":
-        return await connector.search(keyword)
     elif platform == "reddit":
         return await connector.search_by_keyword(keyword, after=cursor)
     elif platform == "threads":

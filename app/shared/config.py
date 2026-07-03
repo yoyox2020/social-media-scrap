@@ -33,6 +33,15 @@ class Settings(BaseSettings):
     ensemble_data_timeout: int = 30
     ensemble_data_max_retries: int = 3
 
+    # Apify (pengganti EnsembleData untuk scraping Instagram)
+    apify_api_token: str = ""
+    apify_actor_id: str = "ycQuEFDDZmgX7BAsL"  # social-media-sentiment-analysis-tool
+
+    # Instagram trend-recommendation scraping (lihat docs/trend-recommendations.md)
+    instagram_trend_daily_budget: int = 3   # maks topik trend_recommendations di-scrape/hari (Apify berbayar)
+    instagram_trend_posts_per_topic: int = 1
+    instagram_trend_comments_per_post: int = 10
+
     # YouTube Data API v3 (fallback saat EnsembleData quota habis)
     youtube_data_api_key: str = ""
 
@@ -49,7 +58,7 @@ class Settings(BaseSettings):
 
     # Collector
     collector_max_pages: int = 5
-    collector_default_platforms: str = "tiktok,youtube,instagram"
+    collector_default_platforms: str = "tiktok,youtube"
 
     # AI Models
     indobert_model_name: str = "mdhugol/indonesia-bert-sentiment-classification"
