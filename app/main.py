@@ -53,6 +53,7 @@ from app.api.v1 import (
     sentiment,
     topic_search,
     topics,
+    trend_recommendations,
     trends,
 )
 # Import semua domain models agar SQLAlchemy mapper bisa resolve relationship
@@ -71,6 +72,7 @@ import app.domain.youtube_analysis.models  # noqa: F401
 import app.domain.search_topics.models  # noqa: F401
 import app.domain.scrape_runs.models  # noqa: F401
 import app.domain.instagram_trending.models  # noqa: F401
+import app.domain.trend_recommendations.models  # noqa: F401
 
 from app.api.v1.youtube.router import router as youtube_router
 from app.api.v1.instagram.router import router as instagram_router
@@ -891,3 +893,4 @@ app.include_router(reports.router, prefix=API_PREFIX)
 app.include_router(youtube_router, prefix=API_PREFIX)
 app.include_router(instagram_router, prefix=API_PREFIX)
 app.include_router(facebook_router, prefix=API_PREFIX)
+app.include_router(trend_recommendations.router, prefix=API_PREFIX)
