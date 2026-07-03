@@ -5,6 +5,7 @@ docs/apify-instagram-method.md, docs/trend-recommendations.md).
 GET  /instagram/profile      — profil + recent posts dari username (Instagram internal API, bukan Apify)
 GET  /instagram/posts        — scrape + ambil post dari username (manual, tanpa budget cap)
 GET  /instagram/search       — [nonaktif] Apify tidak punya fitur discovery-by-keyword
+GET  /instagram/posts/search — cari post by keyword di caption; kalau kosong, trigger AI keyword research
 GET  /instagram/trending     — topik viral Instagram dari trend_recommendations + hasil scrape
 GET  /instagram/analysis/summary — ringkasan MENYELURUH hasil analisis sentimen (semua akun, bukan cuma trend_recommendations)
 GET  /instagram/comments     — list komentar Instagram (filter username/post/sentimen/tanggal)
@@ -404,6 +405,121 @@ async def search_instagram_keyword(
             "dengan username yang sudah diketahui, atau submit ke POST /trend-recommendations."
         ),
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /instagram/posts/search — cari post by keyword; kalau kosong, trigger AI
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/posts/search", response_model=dict,
+            summary="Cari post Instagram by keyword — kalau tidak ada di DB, trigger AI cari topik+akun baru")
+async def search_instagram_posts(
+    q: str = Query(..., min_length=2, max_length=200, description="Keyword yang dicari di caption post"),
+    username: str | None = Query(default=None, description="Filter ke akun tertentu (opsional)"),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Cari post Instagram berdasarkan keyword di caption, dari data yang SUDAH ADA
+    di database (akun yang sudah pernah discrape). Beda dengan `GET /instagram/search`
+    (dinonaktifkan) yang tujuannya menemukan AKUN BARU — itu butuh fitur discovery
+    yang tidak dimiliki Apify.
+
+    **Kalau tidak ketemu apapun** (`total == 0`): otomatis trigger job background
+    (`workers.instagram.ai_keyword_research`) yang memakai Claude (web_search) untuk
+    mencari topik + akun Instagram nyata terkait keyword ini, lalu submit ke
+    `trend_recommendations` (status='pending'). Topik itu MASUK ANTRIAN pipeline
+    scrape Instagram normal (budget harian `instagram_trend_daily_budget`, jadwal
+    09:00 WIB) — TIDAK langsung discrape saat itu juga. Cek lagi nanti via endpoint
+    ini, `GET /instagram/trending`, atau `GET /instagram/trend-scrape/status`.
+    """
+    filters = ["p.platform = 'instagram'", "p.content ILIKE :keyword"]
+    params: dict = {"keyword": f"%{q}%", "limit": limit, "offset": offset}
+
+    if username:
+        filters.append("p.author = :username")
+        params["username"] = username.strip().lstrip("@").lower()
+
+    where_clause = " AND ".join(filters)
+    count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
+
+    total: int = (await db.scalar(
+        text(f"SELECT COUNT(*) FROM posts p WHERE {where_clause}"), count_params
+    )) or 0
+
+    if total == 0:
+        from app.workers.instagram_trending_worker import instagram_ai_keyword_research_task
+        task = instagram_ai_keyword_research_task.delay(q)
+        return build_success_response({
+            "query":            q,
+            "username_filter":  username,
+            "total":            0,
+            "items":            [],
+            "ai_search_triggered": True,
+            "ai_task_id":       task.id,
+            "message": (
+                f"Belum ada post dengan keyword '{q}' di database. Sedang dicarikan "
+                "topik+akun terkait via AI (background) — hasilnya akan masuk antrian "
+                "scrape Instagram normal (budget harian, jadwal 09:00 WIB), bukan "
+                "langsung discrape sekarang. Cek lagi beberapa saat lagi."
+            ),
+        })
+
+    rows = (await db.execute(text(f"""
+        SELECT p.id, p.external_id, p.content, p.author, p.url, p.published_at, p.metadata
+        FROM posts p
+        WHERE {where_clause}
+        ORDER BY p.published_at DESC NULLS LAST
+        OFFSET :offset LIMIT :limit
+    """), params)).mappings().all()
+
+    post_ids = [str(r["id"]) for r in rows]
+    sentiment_by_post: dict[str, Counter] = {}
+    if post_ids:
+        ids_sql = ", ".join(f"'{pid}'" for pid in post_ids)
+        cmt_rows = (await db.execute(text(f"""
+            SELECT c.post_id::text AS post_id, la.label
+            FROM comments c
+            LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+            WHERE c.post_id::text IN ({ids_sql})
+        """))).mappings().all()
+        for cr in cmt_rows:
+            bucket = sentiment_by_post.setdefault(cr["post_id"], Counter())
+            if cr["label"]:
+                bucket[cr["label"]] += 1
+
+    items = []
+    for r in rows:
+        pid = str(r["id"])
+        meta = r["metadata"] or {}
+        counter = sentiment_by_post.get(pid, Counter())
+        items.append({
+            "post_uuid":     pid,
+            "post_id":       r["external_id"],
+            "username":      r["author"],
+            "caption":       r["content"] or "",
+            "url":           r["url"] or f"https://www.instagram.com/p/{r['external_id']}/",
+            "likes":         meta.get("likes", 0),
+            "comment_count": meta.get("comments", 0),
+            "published_at":  r["published_at"].isoformat() if r["published_at"] else None,
+            "sentiment": {
+                "positif": counter.get("positif", 0),
+                "negatif": counter.get("negatif", 0),
+                "netral":  counter.get("netral", 0),
+            } if counter else None,
+        })
+
+    return build_success_response({
+        "query":            q,
+        "username_filter":  username,
+        "total":            total,
+        "offset":           offset,
+        "limit":            limit,
+        "ai_search_triggered": False,
+        "items":            items,
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────

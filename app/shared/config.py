@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     instagram_trend_posts_per_topic: int = 1
     instagram_trend_comments_per_post: int = 10
 
+    # Anthropic (Claude) — AI keyword research fallback saat GET /instagram/posts/search
+    # tidak ketemu di DB (lihat docs/setting-tool-calling.md § keyword search fallback)
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-opus-4-8"
+
     # YouTube Data API v3 (fallback saat EnsembleData quota habis)
     youtube_data_api_key: str = ""
 
