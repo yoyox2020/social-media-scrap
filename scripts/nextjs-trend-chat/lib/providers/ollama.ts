@@ -1,11 +1,13 @@
 /**
  * Provider: Ollama (model lokal, mis. qwen3:8b) — Ollama expose endpoint yang
  * kompatibel dengan OpenAI, jadi dipakai SDK `openai` yang sama, cuma beda
- * base_url. TIDAK ADA akses internet sama sekali — kalau butuh data trending
- * real-time, tambahkan tool search eksternal sendiri di `tools` di bawah.
+ * base_url. Ollama sendiri TIDAK punya akses internet — supaya tetap bisa cari
+ * topik trending nyata, disediakan tool `web_search` (via SerpAPI) yang
+ * dieksekusi oleh kode di sini, bukan oleh Ollama.
  *
  * npm install openai   (dipakai juga untuk provider ini, bukan cuma OpenAI asli)
  * env: OLLAMA_BASE_URL (default http://localhost:11434), OLLAMA_MODEL (default qwen3:8b)
+ *      SERPAPI_API_KEY (untuk tool web_search — signup di https://serpapi.com)
  */
 import OpenAI from "openai";
 import {
@@ -14,15 +16,23 @@ import {
   SUBMIT_TREND_TOOL_PARAMETERS,
   executeSubmitTrendRecommendations,
 } from "../submit-trend-tool";
+import {
+  WEB_SEARCH_TOOL_NAME,
+  WEB_SEARCH_TOOL_DESCRIPTION,
+  WEB_SEARCH_TOOL_PARAMETERS,
+  executeWebSearch,
+} from "../web-search-tool";
 import { encodeEvent } from "../events";
 
 const SYSTEM_PROMPT =
-  "Kamu adalah AI trend-analyst. Kalau user minta submit topik trending, panggil tool " +
-  "submit_trend_recommendations dengan hasilnya. CATATAN: kamu TIDAK punya akses internet — " +
-  "kalau ditanya topik 'trending hari ini', jawab dari pengetahuanmu tapi beri tahu user ini " +
-  "bukan data real-time.";
+  "Kamu adalah AI trend-analyst. Kamu TIDAK punya akses internet bawaan, tapi punya " +
+  "tool web_search yang bisa kamu panggil untuk mencari informasi nyata di internet " +
+  "(dieksekusi oleh sistem, hasilnya dikembalikan ke kamu). Kalau user minta cari/submit " +
+  "topik trending: WAJIB panggil web_search dulu (boleh beberapa kali dengan query " +
+  "berbeda) untuk menemukan topik NYATA, baru panggil submit_trend_recommendations " +
+  "dengan hasilnya. Jangan mengarang topik tanpa hasil pencarian.";
 
-const MAX_ITERATIONS = 8;
+const MAX_ITERATIONS = 10;
 
 export async function runOllama(
   prompt: string,
@@ -33,6 +43,14 @@ export async function runOllama(
   const client = new OpenAI({ baseURL, apiKey: "ollama" }); // apiKey diabaikan Ollama, tapi wajib diisi
 
   const tools: OpenAI.Chat.ChatCompletionTool[] = [
+    {
+      type: "function",
+      function: {
+        name: WEB_SEARCH_TOOL_NAME,
+        description: WEB_SEARCH_TOOL_DESCRIPTION,
+        parameters: WEB_SEARCH_TOOL_PARAMETERS as unknown as Record<string, unknown>,
+      },
+    },
     {
       type: "function",
       function: {
@@ -60,18 +78,34 @@ export async function runOllama(
     }
 
     for (const call of msg.tool_calls) {
-      if (call.type !== "function" || call.function.name !== SUBMIT_TREND_TOOL_NAME) continue;
+      if (call.type !== "function") continue;
 
-      const args = JSON.parse(call.function.arguments);
-      controller.enqueue(
-        encodeEvent({
-          type: "status",
-          message: `Mengirim ${args?.items?.length ?? 0} topik ke trend-recommendations...`,
-        })
-      );
-      const result = await executeSubmitTrendRecommendations(args);
-      controller.enqueue(encodeEvent({ type: "tool_result", tool: SUBMIT_TREND_TOOL_NAME, result }));
-      messages = [...messages, { role: "tool", tool_call_id: call.id, content: JSON.stringify(result) }];
+      if (call.function.name === WEB_SEARCH_TOOL_NAME) {
+        const args = JSON.parse(call.function.arguments);
+        controller.enqueue(encodeEvent({ type: "status", message: `Mencari: "${args.query}"...` }));
+        const results = await executeWebSearch(args.query);
+        messages = [
+          ...messages,
+          { role: "tool", tool_call_id: call.id, content: JSON.stringify(results) },
+        ];
+        continue;
+      }
+
+      if (call.function.name === SUBMIT_TREND_TOOL_NAME) {
+        const args = JSON.parse(call.function.arguments);
+        controller.enqueue(
+          encodeEvent({
+            type: "status",
+            message: `Mengirim ${args?.items?.length ?? 0} topik ke trend-recommendations...`,
+          })
+        );
+        const result = await executeSubmitTrendRecommendations(args);
+        controller.enqueue(encodeEvent({ type: "tool_result", tool: SUBMIT_TREND_TOOL_NAME, result }));
+        messages = [
+          ...messages,
+          { role: "tool", tool_call_id: call.id, content: JSON.stringify(result) },
+        ];
+      }
     }
   }
 

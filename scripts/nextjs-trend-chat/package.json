@@ -1,0 +1,25 @@
+{
+  "name": "nextjs-trend-chat",
+  "version": "1.0.0",
+  "description": "Referensi implementasi \"AI yang benar-benar mengeksekusi HTTP request\", bukan cuma kasih teks — versi Next.js dari `scripts/ai_trend_submit.py`. User ketik prompt terkait pencarian trending di frontend, AI (Claude/OpenAI/Ollama, atau provider lain yang kamu tambahkan) memutuskan kapan panggil tool `submit_trend_recommendations`, dan **route handler ini** (bukan AI-nya) yang benar-benar mengirim `POST /api/v1/trend-recommendations` ke backend social-media-scrap.",
+  "main": "index.js",
+  "directories": {
+    "lib": "lib"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
+    "openai": "^6.45.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "tsx": "^4.23.0",
+    "typescript": "^6.0.3"
+  }
+}

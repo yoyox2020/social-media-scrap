@@ -9,6 +9,7 @@ GET  /instagram/trending     — topik viral Instagram dari trend_recommendation
 GET  /instagram/comments     — list komentar Instagram (filter username/post/sentimen/tanggal)
 POST /instagram/scrape       — trigger scrape username manual via Celery (tanpa budget cap)
 POST /instagram/trend-scrape/run — trigger manual batch harian trend_recommendations (maks N topik/hari)
+GET  /instagram/trend-scrape/status — monitoring pending/used + riwayat scrape_runs
 """
 from __future__ import annotations
 
@@ -743,4 +744,85 @@ async def trigger_trend_scrape_run(
         "status":  "queued",
         "task_id": task.id,
         "message": "Batch scrape trend_recommendations dijadwalkan di background.",
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /instagram/trend-scrape/status — monitoring pipeline trend_recommendations
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/trend-scrape/status", response_model=dict,
+            summary="Monitoring pipeline scrape trend_recommendations (pending/used, riwayat run)")
+async def get_trend_scrape_status(
+    recent_limit: int = Query(default=10, ge=1, le=50, description="Jumlah riwayat scrape_runs terakhir"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Snapshot status pipeline Instagram trend-recommendations, tanpa perlu psql manual:
+
+    - Ringkasan berapa topik `pending` vs `used` yang punya akun Instagram
+      (lintas tanggal, bukan cuma hari ini — supaya kelihatan backlog-nya)
+    - Daftar topik `pending` yang akan diambil giliran berikutnya (urut score)
+    - Riwayat run terakhir dari `scrape_runs` (sukses/gagal, durasi, error)
+
+    Scraping otomatis jalan tiap hari jam 09:00 WIB (Celery Beat), maksimal
+    `settings.instagram_trend_daily_budget` topik/hari. Kalau sebuah topik gagal
+    di-scrape (0 post), statusnya TETAP `pending` dan otomatis dicoba lagi di run
+    berikutnya — tidak perlu campur tangan manual.
+    """
+    from app.domain.scrape_runs.models import ScrapeRun
+    from app.domain.trend_recommendations.models import TrendRecommendation
+
+    all_topics = (await db.scalars(select(TrendRecommendation))).all()
+
+    def _ig_username(t: TrendRecommendation) -> str | None:
+        for acc in t.related_accounts or []:
+            if acc.get("platform") == "instagram" and acc.get("username"):
+                return acc["username"]
+        return None
+
+    ig_topics = [(t, _ig_username(t)) for t in all_topics if _ig_username(t)]
+    pending = [(t, u) for t, u in ig_topics if t.status == "pending"]
+    used = [(t, u) for t, u in ig_topics if t.status == "used"]
+    pending_sorted = sorted(pending, key=lambda tu: tu[0].score, reverse=True)
+
+    runs = (await db.scalars(
+        select(ScrapeRun)
+        .where(ScrapeRun.platform == "instagram")
+        .order_by(ScrapeRun.started_at.desc())
+        .limit(recent_limit)
+    )).all()
+
+    return build_success_response({
+        "daily_budget": settings.instagram_trend_daily_budget,
+        "schedule": "09:00 WIB otomatis (Celery Beat) — trigger manual: POST /instagram/trend-scrape/run",
+        "summary": {
+            "pending_with_instagram_account": len(pending),
+            "used_with_instagram_account":    len(used),
+            "total_with_instagram_account":   len(ig_topics),
+        },
+        "pending_topics": [
+            {
+                "topic":                t.topic,
+                "score":                t.score,
+                "instagram_username":   u,
+                "recommendation_date":  t.recommendation_date.isoformat(),
+            }
+            for t, u in pending_sorted
+        ],
+        "recent_runs": [
+            {
+                "topic":            r.keyword_text,
+                "status":           r.status,
+                "triggered_by":     r.triggered_by,
+                "videos_fetched":   r.videos_fetched,
+                "videos_new":       r.videos_new,
+                "duration_seconds": round(r.duration_seconds, 2) if r.duration_seconds is not None else None,
+                "error_message":    r.error_message,
+                "started_at":       r.started_at.isoformat(),
+                "finished_at":      r.finished_at.isoformat() if r.finished_at else None,
+            }
+            for r in runs
+        ],
     })
