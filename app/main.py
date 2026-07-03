@@ -640,6 +640,9 @@ async function load() {
 
     const ktTbody = document.getElementById('kt-table');
     const ktRows = kt.recent_activity || [];
+    const edExpired = (d.ensemble_data || {}).status === 'expired';
+    const todayStr = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+
     if (ktRows.length === 0) {
       ktTbody.innerHTML = '<tr><td colspan="9" style="color:#475569;font-style:italic;padding:12px">Belum ada keyword tracker — lakukan POST /videos/viral dengan parameter q= untuk memulai</td></tr>';
     } else {
@@ -648,15 +651,47 @@ async function load() {
         const pct = Math.min(100, Math.round(daysDone / 7 * 100));
         const ll = r.last_log || {};
         const hasLog = ll.posts_new !== undefined || ll.error !== undefined;
+        const is493 = (ll.error || '').includes('493') || (ll.error || '').toLowerCase().includes('subscription');
+        const scrapedToday = r.last_scraped_date === todayStr;
         const kondisi = !hasLog ? 'belum' : (ll.error ? 'error' : 'ok');
+
         const statusPill = r.status === 'active'
           ? '<span class="pill pill-active">active</span>'
           : '<span class="pill pill-done">done</span>';
-        const logText = kondisi === 'error'
-          ? `<span class="red" title="${ll.error||''}">${(ll.error||'').substring(0,50)}${(ll.error||'').length>50?'...':''}</span>`
-          : kondisi === 'ok'
-            ? `<span class="green">+${ll.posts_new} baru</span>`
-            : '<span style="color:#475569">-</span>';
+
+        // ── LOG TERAKHIR: cerdas tergantung kondisi ──
+        let logText;
+        if (kondisi === 'error' && is493) {
+          // Error karena EnsembleData expired
+          logText = `<span class="yellow">⏳ EnsembleData expired</span><br>
+                     <span style="color:#475569;font-size:.7rem">Keyword search tidak ada fallback — menunggu renewal</span>`;
+        } else if (kondisi === 'error') {
+          logText = `<span class="red" title="${ll.error||''}">${(ll.error||'').substring(0,50)}${(ll.error||'').length>50?'...':''}</span>`;
+        } else if (kondisi === 'ok' && !scrapedToday && edExpired && r.status === 'active') {
+          // Sukses kemarin, tapi hari ini belum jalan karena API expired
+          logText = `<span class="green">+${ll.posts_new} baru</span>
+                     <span style="color:#475569;font-size:.68rem">(${ll.date||''})</span><br>
+                     <span class="yellow" style="font-size:.72rem">⏳ Hari ini belum scrape — EnsembleData expired, tunggu 12:00 WIB besok</span>`;
+        } else if (kondisi === 'ok' && !scrapedToday && r.status === 'active') {
+          // Sukses sebelumnya, hari ini belum jalan (bukan karena API)
+          logText = `<span class="green">+${ll.posts_new} baru</span>
+                     <span style="color:#475569;font-size:.68rem">(${ll.date||''})</span><br>
+                     <span style="color:#64748b;font-size:.72rem">🕐 Menunggu jadwal 12:00 WIB</span>`;
+        } else if (kondisi === 'ok') {
+          logText = `<span class="green">+${ll.posts_new} baru</span>
+                     <span style="color:#475569;font-size:.68rem">(${ll.date||''})</span>`;
+        } else {
+          logText = edExpired
+            ? `<span class="yellow">⏳ Menunggu EnsembleData aktif</span>`
+            : '<span style="color:#475569">Belum pernah scrape</span>';
+        }
+
+        // ── TGL SCRAPE: tandai merah jika expired dan belum scrape hari ini ──
+        const tglColor = (!scrapedToday && edExpired && r.status === 'active') ? '#fbbf24' : '#94a3b8';
+        const tglScrape = r.last_scraped_date
+          ? `<span style="color:${tglColor};font-size:.75rem">${r.last_scraped_date}</span>`
+          : '<span style="color:#475569">-</span>';
+
         return `<tr class="vt-${kondisi}">
           <td><span class="pill pill-keyword">#</span> <b>${r.search_query}</b><br>
               <span style="color:#475569;font-size:.7rem">${r.tracker_id.substring(0,8)}…</span></td>
@@ -665,10 +700,10 @@ async function load() {
           <td><div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
               <span style="font-size:.7rem;color:#64748b">${pct}%</span></td>
           <td class="${r.posts_collected > 0 ? 'green' : ''}">${r.posts_collected ?? 0}</td>
-          <td style="color:#94a3b8;font-size:.75rem">${r.last_scraped_date || '-'}</td>
+          <td>${tglScrape}</td>
           <td style="color:#475569;font-size:.7rem">${fmt(r.started_at)}</td>
           <td style="color:#475569;font-size:.7rem">${fmt(r.ends_at)}</td>
-          <td style="font-size:.75rem">${logText}</td>
+          <td style="font-size:.75rem;line-height:1.5">${logText}</td>
         </tr>`;
       }).join('');
     }
