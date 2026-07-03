@@ -622,3 +622,105 @@ async def list_instagram_comments(
         "limit":  limit,
         "items":  items,
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /instagram/scrape  — trigger scraping username via Celery (background)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/scrape", response_model=dict, status_code=202,
+             summary="Trigger scraping Instagram username secara background (Celery)")
+async def trigger_instagram_scrape(
+    username: str = Query(..., min_length=1, max_length=100, description="Username Instagram (tanpa @)"),
+    max_posts: int = Query(default=5, ge=1, le=5, description="Maks post per username (1-5)"),
+    max_comments: int = Query(default=5, ge=0, le=5, description="Maks komentar per post (0-5)"),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Trigger scraping Instagram secara async via Celery worker.
+
+    Berbeda dengan `GET /instagram/posts` yang scrape inline (request harus tunggu selesai),
+    endpoint ini langsung return **202 Accepted** dan scraping berjalan di background.
+
+    **Gunakan ini untuk:**
+    - Scrape username baru tanpa memblok response
+    - Trigger ulang scrape username yang sudah ada
+    - Integrasi dengan scheduler / cron eksternal
+
+    **Flow background:**
+    1. Celery worker terima task
+    2. Panggil EnsembleData: user/info → user/posts → post/comments
+    3. Simpan ke DB: posts + comments + lexicon_analyses
+    4. Bisa dipantau via `GET /youtube/monitor-public` (worker status)
+
+    **Cek hasil setelah selesai:**
+    `GET /instagram/posts?username={username}` — ambil dari DB
+    `GET /instagram/comments?username={username}` — list komentar
+    """
+    from app.workers.instagram_trending_worker import instagram_scrape_username_task
+
+    clean_username = username.strip().lstrip("@").lower()
+    task = instagram_scrape_username_task.delay(
+        username=clean_username,
+        max_posts=max_posts,
+        max_comments=max_comments,
+    )
+
+    return build_success_response({
+        "status":       "queued",
+        "task_id":      task.id,
+        "username":     clean_username,
+        "max_posts":    max_posts,
+        "max_comments": max_comments,
+        "message":      f"Scraping @{clean_username} dijadwalkan. Cek hasilnya di GET /instagram/posts?username={clean_username}",
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /instagram/trending/{username}/scrape  — trigger scrape akun trending
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/trending/{username}/scrape", response_model=dict, status_code=202,
+             summary="Trigger scraping on-demand untuk akun trending terdaftar")
+async def trigger_trending_account_scrape(
+    username: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Trigger scraping on-demand untuk satu akun yang sudah terdaftar di tabel
+    `instagram_trending_accounts`.
+
+    Berbeda dengan `POST /instagram/scrape` (username sembarang), endpoint ini
+    khusus untuk akun trending — menggunakan `run_scrape_account()` yang juga
+    update `last_scraped_date` dan `posts_collected` di tabel trending.
+
+    Return 404 jika username tidak terdaftar sebagai akun trending aktif.
+    """
+    from app.domain.instagram_trending.models import InstagramTrendingAccount
+    from app.workers.instagram_trending_worker import instagram_trending_scrape_account_task
+    from sqlalchemy import select
+
+    clean_username = username.strip().lstrip("@").lower()
+    account = await db.scalar(
+        select(InstagramTrendingAccount).where(
+            InstagramTrendingAccount.username == clean_username,
+            InstagramTrendingAccount.status == "active",
+        )
+    )
+    if not account:
+        raise HTTPException(
+            status_code=404,
+            detail=f"@{clean_username} tidak ditemukan di daftar akun trending aktif.",
+        )
+
+    task = instagram_trending_scrape_account_task.delay(account_id=str(account.id))
+
+    return build_success_response({
+        "status":   "queued",
+        "task_id":  task.id,
+        "username": clean_username,
+        "account_id": str(account.id),
+        "rank":     account.rank,
+        "message":  f"Scraping trending @{clean_username} (rank #{account.rank}) dijadwalkan di background.",
+    })
