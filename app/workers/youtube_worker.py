@@ -236,9 +236,9 @@ async def _run_fetch_trending(
 def collect_youtube_pipeline_task(
     self,
     keyword_id: str,
-    max_pages: int = 2,
-    max_comments_per_video: int = 100,
-    max_comment_pages: int = 3,
+    max_pages: int = 1,
+    max_comments_per_video: int = 5,
+    max_comment_pages: int = 1,
     triggered_by: str = "celery_beat",
 ) -> dict:
     """Pipeline per keyword: collect video → dispatch comment tasks."""
@@ -337,14 +337,13 @@ async def _run_youtube_pipeline(
         await fresh_engine.dispose()
         raise
 
-    # ── Dispatch comment tasks ─────────────────────────────────────────────────
-    fetch_limit = max(videos_fetched, 10)
+    # ── Dispatch comment tasks — max 2 video per run untuk hemat token ───────
     async with session_factory() as db:
         result = await db.scalars(
             select(Post)
             .where(Post.keyword_id == kw_uuid, Post.platform == "youtube")
             .order_by(desc(Post.collected_at))
-            .limit(fetch_limit)
+            .limit(2)
         )
         posts = list(result.all())
 

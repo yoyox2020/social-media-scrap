@@ -23,7 +23,7 @@ from app.domain.keywords.models import Keyword
 from app.domain.posts.models import Post
 from app.domain.trending.models import TrendingTopic
 from app.domain.users.models import User
-from app.domain.viral_tracking.models import FlaggedAccount, ViralChannelTracker
+from app.domain.viral_tracking.models import FlaggedAccount, ViralChannelTracker, ViralKeywordTracker
 from app.domain.youtube_analysis.models import LexiconAnalysis
 from app.infrastructure.database.connection import get_db
 from app.services.auth.dependencies import get_current_user
@@ -2246,6 +2246,102 @@ async def scrape_monitor_public(
             "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
         })
 
+    # ── Instagram trending stats ──────────────────────────────────────────────
+    ig_posts_total: int = await db.scalar(
+        text("SELECT COUNT(*) FROM posts WHERE platform = 'instagram'")
+    ) or 0
+
+    ig_comments_total: int = await db.scalar(
+        text("""
+            SELECT COUNT(*) FROM comments c
+            JOIN posts p ON c.post_id = p.id
+            WHERE p.platform = 'instagram'
+        """)
+    ) or 0
+
+    ig_scraped_today: int = await db.scalar(
+        text("""
+            SELECT COUNT(DISTINCT author) FROM posts
+            WHERE platform = 'instagram'
+              AND collected_at::date = CURRENT_DATE
+        """)
+    ) or 0
+
+    ig_trending_rows = (await db.execute(text("""
+        SELECT username, rank, trending_score, engagement_rate, virality_score,
+               followers, posts_collected, status, last_scraped_date,
+               discovered_via, source,
+               (scrape_logs->-1) AS last_log
+        FROM instagram_trending_accounts
+        WHERE status = 'active'
+        ORDER BY rank ASC NULLS LAST
+        LIMIT 10
+    """))).mappings().all()
+
+    ig_last_discovery = (await db.scalar(
+        text("""
+            SELECT MAX(((scrape_logs->-1)->>'date')::date)
+            FROM instagram_trending_accounts
+            WHERE scrape_logs != '[]'::jsonb
+        """)
+    ))
+
+    ig_trending_accounts = []
+    for row in ig_trending_rows:
+        last_log = row["last_log"] or {}
+        ig_trending_accounts.append({
+            "rank":           row["rank"],
+            "username":       row["username"],
+            "followers":      row["followers"],
+            "trending_score": float(row["trending_score"] or 0),
+            "engagement_rate": float(row["engagement_rate"] or 0),
+            "virality_score": float(row["virality_score"] or 0),
+            "posts_collected": row["posts_collected"],
+            "last_scraped":   row["last_scraped_date"].isoformat() if row["last_scraped_date"] else None,
+            "discovered_via": row["discovered_via"],
+            "source":         row["source"],
+            "last_scrape_log": last_log,
+        })
+
+    # ── EnsembleData status (dari error log di DB, tanpa hit API) ────────────
+    ed_last_error_row = (await db.execute(text("""
+        SELECT error_message, started_at
+        FROM scrape_runs
+        WHERE (error_message ILIKE '%493%' OR error_message ILIKE '%subscription expired%'
+               OR error_message ILIKE '%Subscription expired%')
+          AND started_at > NOW() - INTERVAL '48 hours'
+        ORDER BY started_at DESC
+        LIMIT 1
+    """))).mappings().first()
+
+    ed_last_success_row = (await db.execute(text("""
+        SELECT finished_at FROM scrape_runs
+        WHERE status = 'success'
+        ORDER BY finished_at DESC LIMIT 1
+    """))).mappings().first()
+
+    ig_last_err_row = (await db.execute(text("""
+        SELECT updated_at FROM instagram_trending_accounts
+        WHERE scrape_logs::text ILIKE '%493%'
+          AND updated_at > NOW() - INTERVAL '48 hours'
+        ORDER BY updated_at DESC LIMIT 1
+    """))).mappings().first()
+
+    ed_err_at   = ed_last_error_row["started_at"] if ed_last_error_row else None
+    ig_err_at   = ig_last_err_row["updated_at"]   if ig_last_err_row   else None
+    last_err_at = max(filter(None, [ed_err_at, ig_err_at]), default=None)
+    ed_success_at = ed_last_success_row["finished_at"] if ed_last_success_row else None
+
+    if last_err_at:
+        ed_status  = "expired"
+        ed_message = "Subscription expired (HTTP 493) — scraping menunggu renewal"
+    elif ed_success_at:
+        ed_status  = "active"
+        ed_message = "API berjalan normal"
+    else:
+        ed_status  = "unknown"
+        ed_message = "Belum ada data scraping"
+
     # ── Celery worker info via inspect ────────────────────────────────────────
     import asyncio
     from app.workers.celery_app import celery_app as _celery
@@ -2317,6 +2413,28 @@ async def scrape_monitor_public(
             "completed_trackers": int(kt_stats["completed_trackers"] or 0),
             "posts_collected": int(kt_stats["total_posts_collected"] or 0),
             "recent_activity": keyword_recent,
+        },
+        "ensemble_data": {
+            "status":         ed_status,
+            "message":        ed_message,
+            "last_error_at":  last_err_at.isoformat()    if last_err_at    else None,
+            "last_success_at": ed_success_at.isoformat() if ed_success_at  else None,
+            "affects":        ["youtube", "instagram"],
+            "recovery":       "Otomatis pulih saat subscription diperbarui. Celery Beat: Instagram 09:00, YouTube 12:00 WIB.",
+        },
+        "instagram": {
+            "total_posts":     ig_posts_total,
+            "total_comments":  ig_comments_total,
+            "accounts_scraped_today": ig_scraped_today,
+            "trending": {
+                "total_accounts":  len(ig_trending_accounts),
+                "last_discovery":  ig_last_discovery.isoformat() if ig_last_discovery else None,
+                "schedule":        "09:00 WIB (daily, Celery Beat)",
+                "provider":        "ensembledata",
+                "max_posts_per_account": 2,
+                "max_comments_per_post": 5,
+                "accounts": ig_trending_accounts,
+            },
         },
         "runs_pagination": {
             "page": runs_page,
@@ -2881,4 +2999,90 @@ async def trigger_tracker_scrape(
         "channel_name": tracker.channel_name,
         "status": "queued",
         "message": "Scrape channel berjalan di background.",
+    })
+
+
+@router.post("/keyword-tracking/retry-all", response_model=dict, status_code=202, summary="Retry semua keyword tracker yang stuck atau belum scrape hari ini")
+async def retry_all_keyword_trackers(
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Public endpoint — tidak perlu auth, konsisten dengan retry channel tracker.
+    Queue ulang semua keyword tracker aktif yang:
+      (1) belum pernah scrape (last_scraped_date IS NULL), ATAU
+      (2) last day_log punya error, ATAU
+      (3) last_scraped_date bukan hari ini (missed scheduled window)
+    Reset last_scraped_date → NULL sebelum queue agar task tidak skip.
+    """
+    from sqlalchemy import select, update
+    from app.workers.viral_tracking_worker import viral_keyword_daily_scrape_task
+
+    result = await db.execute(
+        select(ViralKeywordTracker.id, ViralKeywordTracker.search_query)
+        .where(
+            ViralKeywordTracker.status == "active",
+            text("""(
+                last_scraped_date IS NULL
+                OR last_scraped_date < CURRENT_DATE
+                OR (
+                    jsonb_array_length(COALESCE(day_logs, '[]'::jsonb)) > 0
+                    AND (day_logs -> (jsonb_array_length(day_logs) - 1) ->> 'error') IS NOT NULL
+                )
+            )"""),
+        )
+    )
+    rows = result.all()
+    tracker_ids = [str(r.id) for r in rows]
+
+    if tracker_ids:
+        await db.execute(
+            update(ViralKeywordTracker)
+            .where(ViralKeywordTracker.id.in_([r.id for r in rows]))
+            .values(last_scraped_date=None)
+        )
+        await db.commit()
+        for tid in tracker_ids:
+            viral_keyword_daily_scrape_task.delay(tid)
+
+    return build_success_response({
+        "retried": len(tracker_ids),
+        "tracker_ids": tracker_ids,
+        "message": f"{len(tracker_ids)} keyword tracker di-queue ulang. Cek monitor dalam 2–5 menit.",
+    })
+
+
+@router.post("/keyword-tracking/{tracker_id}/run", response_model=dict, status_code=202, summary="Paksa jalankan keyword tracker tertentu sekarang")
+async def trigger_keyword_tracker_run(
+    tracker_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Public endpoint — trigger scrape sekarang untuk satu keyword tracker.
+    Reset last_scraped_date → NULL agar task tidak skip jika sudah jalan hari ini dengan error.
+    """
+    from app.workers.viral_tracking_worker import viral_keyword_daily_scrape_task
+
+    tracker = await db.get(ViralKeywordTracker, tracker_id)
+    if not tracker:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError("ViralKeywordTracker", str(tracker_id))
+
+    if tracker.status != "active":
+        return build_success_response({
+            "status": "skipped",
+            "tracker_id": str(tracker_id),
+            "search_query": tracker.search_query,
+            "message": f"Tracker sudah berstatus '{tracker.status}', tidak bisa dijalankan ulang.",
+        })
+
+    tracker.last_scraped_date = None
+    await db.commit()
+
+    task = viral_keyword_daily_scrape_task.delay(str(tracker_id))
+    return build_success_response({
+        "job_id": task.id,
+        "tracker_id": str(tracker_id),
+        "search_query": tracker.search_query,
+        "status": "queued",
+        "message": "Keyword scrape berjalan di background. Cek monitor dalam 2–5 menit.",
     })

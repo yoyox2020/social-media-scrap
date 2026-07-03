@@ -70,9 +70,11 @@ import app.domain.trending.models  # noqa: F401
 import app.domain.youtube_analysis.models  # noqa: F401
 import app.domain.search_topics.models  # noqa: F401
 import app.domain.scrape_runs.models  # noqa: F401
+import app.domain.instagram_trending.models  # noqa: F401
 
 from app.api.v1.youtube.router import router as youtube_router
 from app.api.v1.instagram.router import router as instagram_router
+from app.api.v1.facebook.router import router as facebook_router
 from app.infrastructure.database.connection import engine
 from app.infrastructure.logging.logger import get_logger, setup_logging
 from app.infrastructure.middleware.request_id import RequestIDMiddleware
@@ -310,12 +312,39 @@ async def scraping_status_page():
   .page-btn[disabled] { opacity: 0.35; cursor: default; }
   .page-info { font-size: 0.8rem; color: #64748b; }
   .page-total { font-size: 0.75rem; color: #475569; margin-right: auto; }
+  /* EnsembleData banner */
+  .ed-banner { padding: 10px 16px; border-radius: 8px; margin-bottom: 20px; display: flex; align-items: center; gap: 12px; font-size: 0.85rem; flex-wrap: wrap; }
+  .ed-banner.expired { background: rgba(248,113,113,0.08); border: 1px solid #450a0a; }
+  .ed-banner.active  { background: rgba(74,222,128,0.08);  border: 1px solid #14532d; }
+  .ed-banner.unknown { background: #1e293b; border: 1px solid #334155; }
+  .ed-banner-title { font-weight: 700; }
+  /* Instagram section */
+  .ig-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .ig-card { background: #1e293b; border-radius: 8px; padding: 14px; border-left: 3px solid #e879f9; }
+  .ig-card .label { font-size: 0.72rem; color: #64748b; text-transform: uppercase; margin-bottom: 4px; }
+  .ig-card .value { font-size: 1.5rem; font-weight: 700; color: #e879f9; }
+  .ig-card .sub { font-size: 0.72rem; color: #64748b; margin-top: 2px; }
+  .pill-ig-rank { background: #3b0764; color: #e879f9; }
+  .pill-waiting { background: #451a03; color: #fbbf24; }
 </style>
 </head>
 <body>
 <h1>Scraping Monitor</h1>
 <div class="subtitle">Social Intelligence Platform &mdash; Auto-refresh tiap 15 detik</div>
 <div class="refresh-bar">Terakhir update: <span id="last-update">-</span> &nbsp;|&nbsp; Refresh dalam <span id="countdown">15</span>s</div>
+
+<div id="ed-banner" class="ed-banner unknown">
+  <span class="alive-dot off" id="ed-dot"></span>
+  <div>
+    <span class="ed-banner-title">EnsembleData API &mdash;</span>
+    <span id="ed-status-text" style="margin-left:4px">Memuat...</span>
+    <span id="ed-status-detail" style="color:#64748b;font-size:0.8rem;margin-left:8px"></span>
+  </div>
+  <div style="margin-left:auto;text-align:right;font-size:0.75rem;color:#475569">
+    <div id="ed-last-err">-</div>
+    <div id="ed-last-ok" style="color:#4ade80"></div>
+  </div>
+</div>
 
 <div class="grid">
   <div class="card"><div class="label">Status</div><div class="value" id="worker-status">-</div></div>
@@ -367,6 +396,15 @@ async def scraping_status_page():
   <div class="kt-card"><div class="label">Selesai (Done)</div><div class="value" id="kt-done">-</div></div>
   <div class="kt-card"><div class="label">Post Terkumpul</div><div class="value" id="kt-posts">-</div></div>
 </div>
+<div class="retry-bar">
+  <button class="retry-btn" id="kt-retry-btn" onclick="retryAllKeywordTrackers()">&#9654; Retry Semua Keyword</button>
+  <span class="retry-msg" id="kt-retry-msg"></span>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#64748b"></div>Belum scrape</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f97316"></div>Error</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#4ade80"></div>Sukses</div>
+  </div>
+</div>
 <table>
   <thead>
     <tr>
@@ -379,9 +417,36 @@ async def scraping_status_page():
       <th>Mulai</th>
       <th>Berakhir</th>
       <th>Log Terakhir</th>
+      <th>Aksi</th>
     </tr>
   </thead>
   <tbody id="kt-table"></tbody>
+</table>
+
+<div class="section-title" style="margin-top:24px">Instagram Trending</div>
+<div class="ig-grid">
+  <div class="ig-card"><div class="label">Total Posts</div><div class="value" id="ig-posts">-</div><div class="sub">platform instagram</div></div>
+  <div class="ig-card"><div class="label">Total Komentar</div><div class="value" id="ig-comments">-</div><div class="sub">platform instagram</div></div>
+  <div class="ig-card"><div class="label">Akun Trending</div><div class="value" id="ig-accounts">-</div><div class="sub">terdaftar aktif</div></div>
+  <div class="ig-card"><div class="label">Scrape Hari Ini</div><div class="value" id="ig-today">-</div><div class="sub">akun di-scrape</div></div>
+  <div class="ig-card"><div class="label">Last Discovery</div><div class="value" style="font-size:0.95rem;margin-top:4px" id="ig-discovery">-</div><div class="sub">via EnsembleData</div></div>
+  <div class="ig-card"><div class="label">Jadwal</div><div class="value" style="font-size:0.85rem;margin-top:4px">09:00</div><div class="sub">WIB daily (Beat)</div></div>
+</div>
+<table>
+  <thead>
+    <tr>
+      <th>Rank</th>
+      <th>Username</th>
+      <th>Followers</th>
+      <th>Trending Score</th>
+      <th>Engagement</th>
+      <th>Posts di DB</th>
+      <th>Last Scrape</th>
+      <th>Discovered Via</th>
+      <th>Status Log</th>
+    </tr>
+  </thead>
+  <tbody id="ig-table"></tbody>
 </table>
 
 <div class="section-title" style="margin-top:24px">Riwayat Scraping Keyword</div>
@@ -468,6 +533,52 @@ async function retryFailed() {
     msg.textContent = 'Gagal terhubung ke server.';
   }
   setTimeout(() => { btn.disabled = false; msg.textContent = ''; msg.style.color = '#60a5fa'; }, 8000);
+}
+
+async function retryAllKeywordTrackers() {
+  const btn = document.getElementById('kt-retry-btn');
+  const msg = document.getElementById('kt-retry-msg');
+  btn.disabled = true;
+  msg.textContent = 'Mengirim...';
+  msg.style.color = '#60a5fa';
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/keyword-tracking/retry-all', { method: 'POST' });
+    const json = await r.json();
+    if (r.ok) {
+      const n = json.data?.retried ?? 0;
+      msg.style.color = '#4ade80';
+      msg.textContent = n > 0 ? `${n} tracker di-queue. Refresh dalam 2-5 menit.` : 'Tidak ada tracker yang perlu di-retry.';
+      if (n > 0) setTimeout(load, 4000);
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.detail || 'Error server.';
+    }
+  } catch(e) {
+    msg.style.color = '#f87171';
+    msg.textContent = 'Gagal terhubung ke server.';
+  }
+  setTimeout(() => { btn.disabled = false; msg.textContent = ''; }, 8000);
+}
+
+async function runKeywordTracker(trackerId, btnEl) {
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = '…'; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/keyword-tracking/' + trackerId + '/run', { method: 'POST' });
+    const json = await r.json();
+    if (r.ok) {
+      const sq = json.data?.search_query || trackerId.substring(0,8);
+      const msg = document.getElementById('kt-retry-msg');
+      msg.style.color = '#4ade80';
+      msg.textContent = `"${sq}" di-queue. Refresh dalam 2-5 menit.`;
+      setTimeout(() => { msg.textContent = ''; }, 8000);
+      setTimeout(load, 4000);
+    } else {
+      alert(json.detail || 'Gagal trigger tracker.');
+    }
+  } catch(e) {
+    alert('Gagal terhubung ke server.');
+  }
+  if (btnEl) { btnEl.disabled = false; btnEl.textContent = '▶'; }
 }
 
 function renderWorkers(workers) {
@@ -585,23 +696,63 @@ async function load() {
 
     const ktTbody = document.getElementById('kt-table');
     const ktRows = kt.recent_activity || [];
+    const edExpired = (d.ensemble_data || {}).status === 'expired';
+    const todayStr = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+
     if (ktRows.length === 0) {
-      ktTbody.innerHTML = '<tr><td colspan="9" style="color:#475569;font-style:italic;padding:12px">Belum ada keyword tracker — lakukan POST /videos/viral dengan parameter q= untuk memulai</td></tr>';
+      ktTbody.innerHTML = '<tr><td colspan="10" style="color:#475569;font-style:italic;padding:12px">Belum ada keyword tracker — lakukan POST /videos/viral dengan parameter q= untuk memulai</td></tr>';
     } else {
       ktTbody.innerHTML = ktRows.map(r => {
         const daysDone = r.days_done || 0;
         const pct = Math.min(100, Math.round(daysDone / 7 * 100));
         const ll = r.last_log || {};
         const hasLog = ll.posts_new !== undefined || ll.error !== undefined;
+        const is493 = (ll.error || '').includes('493') || (ll.error || '').toLowerCase().includes('subscription');
+        const scrapedToday = r.last_scraped_date === todayStr;
         const kondisi = !hasLog ? 'belum' : (ll.error ? 'error' : 'ok');
+
         const statusPill = r.status === 'active'
           ? '<span class="pill pill-active">active</span>'
           : '<span class="pill pill-done">done</span>';
-        const logText = kondisi === 'error'
-          ? `<span class="red" title="${ll.error||''}">${(ll.error||'').substring(0,50)}${(ll.error||'').length>50?'...':''}</span>`
-          : kondisi === 'ok'
-            ? `<span class="green">+${ll.posts_new} baru</span>`
-            : '<span style="color:#475569">-</span>';
+
+        // ── LOG TERAKHIR: cerdas tergantung kondisi ──
+        let logText;
+        if (kondisi === 'error' && is493) {
+          // Error karena EnsembleData expired
+          logText = `<span class="yellow">⏳ EnsembleData expired</span><br>
+                     <span style="color:#475569;font-size:.7rem">Keyword search tidak ada fallback — menunggu renewal</span>`;
+        } else if (kondisi === 'error') {
+          logText = `<span class="red" title="${ll.error||''}">${(ll.error||'').substring(0,50)}${(ll.error||'').length>50?'...':''}</span>`;
+        } else if (kondisi === 'ok' && !scrapedToday && edExpired && r.status === 'active') {
+          // Sukses kemarin, tapi hari ini belum jalan karena API expired
+          logText = `<span class="green">+${ll.posts_new} baru</span>
+                     <span style="color:#475569;font-size:.68rem">(${ll.date||''})</span><br>
+                     <span class="yellow" style="font-size:.72rem">⏳ Hari ini belum scrape — EnsembleData expired, tunggu 12:00 WIB besok</span>`;
+        } else if (kondisi === 'ok' && !scrapedToday && r.status === 'active') {
+          // Sukses sebelumnya, hari ini belum jalan (bukan karena API)
+          logText = `<span class="green">+${ll.posts_new} baru</span>
+                     <span style="color:#475569;font-size:.68rem">(${ll.date||''})</span><br>
+                     <span style="color:#64748b;font-size:.72rem">🕐 Menunggu jadwal 12:00 WIB</span>`;
+        } else if (kondisi === 'ok') {
+          logText = `<span class="green">+${ll.posts_new} baru</span>
+                     <span style="color:#475569;font-size:.68rem">(${ll.date||''})</span>`;
+        } else {
+          logText = edExpired
+            ? `<span class="yellow">⏳ Menunggu EnsembleData aktif</span>`
+            : '<span style="color:#475569">Belum pernah scrape</span>';
+        }
+
+        // ── TGL SCRAPE: tandai merah jika expired dan belum scrape hari ini ──
+        const tglColor = (!scrapedToday && edExpired && r.status === 'active') ? '#fbbf24' : '#94a3b8';
+        const tglScrape = r.last_scraped_date
+          ? `<span style="color:${tglColor};font-size:.75rem">${r.last_scraped_date}</span>`
+          : '<span style="color:#475569">-</span>';
+
+        const canRun = r.status === 'active';
+        const runBtn = canRun
+          ? `<button class="retry-btn" style="padding:2px 8px;font-size:.7rem" onclick="runKeywordTracker('${r.tracker_id}', this)">&#9654;</button>`
+          : `<span style="color:#475569;font-size:.7rem">selesai</span>`;
+
         return `<tr class="vt-${kondisi}">
           <td><span class="pill pill-keyword">#</span> <b>${r.search_query}</b><br>
               <span style="color:#475569;font-size:.7rem">${r.tracker_id.substring(0,8)}…</span></td>
@@ -610,10 +761,11 @@ async function load() {
           <td><div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
               <span style="font-size:.7rem;color:#64748b">${pct}%</span></td>
           <td class="${r.posts_collected > 0 ? 'green' : ''}">${r.posts_collected ?? 0}</td>
-          <td style="color:#94a3b8;font-size:.75rem">${r.last_scraped_date || '-'}</td>
+          <td>${tglScrape}</td>
           <td style="color:#475569;font-size:.7rem">${fmt(r.started_at)}</td>
           <td style="color:#475569;font-size:.7rem">${fmt(r.ends_at)}</td>
-          <td style="font-size:.75rem">${logText}</td>
+          <td style="font-size:.75rem;line-height:1.5">${logText}</td>
+          <td style="text-align:center">${runBtn}</td>
         </tr>`;
       }).join('');
     }
@@ -635,6 +787,70 @@ async function load() {
 
     const runsPag = d.runs_pagination || {};
     renderPagination('runs-pagination', runsPage, runsPag.total_pages || 1, runsPag.total || 0, 'navRuns');
+
+    // ── EnsembleData status banner ─────────────────────────────────────────
+    const ed = d.ensemble_data || {};
+    const banner = document.getElementById('ed-banner');
+    const edDot  = document.getElementById('ed-dot');
+    const edText = document.getElementById('ed-status-text');
+    const edDetail = document.getElementById('ed-status-detail');
+    const edLastErr = document.getElementById('ed-last-err');
+    const edLastOk  = document.getElementById('ed-last-ok');
+    banner.className = `ed-banner ${ed.status || 'unknown'}`;
+    if (ed.status === 'active') {
+      edDot.className = 'alive-dot on';
+      edText.innerHTML = '<span class="green">AKTIF</span>';
+      edDetail.textContent = ed.message || '';
+    } else if (ed.status === 'expired') {
+      edDot.className = 'alive-dot off';
+      edText.innerHTML = '<span class="red">EXPIRED / MENUNGGU RENEWAL</span>';
+      edDetail.textContent = 'Semua scraping YouTube & Instagram ditahan sampai subscription diperbarui';
+    } else {
+      edDot.className = 'alive-dot off';
+      edText.innerHTML = '<span style="color:#64748b">UNKNOWN</span>';
+      edDetail.textContent = ed.message || 'Belum ada data scraping';
+    }
+    edLastErr.textContent = ed.last_error_at  ? `Error terakhir: ${fmt(ed.last_error_at)}` : '';
+    edLastOk.textContent  = ed.last_success_at ? `Sukses terakhir: ${fmt(ed.last_success_at)}` : '';
+
+    // ── Instagram trending section ─────────────────────────────────────────
+    const ig = d.instagram || {};
+    const igt = ig.trending || {};
+    document.getElementById('ig-posts').textContent    = (ig.total_posts    || 0).toLocaleString();
+    document.getElementById('ig-comments').textContent = (ig.total_comments || 0).toLocaleString();
+    document.getElementById('ig-accounts').textContent = (igt.total_accounts || 0).toLocaleString();
+    document.getElementById('ig-today').textContent    = (ig.accounts_scraped_today || 0).toLocaleString();
+    document.getElementById('ig-discovery').textContent = igt.last_discovery
+      ? fmt(igt.last_discovery + 'T00:00:00') : (ed.status === 'expired' ? '⏳ Menunggu' : '-');
+
+    const igTbody = document.getElementById('ig-table');
+    const igAccounts = igt.accounts || [];
+    if (igAccounts.length === 0) {
+      igTbody.innerHTML = '<tr><td colspan="9" style="color:#475569;font-style:italic;padding:12px">Belum ada akun trending — discovery berjalan jam 09:00 WIB saat EnsembleData aktif</td></tr>';
+    } else {
+      igTbody.innerHTML = igAccounts.map(acc => {
+        const ll = acc.last_scrape_log || {};
+        const hasErr = ll.errors && ll.errors.length > 0;
+        const logText = hasErr
+          ? `<span class="red" title="${ll.errors[0]||''}">${(ll.errors[0]||'').substring(0,40)}…</span>`
+          : (ll.posts_new !== undefined
+              ? `<span class="green">+${ll.posts_new} post</span>`
+              : '<span style="color:#475569">-</span>');
+        const waiting = ed.status === 'expired'
+          ? '<span class="pill pill-waiting">⏳ waiting</span>' : '';
+        return `<tr>
+          <td><span class="pill pill-ig-rank">#${acc.rank ?? '-'}</span></td>
+          <td><b>@${acc.username}</b>${waiting}</td>
+          <td style="color:#94a3b8">${(acc.followers||0).toLocaleString()}</td>
+          <td class="${(acc.trending_score||0)>5?'green':'yellow'}">${(acc.trending_score||0).toFixed(2)}</td>
+          <td style="color:#94a3b8">${(acc.engagement_rate||0).toFixed(2)}%</td>
+          <td class="${(acc.posts_collected||0)>0?'green':''}">${acc.posts_collected ?? 0}</td>
+          <td style="color:#94a3b8;font-size:.75rem">${acc.last_scraped || '-'}</td>
+          <td style="color:#475569;font-size:.75rem">${acc.discovered_via || '-'}</td>
+          <td style="font-size:.75rem">${logText}</td>
+        </tr>`;
+      }).join('');
+    }
 
     document.getElementById('last-update').textContent = new Date().toLocaleTimeString('id-ID');
     countdown = 15;
@@ -674,3 +890,4 @@ app.include_router(agents.router, prefix=API_PREFIX)
 app.include_router(reports.router, prefix=API_PREFIX)
 app.include_router(youtube_router, prefix=API_PREFIX)
 app.include_router(instagram_router, prefix=API_PREFIX)
+app.include_router(facebook_router, prefix=API_PREFIX)

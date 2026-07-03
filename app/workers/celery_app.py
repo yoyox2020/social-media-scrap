@@ -16,6 +16,7 @@ import app.domain.reports.models  # noqa: F401
 import app.domain.trending.models  # noqa: F401
 import app.domain.youtube_analysis.models  # noqa: F401
 import app.domain.viral_tracking.models  # noqa: F401
+import app.domain.instagram_trending.models  # noqa: F401
 
 from app.shared.config import settings
 
@@ -34,6 +35,7 @@ celery_app = Celery(
         "app.workers.scheduled_tasks",
         "app.workers.youtube_worker",
         "app.workers.viral_tracking_worker",
+        "app.workers.instagram_trending_worker",
     ],
 )
 
@@ -73,6 +75,13 @@ celery_app.conf.update(
         "retry-missing-embeddings-every-6h": {
             "task": "workers.retry_missing_embeddings",
             "schedule": crontab(minute=30, hour="1,7,13,19"),
+            "options": {"queue": "default"},
+        },
+        # Instagram: discovery + scoring + auto-scrape top 5 trending setiap hari jam 09:00 WIB
+        "instagram-trending-daily-09:00": {
+            "task": "workers.instagram_trending.daily",
+            "schedule": crontab(hour=9, minute=0),
+            "kwargs": {"provider": "ensembledata"},
             "options": {"queue": "default"},
         },
         # YouTube: fetch trending Indonesia setiap hari jam 12.00 WIB
