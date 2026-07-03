@@ -312,12 +312,39 @@ async def scraping_status_page():
   .page-btn[disabled] { opacity: 0.35; cursor: default; }
   .page-info { font-size: 0.8rem; color: #64748b; }
   .page-total { font-size: 0.75rem; color: #475569; margin-right: auto; }
+  /* EnsembleData banner */
+  .ed-banner { padding: 10px 16px; border-radius: 8px; margin-bottom: 20px; display: flex; align-items: center; gap: 12px; font-size: 0.85rem; flex-wrap: wrap; }
+  .ed-banner.expired { background: rgba(248,113,113,0.08); border: 1px solid #450a0a; }
+  .ed-banner.active  { background: rgba(74,222,128,0.08);  border: 1px solid #14532d; }
+  .ed-banner.unknown { background: #1e293b; border: 1px solid #334155; }
+  .ed-banner-title { font-weight: 700; }
+  /* Instagram section */
+  .ig-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .ig-card { background: #1e293b; border-radius: 8px; padding: 14px; border-left: 3px solid #e879f9; }
+  .ig-card .label { font-size: 0.72rem; color: #64748b; text-transform: uppercase; margin-bottom: 4px; }
+  .ig-card .value { font-size: 1.5rem; font-weight: 700; color: #e879f9; }
+  .ig-card .sub { font-size: 0.72rem; color: #64748b; margin-top: 2px; }
+  .pill-ig-rank { background: #3b0764; color: #e879f9; }
+  .pill-waiting { background: #451a03; color: #fbbf24; }
 </style>
 </head>
 <body>
 <h1>Scraping Monitor</h1>
 <div class="subtitle">Social Intelligence Platform &mdash; Auto-refresh tiap 15 detik</div>
 <div class="refresh-bar">Terakhir update: <span id="last-update">-</span> &nbsp;|&nbsp; Refresh dalam <span id="countdown">15</span>s</div>
+
+<div id="ed-banner" class="ed-banner unknown">
+  <span class="alive-dot off" id="ed-dot"></span>
+  <div>
+    <span class="ed-banner-title">EnsembleData API &mdash;</span>
+    <span id="ed-status-text" style="margin-left:4px">Memuat...</span>
+    <span id="ed-status-detail" style="color:#64748b;font-size:0.8rem;margin-left:8px"></span>
+  </div>
+  <div style="margin-left:auto;text-align:right;font-size:0.75rem;color:#475569">
+    <div id="ed-last-err">-</div>
+    <div id="ed-last-ok" style="color:#4ade80"></div>
+  </div>
+</div>
 
 <div class="grid">
   <div class="card"><div class="label">Status</div><div class="value" id="worker-status">-</div></div>
@@ -384,6 +411,32 @@ async def scraping_status_page():
     </tr>
   </thead>
   <tbody id="kt-table"></tbody>
+</table>
+
+<div class="section-title" style="margin-top:24px">Instagram Trending</div>
+<div class="ig-grid">
+  <div class="ig-card"><div class="label">Total Posts</div><div class="value" id="ig-posts">-</div><div class="sub">platform instagram</div></div>
+  <div class="ig-card"><div class="label">Total Komentar</div><div class="value" id="ig-comments">-</div><div class="sub">platform instagram</div></div>
+  <div class="ig-card"><div class="label">Akun Trending</div><div class="value" id="ig-accounts">-</div><div class="sub">terdaftar aktif</div></div>
+  <div class="ig-card"><div class="label">Scrape Hari Ini</div><div class="value" id="ig-today">-</div><div class="sub">akun di-scrape</div></div>
+  <div class="ig-card"><div class="label">Last Discovery</div><div class="value" style="font-size:0.95rem;margin-top:4px" id="ig-discovery">-</div><div class="sub">via EnsembleData</div></div>
+  <div class="ig-card"><div class="label">Jadwal</div><div class="value" style="font-size:0.85rem;margin-top:4px">09:00</div><div class="sub">WIB daily (Beat)</div></div>
+</div>
+<table>
+  <thead>
+    <tr>
+      <th>Rank</th>
+      <th>Username</th>
+      <th>Followers</th>
+      <th>Trending Score</th>
+      <th>Engagement</th>
+      <th>Posts di DB</th>
+      <th>Last Scrape</th>
+      <th>Discovered Via</th>
+      <th>Status Log</th>
+    </tr>
+  </thead>
+  <tbody id="ig-table"></tbody>
 </table>
 
 <div class="section-title" style="margin-top:24px">Riwayat Scraping Keyword</div>
@@ -637,6 +690,70 @@ async function load() {
 
     const runsPag = d.runs_pagination || {};
     renderPagination('runs-pagination', runsPage, runsPag.total_pages || 1, runsPag.total || 0, 'navRuns');
+
+    // ── EnsembleData status banner ─────────────────────────────────────────
+    const ed = d.ensemble_data || {};
+    const banner = document.getElementById('ed-banner');
+    const edDot  = document.getElementById('ed-dot');
+    const edText = document.getElementById('ed-status-text');
+    const edDetail = document.getElementById('ed-status-detail');
+    const edLastErr = document.getElementById('ed-last-err');
+    const edLastOk  = document.getElementById('ed-last-ok');
+    banner.className = `ed-banner ${ed.status || 'unknown'}`;
+    if (ed.status === 'active') {
+      edDot.className = 'alive-dot on';
+      edText.innerHTML = '<span class="green">AKTIF</span>';
+      edDetail.textContent = ed.message || '';
+    } else if (ed.status === 'expired') {
+      edDot.className = 'alive-dot off';
+      edText.innerHTML = '<span class="red">EXPIRED / MENUNGGU RENEWAL</span>';
+      edDetail.textContent = 'Semua scraping YouTube & Instagram ditahan sampai subscription diperbarui';
+    } else {
+      edDot.className = 'alive-dot off';
+      edText.innerHTML = '<span style="color:#64748b">UNKNOWN</span>';
+      edDetail.textContent = ed.message || 'Belum ada data scraping';
+    }
+    edLastErr.textContent = ed.last_error_at  ? `Error terakhir: ${fmt(ed.last_error_at)}` : '';
+    edLastOk.textContent  = ed.last_success_at ? `Sukses terakhir: ${fmt(ed.last_success_at)}` : '';
+
+    // ── Instagram trending section ─────────────────────────────────────────
+    const ig = d.instagram || {};
+    const igt = ig.trending || {};
+    document.getElementById('ig-posts').textContent    = (ig.total_posts    || 0).toLocaleString();
+    document.getElementById('ig-comments').textContent = (ig.total_comments || 0).toLocaleString();
+    document.getElementById('ig-accounts').textContent = (igt.total_accounts || 0).toLocaleString();
+    document.getElementById('ig-today').textContent    = (ig.accounts_scraped_today || 0).toLocaleString();
+    document.getElementById('ig-discovery').textContent = igt.last_discovery
+      ? fmt(igt.last_discovery + 'T00:00:00') : (ed.status === 'expired' ? '⏳ Menunggu' : '-');
+
+    const igTbody = document.getElementById('ig-table');
+    const igAccounts = igt.accounts || [];
+    if (igAccounts.length === 0) {
+      igTbody.innerHTML = '<tr><td colspan="9" style="color:#475569;font-style:italic;padding:12px">Belum ada akun trending — discovery berjalan jam 09:00 WIB saat EnsembleData aktif</td></tr>';
+    } else {
+      igTbody.innerHTML = igAccounts.map(acc => {
+        const ll = acc.last_scrape_log || {};
+        const hasErr = ll.errors && ll.errors.length > 0;
+        const logText = hasErr
+          ? `<span class="red" title="${ll.errors[0]||''}">${(ll.errors[0]||'').substring(0,40)}…</span>`
+          : (ll.posts_new !== undefined
+              ? `<span class="green">+${ll.posts_new} post</span>`
+              : '<span style="color:#475569">-</span>');
+        const waiting = ed.status === 'expired'
+          ? '<span class="pill pill-waiting">⏳ waiting</span>' : '';
+        return `<tr>
+          <td><span class="pill pill-ig-rank">#${acc.rank ?? '-'}</span></td>
+          <td><b>@${acc.username}</b>${waiting}</td>
+          <td style="color:#94a3b8">${(acc.followers||0).toLocaleString()}</td>
+          <td class="${(acc.trending_score||0)>5?'green':'yellow'}">${(acc.trending_score||0).toFixed(2)}</td>
+          <td style="color:#94a3b8">${(acc.engagement_rate||0).toFixed(2)}%</td>
+          <td class="${(acc.posts_collected||0)>0?'green':''}">${acc.posts_collected ?? 0}</td>
+          <td style="color:#94a3b8;font-size:.75rem">${acc.last_scraped || '-'}</td>
+          <td style="color:#475569;font-size:.75rem">${acc.discovered_via || '-'}</td>
+          <td style="font-size:.75rem">${logText}</td>
+        </tr>`;
+      }).join('');
+    }
 
     document.getElementById('last-update').textContent = new Date().toLocaleTimeString('id-ID');
     countdown = 15;

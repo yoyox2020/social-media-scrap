@@ -2303,6 +2303,45 @@ async def scrape_monitor_public(
             "last_scrape_log": last_log,
         })
 
+    # ── EnsembleData status (dari error log di DB, tanpa hit API) ────────────
+    ed_last_error_row = (await db.execute(text("""
+        SELECT error_message, started_at
+        FROM scrape_runs
+        WHERE (error_message ILIKE '%493%' OR error_message ILIKE '%subscription expired%'
+               OR error_message ILIKE '%Subscription expired%')
+          AND started_at > NOW() - INTERVAL '48 hours'
+        ORDER BY started_at DESC
+        LIMIT 1
+    """))).mappings().first()
+
+    ed_last_success_row = (await db.execute(text("""
+        SELECT finished_at FROM scrape_runs
+        WHERE status = 'success'
+        ORDER BY finished_at DESC LIMIT 1
+    """))).mappings().first()
+
+    ig_last_err_row = (await db.execute(text("""
+        SELECT updated_at FROM instagram_trending_accounts
+        WHERE scrape_logs::text ILIKE '%493%'
+          AND updated_at > NOW() - INTERVAL '48 hours'
+        ORDER BY updated_at DESC LIMIT 1
+    """))).mappings().first()
+
+    ed_err_at   = ed_last_error_row["started_at"] if ed_last_error_row else None
+    ig_err_at   = ig_last_err_row["updated_at"]   if ig_last_err_row   else None
+    last_err_at = max(filter(None, [ed_err_at, ig_err_at]), default=None)
+    ed_success_at = ed_last_success_row["finished_at"] if ed_last_success_row else None
+
+    if last_err_at:
+        ed_status  = "expired"
+        ed_message = "Subscription expired (HTTP 493) — scraping menunggu renewal"
+    elif ed_success_at:
+        ed_status  = "active"
+        ed_message = "API berjalan normal"
+    else:
+        ed_status  = "unknown"
+        ed_message = "Belum ada data scraping"
+
     # ── Celery worker info via inspect ────────────────────────────────────────
     import asyncio
     from app.workers.celery_app import celery_app as _celery
@@ -2374,6 +2413,14 @@ async def scrape_monitor_public(
             "completed_trackers": int(kt_stats["completed_trackers"] or 0),
             "posts_collected": int(kt_stats["total_posts_collected"] or 0),
             "recent_activity": keyword_recent,
+        },
+        "ensemble_data": {
+            "status":         ed_status,
+            "message":        ed_message,
+            "last_error_at":  last_err_at.isoformat()    if last_err_at    else None,
+            "last_success_at": ed_success_at.isoformat() if ed_success_at  else None,
+            "affects":        ["youtube", "instagram"],
+            "recovery":       "Otomatis pulih saat subscription diperbarui. Celery Beat: Instagram 09:00, YouTube 12:00 WIB.",
         },
         "instagram": {
             "total_posts":     ig_posts_total,
