@@ -144,6 +144,79 @@ ORDER BY score DESC;
 
 ---
 
+## Contoh Prompt untuk AI Eksternal
+
+Prompt ini bisa dipakai untuk AI eksternal (LLM dengan web search/browsing, atau
+agent lain) supaya cari 20 topik trending lintas media sosial lalu langsung
+submit ke API ini. Sesuaikan `{TANGGAL}`, `{NEGARA}`, dan base URL sebelum dipakai.
+
+```
+Kamu adalah AI trend-analyst. Tugasmu: cari MAKSIMAL 20 topik/isu yang sedang
+viral hari ini ({TANGGAL}) di media sosial {NEGARA} (Twitter/X, Instagram,
+TikTok, Facebook), lalu submit hasilnya ke API berikut.
+
+ATURAN PENTING:
+1. Hanya submit topik yang BENAR-BENAR kamu temukan lewat pencarian nyata
+   (web search/browsing) — JANGAN mengarang topik atau akun yang tidak
+   terverifikasi. Kalau cuma menemukan 5 topik nyata, submit 5 saja, jangan
+   dipaksa sampai 20.
+2. Untuk setiap topik, cari akun resmi/paling relevan yang mendorong
+   virality-nya di tiap platform (bukan sekadar akun pertama yang muncul di
+   pencarian) — sertakan platform + username-nya di `related_accounts`.
+   Kalau tidak ketemu akun untuk suatu platform, lewati saja (tidak wajib
+   semua platform terisi per topik).
+3. `score` (0.0-1.0) mencerminkan seberapa viral topik itu menurutmu,
+   berdasarkan sinyal yang kamu temukan (disebut di banyak sumber berita,
+   volume percakapan, dll) — bukan angka acak.
+4. Jangan duplikasi topik yang sama dengan penamaan berbeda (mis. "Piala
+   Dunia" dan "World Cup 2026" — pilih salah satu).
+
+FORMAT OUTPUT — kirim sebagai body JSON ke:
+POST {BASE_URL}/api/v1/trend-recommendations
+Content-Type: application/json
+(tidak perlu token/API key — endpoint ini publik)
+
+{
+  "source": "nama_ai_atau_sistemmu",
+  "recommendation_date": "{TANGGAL, format YYYY-MM-DD}",
+  "items": [
+    {
+      "topic": "nama topik/isu",
+      "score": 0.0-1.0,
+      "related_accounts": [
+        {"platform": "twitter", "username": "..."},
+        {"platform": "instagram", "username": "..."}
+      ]
+    }
+  ]
+}
+
+Setelah submit, response akan berisi {"created":[...], "updated":[...],
+"evicted":[...], "rejected":[...]} — cek apakah semua topikmu masuk kategori
+"created" atau "updated". Kalau ada yang "rejected", berarti hari itu sudah
+penuh 20 slot dan skor topikmu lebih rendah dari yang sudah tersimpan.
+```
+
+**Contoh konkret** (dipakai saat uji coba 2026-07-03, lihat riwayat di bawah):
+
+```bash
+curl -X POST http://187.77.125.10:8000/api/v1/trend-recommendations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source": "websearch_manual_2026-07-03",
+    "items": [
+      {"topic": "Bahlil Lahadalia", "score": 0.9, "related_accounts": [
+        {"platform": "instagram", "username": "bahlillahadalia"},
+        {"platform": "twitter", "username": "bahlillahadalia"},
+        {"platform": "facebook", "username": "BahlilLahadaliaOfficial"},
+        {"platform": "tiktok", "username": "bahlil.lahadalia"}
+      ]}
+    ]
+  }'
+```
+
+---
+
 ## Riwayat uji coba
 
 **2026-07-03** — Uji coba pertama pakai 5 topik viral nyata hasil web search
