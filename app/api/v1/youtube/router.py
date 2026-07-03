@@ -23,7 +23,7 @@ from app.domain.keywords.models import Keyword
 from app.domain.posts.models import Post
 from app.domain.trending.models import TrendingTopic
 from app.domain.users.models import User
-from app.domain.viral_tracking.models import FlaggedAccount, ViralChannelTracker
+from app.domain.viral_tracking.models import FlaggedAccount, ViralChannelTracker, ViralKeywordTracker
 from app.domain.youtube_analysis.models import LexiconAnalysis
 from app.infrastructure.database.connection import get_db
 from app.services.auth.dependencies import get_current_user
@@ -3016,9 +3016,6 @@ async def retry_all_keyword_trackers(
     """
     from sqlalchemy import select, update
     from app.workers.viral_tracking_worker import viral_keyword_daily_scrape_task
-    from datetime import date
-
-    today = date.today()
 
     result = await db.execute(
         select(ViralKeywordTracker.id, ViralKeywordTracker.search_query)
