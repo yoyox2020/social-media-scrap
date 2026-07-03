@@ -266,7 +266,7 @@ async def get_instagram_posts(
     if post_ids and max_comments > 0:
         ids_sql = ", ".join(f"'{pid}'" for pid in post_ids)
         cmt_rows = (await db.execute(text(f"""
-            SELECT c.id, c.content, c.author, c.post_id::text AS post_id,
+            SELECT c.id, c.external_id, c.content, c.author, c.post_id::text AS post_id,
                    la.label AS sentiment, la.score
             FROM comments c
             LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
@@ -282,11 +282,12 @@ async def get_instagram_posts(
             bucket = comments_by_post.setdefault(pid, [])
             if len(bucket) < max_comments:
                 bucket.append({
-                    "id":        str(cr["id"]),
-                    "content":   cr["content"],
-                    "author":    cr["author"],
-                    "sentiment": cr["sentiment"],
-                    "score":     round(float(cr["score"]), 3) if cr["score"] is not None else None,
+                    "id":         str(cr["id"]),
+                    "comment_id": cr["external_id"],
+                    "content":    cr["content"],
+                    "author":     cr["author"],
+                    "sentiment":  cr["sentiment"],
+                    "score":      round(float(cr["score"]), 3) if cr["score"] is not None else None,
                 })
 
     # ── Build items ───────────────────────────────────────────────────────────
@@ -420,7 +421,7 @@ async def get_instagram_trending(
         if post_ids:
             ids_sql = ", ".join(f"'{pid}'" for pid in post_ids)
             cmt_rows = (await db.execute(text(f"""
-                SELECT c.content, c.author, c.post_id::text AS post_id,
+                SELECT c.id, c.external_id, c.content, c.author, c.post_id::text AS post_id,
                        la.label AS sentiment, la.score
                 FROM comments c
                 LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
@@ -436,10 +437,12 @@ async def get_instagram_trending(
                 bucket = comments_by_post.setdefault(pid, [])
                 if len(bucket) < 5:
                     bucket.append({
-                        "content":   cr["content"],
-                        "author":    cr["author"],
-                        "sentiment": cr["sentiment"],
-                        "score":     round(float(cr["score"]), 3) if cr["score"] is not None else None,
+                        "id":         str(cr["id"]),
+                        "comment_id": cr["external_id"],
+                        "content":    cr["content"],
+                        "author":     cr["author"],
+                        "sentiment":  cr["sentiment"],
+                        "score":      round(float(cr["score"]), 3) if cr["score"] is not None else None,
                     })
 
         counter = Counter(all_labels)
