@@ -3000,3 +3000,92 @@ async def trigger_tracker_scrape(
         "status": "queued",
         "message": "Scrape channel berjalan di background.",
     })
+
+
+@router.post("/keyword-tracking/retry-all", response_model=dict, status_code=202, summary="Retry semua keyword tracker yang stuck atau belum scrape hari ini")
+async def retry_all_keyword_trackers(
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Public endpoint — tidak perlu auth, konsisten dengan retry channel tracker.
+    Queue ulang semua keyword tracker aktif yang:
+      (1) belum pernah scrape (last_scraped_date IS NULL), ATAU
+      (2) last day_log punya error, ATAU
+      (3) last_scraped_date bukan hari ini (missed scheduled window)
+    Reset last_scraped_date → NULL sebelum queue agar task tidak skip.
+    """
+    from sqlalchemy import select, update
+    from app.workers.viral_tracking_worker import viral_keyword_daily_scrape_task
+    from datetime import date
+
+    today = date.today()
+
+    result = await db.execute(
+        select(ViralKeywordTracker.id, ViralKeywordTracker.search_query)
+        .where(
+            ViralKeywordTracker.status == "active",
+            text("""(
+                last_scraped_date IS NULL
+                OR last_scraped_date < CURRENT_DATE
+                OR (
+                    jsonb_array_length(COALESCE(day_logs, '[]'::jsonb)) > 0
+                    AND (day_logs -> (jsonb_array_length(day_logs) - 1) ->> 'error') IS NOT NULL
+                )
+            )"""),
+        )
+    )
+    rows = result.all()
+    tracker_ids = [str(r.id) for r in rows]
+
+    if tracker_ids:
+        await db.execute(
+            update(ViralKeywordTracker)
+            .where(ViralKeywordTracker.id.in_([r.id for r in rows]))
+            .values(last_scraped_date=None)
+        )
+        await db.commit()
+        for tid in tracker_ids:
+            viral_keyword_daily_scrape_task.delay(tid)
+
+    return build_success_response({
+        "retried": len(tracker_ids),
+        "tracker_ids": tracker_ids,
+        "message": f"{len(tracker_ids)} keyword tracker di-queue ulang. Cek monitor dalam 2–5 menit.",
+    })
+
+
+@router.post("/keyword-tracking/{tracker_id}/run", response_model=dict, status_code=202, summary="Paksa jalankan keyword tracker tertentu sekarang")
+async def trigger_keyword_tracker_run(
+    tracker_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Public endpoint — trigger scrape sekarang untuk satu keyword tracker.
+    Reset last_scraped_date → NULL agar task tidak skip jika sudah jalan hari ini dengan error.
+    """
+    from app.workers.viral_tracking_worker import viral_keyword_daily_scrape_task
+
+    tracker = await db.get(ViralKeywordTracker, tracker_id)
+    if not tracker:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError("ViralKeywordTracker", str(tracker_id))
+
+    if tracker.status != "active":
+        return build_success_response({
+            "status": "skipped",
+            "tracker_id": str(tracker_id),
+            "search_query": tracker.search_query,
+            "message": f"Tracker sudah berstatus '{tracker.status}', tidak bisa dijalankan ulang.",
+        })
+
+    tracker.last_scraped_date = None
+    await db.commit()
+
+    task = viral_keyword_daily_scrape_task.delay(str(tracker_id))
+    return build_success_response({
+        "job_id": task.id,
+        "tracker_id": str(tracker_id),
+        "search_query": tracker.search_query,
+        "status": "queued",
+        "message": "Keyword scrape berjalan di background. Cek monitor dalam 2–5 menit.",
+    })

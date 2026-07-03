@@ -396,6 +396,15 @@ async def scraping_status_page():
   <div class="kt-card"><div class="label">Selesai (Done)</div><div class="value" id="kt-done">-</div></div>
   <div class="kt-card"><div class="label">Post Terkumpul</div><div class="value" id="kt-posts">-</div></div>
 </div>
+<div class="retry-bar">
+  <button class="retry-btn" id="kt-retry-btn" onclick="retryAllKeywordTrackers()">&#9654; Retry Semua Keyword</button>
+  <span class="retry-msg" id="kt-retry-msg"></span>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#64748b"></div>Belum scrape</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f97316"></div>Error</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#4ade80"></div>Sukses</div>
+  </div>
+</div>
 <table>
   <thead>
     <tr>
@@ -408,6 +417,7 @@ async def scraping_status_page():
       <th>Mulai</th>
       <th>Berakhir</th>
       <th>Log Terakhir</th>
+      <th>Aksi</th>
     </tr>
   </thead>
   <tbody id="kt-table"></tbody>
@@ -523,6 +533,52 @@ async function retryFailed() {
     msg.textContent = 'Gagal terhubung ke server.';
   }
   setTimeout(() => { btn.disabled = false; msg.textContent = ''; msg.style.color = '#60a5fa'; }, 8000);
+}
+
+async function retryAllKeywordTrackers() {
+  const btn = document.getElementById('kt-retry-btn');
+  const msg = document.getElementById('kt-retry-msg');
+  btn.disabled = true;
+  msg.textContent = 'Mengirim...';
+  msg.style.color = '#60a5fa';
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/keyword-tracking/retry-all', { method: 'POST' });
+    const json = await r.json();
+    if (r.ok) {
+      const n = json.data?.retried ?? 0;
+      msg.style.color = '#4ade80';
+      msg.textContent = n > 0 ? `${n} tracker di-queue. Refresh dalam 2-5 menit.` : 'Tidak ada tracker yang perlu di-retry.';
+      if (n > 0) setTimeout(load, 4000);
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.detail || 'Error server.';
+    }
+  } catch(e) {
+    msg.style.color = '#f87171';
+    msg.textContent = 'Gagal terhubung ke server.';
+  }
+  setTimeout(() => { btn.disabled = false; msg.textContent = ''; }, 8000);
+}
+
+async function runKeywordTracker(trackerId, btnEl) {
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = '…'; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/keyword-tracking/' + trackerId + '/run', { method: 'POST' });
+    const json = await r.json();
+    if (r.ok) {
+      const sq = json.data?.search_query || trackerId.substring(0,8);
+      const msg = document.getElementById('kt-retry-msg');
+      msg.style.color = '#4ade80';
+      msg.textContent = `"${sq}" di-queue. Refresh dalam 2-5 menit.`;
+      setTimeout(() => { msg.textContent = ''; }, 8000);
+      setTimeout(load, 4000);
+    } else {
+      alert(json.detail || 'Gagal trigger tracker.');
+    }
+  } catch(e) {
+    alert('Gagal terhubung ke server.');
+  }
+  if (btnEl) { btnEl.disabled = false; btnEl.textContent = '▶'; }
 }
 
 function renderWorkers(workers) {
@@ -644,7 +700,7 @@ async function load() {
     const todayStr = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
 
     if (ktRows.length === 0) {
-      ktTbody.innerHTML = '<tr><td colspan="9" style="color:#475569;font-style:italic;padding:12px">Belum ada keyword tracker — lakukan POST /videos/viral dengan parameter q= untuk memulai</td></tr>';
+      ktTbody.innerHTML = '<tr><td colspan="10" style="color:#475569;font-style:italic;padding:12px">Belum ada keyword tracker — lakukan POST /videos/viral dengan parameter q= untuk memulai</td></tr>';
     } else {
       ktTbody.innerHTML = ktRows.map(r => {
         const daysDone = r.days_done || 0;
@@ -692,6 +748,11 @@ async function load() {
           ? `<span style="color:${tglColor};font-size:.75rem">${r.last_scraped_date}</span>`
           : '<span style="color:#475569">-</span>';
 
+        const canRun = r.status === 'active';
+        const runBtn = canRun
+          ? `<button class="retry-btn" style="padding:2px 8px;font-size:.7rem" onclick="runKeywordTracker('${r.tracker_id}', this)">&#9654;</button>`
+          : `<span style="color:#475569;font-size:.7rem">selesai</span>`;
+
         return `<tr class="vt-${kondisi}">
           <td><span class="pill pill-keyword">#</span> <b>${r.search_query}</b><br>
               <span style="color:#475569;font-size:.7rem">${r.tracker_id.substring(0,8)}…</span></td>
@@ -704,6 +765,7 @@ async function load() {
           <td style="color:#475569;font-size:.7rem">${fmt(r.started_at)}</td>
           <td style="color:#475569;font-size:.7rem">${fmt(r.ends_at)}</td>
           <td style="font-size:.75rem;line-height:1.5">${logText}</td>
+          <td style="text-align:center">${runBtn}</td>
         </tr>`;
       }).join('');
     }
