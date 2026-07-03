@@ -416,7 +416,7 @@ async def search_instagram_keyword(
 async def search_instagram_posts(
     q: str = Query(..., min_length=2, max_length=200, description="Keyword yang dicari di caption post"),
     username: str | None = Query(default=None, description="Filter ke akun tertentu (opsional)"),
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=5, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -426,6 +426,8 @@ async def search_instagram_posts(
     di database (akun yang sudah pernah discrape). Beda dengan `GET /instagram/search`
     (dinonaktifkan) yang tujuannya menemukan AKUN BARU — itu butuh fitur discovery
     yang tidak dimiliki Apify.
+
+    Default `limit=5` (cukup 5 post teratas) — naikkan lewat query param kalau butuh lebih.
 
     **Kalau tidak ketemu apapun** (`total == 0`): otomatis trigger job background
     (`workers.instagram.ai_keyword_research`) yang memakai Claude (web_search) untuk
