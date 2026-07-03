@@ -184,17 +184,14 @@ Content-Type: application/json
       "topic": "nama topik/isu",
       "score": 0.0-1.0,
       "related_accounts": [
-        {"platform": "twitter", "username": "..."},
-        {"platform": "instagram", "username": "..."}
+        {"platform": "instagram", "username": "..."},
+        {"platform": "facebook", "username": "..."},
+        {"platform": "tiktok", "username": "..."}
       ]
     }
   ]
 }
 
-Setelah submit, response akan berisi {"created":[...], "updated":[...],
-"evicted":[...], "rejected":[...]} — cek apakah semua topikmu masuk kategori
-"created" atau "updated". Kalau ada yang "rejected", berarti hari itu sudah
-penuh 20 slot dan skor topikmu lebih rendah dari yang sudah tersimpan.
 ```
 
 **Contoh konkret** (dipakai saat uji coba 2026-07-03, lihat riwayat di bawah):
