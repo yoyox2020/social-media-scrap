@@ -178,7 +178,7 @@ async def get_instagram_posts(
     - `sentiment` : distribusi global positif/negatif/netral
     """
     MAX_POSTS_PER_DAY = 5
-    username = username.strip().lstrip("@")
+    username = username.strip().lstrip("@").lower()
 
     # ── Cek apakah sudah di-scrape hari ini ──────────────────────────────────
     scraped_today: bool = await db.scalar(
@@ -250,7 +250,7 @@ async def get_instagram_posts(
                 await scrape_instagram_posts(
                     db=db,
                     username=username,
-                    max_posts=max_posts,
+                    max_posts=MAX_POSTS_PER_DAY,
                     max_comments=max_comments,
                     keyword_id=None,
                 )
@@ -394,6 +394,9 @@ async def get_instagram_trending(
 
     if not accounts:
         return build_success_response({
+            "platform":       "instagram",
+            "total_accounts": 0,
+            "updated_daily":  "09:00 WIB",
             "message": "Belum ada data trending. Task harian berjalan jam 09:00 WIB.",
             "accounts": [],
         })
