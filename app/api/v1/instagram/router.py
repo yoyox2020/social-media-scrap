@@ -479,30 +479,45 @@ async def search_instagram_posts(
         # bisa lebih lambat dari topik baru masuk, jadi TIDAK ada batas waktu di sini.
         already_queued = next((t for t in overlaps if t.status == "pending"), None)
 
+        def _ig_username_of(topic) -> str | None:
+            for acc in topic.related_accounts or []:
+                if acc.get("platform") == "instagram" and acc.get("username"):
+                    return acc["username"]
+            return None
+
         if already_scraped:
+            overlap_username = _ig_username_of(already_scraped)
             return build_success_response({
                 "query": q, "username_filter": username, "total": 0, "items": [],
                 "ai_search_triggered": False,
                 "already_scraped": True,
                 "overlapping_topic": already_scraped.topic,
+                "overlapping_username": overlap_username,
                 "message": (
-                    f"Topik yang mirip ('{already_scraped.topic}') sudah pernah discrape "
-                    "sebelumnya (status=used). Caption post-nya mungkin tidak memuat kata "
-                    f"'{q}' persis — coba cari by username, atau cek GET /instagram/trending."
+                    f"Topik yang mirip ('{already_scraped.topic}'"
+                    + (f", akun @{overlap_username}" if overlap_username else "")
+                    + ") sudah pernah discrape sebelumnya (status=used). Caption post-nya "
+                    f"mungkin tidak memuat kata '{q}' persis — coba cari by username "
+                    f"({'username=' + overlap_username if overlap_username else 'lihat overlapping_username'}), "
+                    "atau cek GET /instagram/trending."
                 ),
             })
 
         if already_queued:
+            overlap_username = _ig_username_of(already_queued)
             age_hours = round((datetime.now(timezone.utc) - already_queued.created_at).total_seconds() / 3600, 1)
             return build_success_response({
                 "query": q, "username_filter": username, "total": 0, "items": [],
                 "ai_search_triggered": False,
                 "already_queued": True,
                 "overlapping_topic": already_queued.topic,
+                "overlapping_username": overlap_username,
                 "message": (
-                    f"Topik yang mirip ('{already_queued.topic}') sudah dalam antrian AI "
-                    f"research sejak {age_hours} jam lalu (belum di-scrape). Tidak trigger "
-                    "AI baru — tunggu giliran pipeline scrape normal (budget harian, jadwal 09:00 WIB)."
+                    f"Topik yang mirip ('{already_queued.topic}'"
+                    + (f", akun @{overlap_username}" if overlap_username else "")
+                    + f") sudah dalam antrian AI research sejak {age_hours} jam lalu "
+                    "(belum di-scrape). Tidak trigger AI baru — tunggu giliran pipeline "
+                    "scrape normal (budget harian, jadwal 09:00 WIB)."
                 ),
             })
 
