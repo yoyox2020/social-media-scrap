@@ -451,6 +451,41 @@ async def scraping_status_page():
   <tbody id="ig-table"></tbody>
 </table>
 
+<div class="section-title" style="margin-top:24px">Instagram Trend-Scrape (trend_recommendations)</div>
+<div class="ig-grid">
+  <div class="ig-card"><div class="label">Pending</div><div class="value" id="its-pending">-</div><div class="sub">nunggu giliran scrape</div></div>
+  <div class="ig-card"><div class="label">Sudah Discrape</div><div class="value" id="its-used">-</div><div class="sub">status=used</div></div>
+  <div class="ig-card"><div class="label">Dari AI Search</div><div class="value" id="its-ai-pending">-</div><div class="sub">trigger keyword miss</div></div>
+  <div class="ig-card"><div class="label">Budget Harian</div><div class="value" id="its-budget">-</div><div class="sub">topik/hari (Apify)</div></div>
+</div>
+<table>
+  <thead>
+    <tr>
+      <th>Topik</th>
+      <th>Score</th>
+      <th>Akun IG</th>
+      <th>Sumber</th>
+      <th>Dibuat</th>
+    </tr>
+  </thead>
+  <tbody id="its-pending-table"></tbody>
+</table>
+
+<div class="section-title" style="margin-top:24px">Riwayat Scrape Instagram (trend_recommendations)</div>
+<table>
+  <thead>
+    <tr>
+      <th>Topik</th>
+      <th>Status</th>
+      <th>Post Baru</th>
+      <th>Durasi</th>
+      <th>Waktu Mulai</th>
+      <th>Error</th>
+    </tr>
+  </thead>
+  <tbody id="its-runs-table"></tbody>
+</table>
+
 <div class="section-title" style="margin-top:24px">Riwayat Scraping Keyword</div>
 <table>
   <thead>
@@ -850,6 +885,46 @@ async function load() {
           <td style="color:#94a3b8;font-size:.75rem">${acc.last_scraped || '-'}</td>
           <td style="color:#475569;font-size:.75rem">${acc.discovered_via || '-'}</td>
           <td style="font-size:.75rem">${logText}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    // ── Instagram trend-scrape (trend_recommendations + AI keyword search) ──
+    const its = d.instagram_trend_scrape || {};
+    const itsSummary = its.summary || {};
+    document.getElementById('its-pending').textContent    = itsSummary.pending_with_instagram_account || 0;
+    document.getElementById('its-used').textContent       = itsSummary.used_with_instagram_account || 0;
+    document.getElementById('its-ai-pending').textContent = itsSummary.ai_keyword_search_pending || 0;
+    document.getElementById('its-budget').textContent     = its.daily_budget ?? '-';
+
+    const itsPendingTbody = document.getElementById('its-pending-table');
+    const itsPending = its.pending_topics || [];
+    if (itsPending.length === 0) {
+      itsPendingTbody.innerHTML = '<tr><td colspan="5" style="color:#475569;font-style:italic;padding:12px">Tidak ada topik pending</td></tr>';
+    } else {
+      itsPendingTbody.innerHTML = itsPending.map(t => `<tr>
+        <td>${t.topic}</td>
+        <td>${(t.score||0).toFixed(2)}</td>
+        <td>@${t.instagram_username || '-'}</td>
+        <td>${t.is_ai_keyword_search ? '<span class="pill pill-waiting">AI Search</span>' : '<span style="color:#64748b;font-size:.72rem">manual</span>'}</td>
+        <td style="color:#94a3b8;font-size:.75rem">${fmt(t.created_at)}</td>
+      </tr>`).join('');
+    }
+
+    const itsRunsTbody = document.getElementById('its-runs-table');
+    const itsRuns = its.recent_runs || [];
+    if (itsRuns.length === 0) {
+      itsRunsTbody.innerHTML = '<tr><td colspan="6" style="color:#475569;font-style:italic;padding:12px">Belum ada riwayat scrape</td></tr>';
+    } else {
+      itsRunsTbody.innerHTML = itsRuns.map(r => {
+        const pillClass = r.status === 'success' ? 'pill-success' : (r.status === 'failed' ? 'pill-failed' : 'pill-running');
+        return `<tr>
+          <td>${r.topic}</td>
+          <td><span class="pill ${pillClass}">${r.status}</span></td>
+          <td class="${(r.videos_new||0)>0?'green':''}">${r.videos_new ?? 0}</td>
+          <td style="color:#94a3b8">${r.duration_seconds ?? '-'}s</td>
+          <td style="color:#94a3b8;font-size:.75rem">${fmt(r.started_at)}</td>
+          <td class="error-text" title="${r.error_message||''}">${r.error_message || '-'}</td>
         </tr>`;
       }).join('');
     }
