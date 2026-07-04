@@ -16,7 +16,7 @@ Alur harian (lihat docs/trend-recommendations.md):
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,12 +27,84 @@ from app.shared.config import settings
 
 logger = logging.getLogger(__name__)
 
+AI_DEDUPE_WINDOW_HOURS = 24
+
 
 def _instagram_username(topic: TrendRecommendation) -> str | None:
     for acc in topic.related_accounts or []:
         if acc.get("platform") == "instagram" and acc.get("username"):
             return acc["username"]
     return None
+
+
+async def find_overlapping_topics(db: AsyncSession, keyword: str) -> list[TrendRecommendation]:
+    """
+    Cari topik `trend_recommendations` yang teksnya tumpang tindih dengan `keyword`
+    (ILIKE substring, lintas status/tanggal) — dipakai untuk cek duplikat sebelum
+    trigger AI keyword research baru (lihat docs/setting-tool-calling.md).
+    """
+    return list((await db.scalars(
+        select(TrendRecommendation)
+        .where(TrendRecommendation.topic.ilike(f"%{keyword}%"))
+        .order_by(TrendRecommendation.created_at.desc())
+    )).all())
+
+
+async def get_trend_scrape_summary(db: AsyncSession, recent_limit: int = 10) -> dict:
+    """
+    Ringkasan pipeline scrape Instagram dari `trend_recommendations` — dipakai
+    baik oleh endpoint ber-auth `GET /instagram/trend-scrape/status` maupun
+    endpoint publik `GET /youtube/monitor-public` (dashboard `/scraping-status`).
+    """
+    all_topics = (await db.scalars(select(TrendRecommendation))).all()
+    ig_topics = [(t, _instagram_username(t)) for t in all_topics if _instagram_username(t)]
+    pending = [(t, u) for t, u in ig_topics if t.status == "pending"]
+    used = [(t, u) for t, u in ig_topics if t.status == "used"]
+    pending_sorted = sorted(pending, key=lambda tu: tu[0].score, reverse=True)
+
+    runs = (await db.scalars(
+        select(ScrapeRun)
+        .where(ScrapeRun.platform == "instagram")
+        .order_by(ScrapeRun.started_at.desc())
+        .limit(recent_limit)
+    )).all()
+
+    return {
+        "daily_budget": settings.instagram_trend_daily_budget,
+        "schedule": "09:00 WIB otomatis (Celery Beat) — trigger manual: POST /instagram/trend-scrape/run",
+        "summary": {
+            "pending_with_instagram_account": len(pending),
+            "used_with_instagram_account":    len(used),
+            "total_with_instagram_account":   len(ig_topics),
+            "ai_keyword_search_pending":      sum(1 for t, _ in pending if t.source == "ai_keyword_search"),
+        },
+        "pending_topics": [
+            {
+                "topic":               t.topic,
+                "score":               t.score,
+                "instagram_username":  u,
+                "source":              t.source,
+                "is_ai_keyword_search": t.source == "ai_keyword_search",
+                "recommendation_date": t.recommendation_date.isoformat(),
+                "created_at":          t.created_at.isoformat(),
+            }
+            for t, u in pending_sorted
+        ],
+        "recent_runs": [
+            {
+                "topic":            r.keyword_text,
+                "status":           r.status,
+                "triggered_by":     r.triggered_by,
+                "videos_fetched":   r.videos_fetched,
+                "videos_new":       r.videos_new,
+                "duration_seconds": round(r.duration_seconds, 2) if r.duration_seconds is not None else None,
+                "error_message":    r.error_message,
+                "started_at":       r.started_at.isoformat(),
+                "finished_at":      r.finished_at.isoformat() if r.finished_at else None,
+            }
+            for r in runs
+        ],
+    }
 
 
 async def run_daily_trend_scrape(db: AsyncSession) -> dict:

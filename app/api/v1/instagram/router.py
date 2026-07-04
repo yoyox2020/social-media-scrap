@@ -5,7 +5,7 @@ docs/apify-instagram-method.md, docs/trend-recommendations.md).
 GET  /instagram/profile      — profil + recent posts dari username (Instagram internal API, bukan Apify)
 GET  /instagram/posts        — scrape + ambil post dari username (manual, tanpa budget cap)
 GET  /instagram/search       — [nonaktif] Apify tidak punya fitur discovery-by-keyword
-GET  /instagram/posts/search — cari post by keyword di caption; kalau kosong, trigger AI keyword research
+GET  /instagram/posts/search — cari post by keyword (+date range); dedup/overlap check sebelum trigger AI keyword research
 GET  /instagram/trending     — topik viral Instagram dari trend_recommendations + hasil scrape
 GET  /instagram/analysis/summary — ringkasan MENYELURUH hasil analisis sentimen (semua akun, bukan cuma trend_recommendations)
 GET  /instagram/comments     — list komentar Instagram (filter username/post/sentimen/tanggal)
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import uuid
 from collections import Counter
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -416,6 +416,8 @@ async def search_instagram_keyword(
 async def search_instagram_posts(
     q: str = Query(..., min_length=2, max_length=200, description="Keyword yang dicari di caption post"),
     username: str | None = Query(default=None, description="Filter ke akun tertentu (opsional)"),
+    date_from: date | None = Query(default=None, description="Filter dari tanggal (published_at)"),
+    date_to: date | None = Query(default=None, description="Filter sampai tanggal (published_at)"),
     limit: int = Query(default=5, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     current_user: User = Depends(get_current_user),
@@ -428,14 +430,23 @@ async def search_instagram_posts(
     itu butuh fitur discovery yang tidak dimiliki Apify.
 
     Default `limit=5` (cukup 5 post teratas) — naikkan lewat query param kalau butuh lebih.
+    Filter `date_from`/`date_to` opsional, berdasarkan tanggal post (`published_at`).
 
-    **Kalau tidak ketemu apapun** (`total == 0`): otomatis trigger job background
-    (`workers.instagram.ai_keyword_research`) yang memakai Claude (web_search) untuk
-    mencari topik + akun Instagram nyata terkait keyword ini, lalu submit ke
-    `trend_recommendations` (status='pending'). Topik itu MASUK ANTRIAN pipeline
-    scrape Instagram normal (budget harian `instagram_trend_daily_budget`, jadwal
-    09:00 WIB) — TIDAK langsung discrape saat itu juga. Cek lagi nanti via endpoint
-    ini, `GET /instagram/trending`, atau `GET /instagram/trend-scrape/status`.
+    **Kalau tidak ketemu apapun** (`total == 0`), dicek dulu topik yang TUMPANG TINDIH
+    di `trend_recommendations` (ILIKE keyword) sebelum trigger AI baru:
+
+    - Kalau ada yang **`status='used'`** → dianggap SUDAH PERNAH discrape (topik/akun
+      sama, cuma caption post belum tentu memuat keyword persis) — tidak trigger AI,
+      cukup kasih flag `already_scraped`.
+    - Kalau ada yang **`status='pending'`** dibuat dalam **24 jam terakhir** → sudah
+      ada riset AI yang sama masih diproses — tidak trigger AI baru (hindari boros
+      kuota Anthropic + topik duplikat), cukup kasih flag `already_queued`.
+    - Kalau tidak ada tumpang tindih sama sekali → trigger job background
+      (`workers.instagram.ai_keyword_research`, Claude+web_search) yang cari topik+akun
+      nyata, submit ke `trend_recommendations` (pending). Topik itu MASUK ANTRIAN
+      pipeline scrape normal (budget harian, jadwal 09:00 WIB) — TIDAK langsung
+      discrape saat itu juga. Cek lagi nanti via endpoint ini atau
+      `GET /instagram/trend-scrape/status`.
     """
     filters = ["p.platform = 'instagram'", "(p.content ILIKE :keyword OR p.author ILIKE :keyword)"]
     params: dict = {"keyword": f"%{q}%", "limit": limit, "offset": offset}
@@ -443,6 +454,12 @@ async def search_instagram_posts(
     if username:
         filters.append("p.author = :username")
         params["username"] = username.strip().lstrip("@").lower()
+    if date_from:
+        filters.append("p.published_at >= :date_from")
+        params["date_from"] = datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc)
+    if date_to:
+        filters.append("p.published_at <= :date_to")
+        params["date_to"] = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59, tzinfo=timezone.utc)
 
     where_clause = " AND ".join(filters)
     count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
@@ -452,6 +469,46 @@ async def search_instagram_posts(
     )) or 0
 
     if total == 0:
+        from app.services.instagram_trending.trend_scrape_service import (
+            AI_DEDUPE_WINDOW_HOURS,
+            find_overlapping_topics,
+        )
+
+        overlaps = await find_overlapping_topics(db, q)
+        already_scraped = next((t for t in overlaps if t.status == "used"), None)
+        dedupe_cutoff = datetime.now(timezone.utc) - timedelta(hours=AI_DEDUPE_WINDOW_HOURS)
+        already_queued = next(
+            (t for t in overlaps if t.status == "pending" and t.created_at >= dedupe_cutoff),
+            None,
+        )
+
+        if already_scraped:
+            return build_success_response({
+                "query": q, "username_filter": username, "total": 0, "items": [],
+                "ai_search_triggered": False,
+                "already_scraped": True,
+                "overlapping_topic": already_scraped.topic,
+                "message": (
+                    f"Topik yang mirip ('{already_scraped.topic}') sudah pernah discrape "
+                    "sebelumnya (status=used). Caption post-nya mungkin tidak memuat kata "
+                    f"'{q}' persis — coba cari by username, atau cek GET /instagram/trending."
+                ),
+            })
+
+        if already_queued:
+            age_hours = round((datetime.now(timezone.utc) - already_queued.created_at).total_seconds() / 3600, 1)
+            return build_success_response({
+                "query": q, "username_filter": username, "total": 0, "items": [],
+                "ai_search_triggered": False,
+                "already_queued": True,
+                "overlapping_topic": already_queued.topic,
+                "message": (
+                    f"Topik yang mirip ('{already_queued.topic}') sudah dalam antrian AI "
+                    f"research sejak {age_hours} jam lalu (belum di-scrape). Tidak trigger "
+                    "AI baru — tunggu giliran pipeline scrape normal (budget harian, jadwal 09:00 WIB)."
+                ),
+            })
+
         from app.workers.instagram_trending_worker import instagram_ai_keyword_research_task
         task = instagram_ai_keyword_research_task.delay(q)
         return build_success_response({
@@ -516,6 +573,8 @@ async def search_instagram_posts(
     return build_success_response({
         "query":            q,
         "username_filter":  username,
+        "date_from":        str(date_from) if date_from else None,
+        "date_to":          str(date_to) if date_to else None,
         "total":            total,
         "offset":           offset,
         "limit":            limit,
@@ -974,59 +1033,11 @@ async def get_trend_scrape_status(
     `settings.instagram_trend_daily_budget` topik/hari. Kalau sebuah topik gagal
     di-scrape (0 post), statusnya TETAP `pending` dan otomatis dicoba lagi di run
     berikutnya — tidak perlu campur tangan manual.
+
+    `summary.ai_keyword_search_pending` = berapa dari topik pending itu yang berasal
+    dari trigger `GET /instagram/posts/search` (keyword miss), bukan submission AI
+    eksternal manual — dan tiap `pending_topics` item punya flag `is_ai_keyword_search`.
     """
-    from app.domain.scrape_runs.models import ScrapeRun
-    from app.domain.trend_recommendations.models import TrendRecommendation
+    from app.services.instagram_trending.trend_scrape_service import get_trend_scrape_summary
 
-    all_topics = (await db.scalars(select(TrendRecommendation))).all()
-
-    def _ig_username(t: TrendRecommendation) -> str | None:
-        for acc in t.related_accounts or []:
-            if acc.get("platform") == "instagram" and acc.get("username"):
-                return acc["username"]
-        return None
-
-    ig_topics = [(t, _ig_username(t)) for t in all_topics if _ig_username(t)]
-    pending = [(t, u) for t, u in ig_topics if t.status == "pending"]
-    used = [(t, u) for t, u in ig_topics if t.status == "used"]
-    pending_sorted = sorted(pending, key=lambda tu: tu[0].score, reverse=True)
-
-    runs = (await db.scalars(
-        select(ScrapeRun)
-        .where(ScrapeRun.platform == "instagram")
-        .order_by(ScrapeRun.started_at.desc())
-        .limit(recent_limit)
-    )).all()
-
-    return build_success_response({
-        "daily_budget": settings.instagram_trend_daily_budget,
-        "schedule": "09:00 WIB otomatis (Celery Beat) — trigger manual: POST /instagram/trend-scrape/run",
-        "summary": {
-            "pending_with_instagram_account": len(pending),
-            "used_with_instagram_account":    len(used),
-            "total_with_instagram_account":   len(ig_topics),
-        },
-        "pending_topics": [
-            {
-                "topic":                t.topic,
-                "score":                t.score,
-                "instagram_username":   u,
-                "recommendation_date":  t.recommendation_date.isoformat(),
-            }
-            for t, u in pending_sorted
-        ],
-        "recent_runs": [
-            {
-                "topic":            r.keyword_text,
-                "status":           r.status,
-                "triggered_by":     r.triggered_by,
-                "videos_fetched":   r.videos_fetched,
-                "videos_new":       r.videos_new,
-                "duration_seconds": round(r.duration_seconds, 2) if r.duration_seconds is not None else None,
-                "error_message":    r.error_message,
-                "started_at":       r.started_at.isoformat(),
-                "finished_at":      r.finished_at.isoformat() if r.finished_at else None,
-            }
-            for r in runs
-        ],
-    })
+    return build_success_response(await get_trend_scrape_summary(db, recent_limit=recent_limit))
