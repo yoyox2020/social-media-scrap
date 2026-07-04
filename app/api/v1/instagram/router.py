@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import uuid
 from collections import Counter
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -438,9 +438,10 @@ async def search_instagram_posts(
     - Kalau ada yang **`status='used'`** → dianggap SUDAH PERNAH discrape (topik/akun
       sama, cuma caption post belum tentu memuat keyword persis) — tidak trigger AI,
       cukup kasih flag `already_scraped`.
-    - Kalau ada yang **`status='pending'`** dibuat dalam **24 jam terakhir** → sudah
-      ada riset AI yang sama masih diproses — tidak trigger AI baru (hindari boros
-      kuota Anthropic + topik duplikat), cukup kasih flag `already_queued`.
+    - Kalau ada yang **`status='pending'`** (berapa pun umurnya — belum sempat
+      discrape sama sekali oleh pipeline) → sudah ada riset AI yang sama masih
+      dalam antrian — tidak trigger AI baru (hindari boros kuota Anthropic +
+      topik duplikat), cukup kasih flag `already_queued`.
     - Kalau tidak ada tumpang tindih sama sekali → trigger job background
       (`workers.instagram.ai_keyword_research`, Claude+web_search) yang cari topik+akun
       nyata, submit ke `trend_recommendations` (pending). Topik itu MASUK ANTRIAN
@@ -469,18 +470,14 @@ async def search_instagram_posts(
     )) or 0
 
     if total == 0:
-        from app.services.instagram_trending.trend_scrape_service import (
-            AI_DEDUPE_WINDOW_HOURS,
-            find_overlapping_topics,
-        )
+        from app.services.instagram_trending.trend_scrape_service import find_overlapping_topics
 
         overlaps = await find_overlapping_topics(db, q)
         already_scraped = next((t for t in overlaps if t.status == "used"), None)
-        dedupe_cutoff = datetime.now(timezone.utc) - timedelta(hours=AI_DEDUPE_WINDOW_HOURS)
-        already_queued = next(
-            (t for t in overlaps if t.status == "pending" and t.created_at >= dedupe_cutoff),
-            None,
-        )
+        # Selama masih 'pending' (belum sempat discrape sama sekali oleh pipeline),
+        # jangan trigger AI baru — berapa pun umurnya. Backlog scrape (budget harian)
+        # bisa lebih lambat dari topik baru masuk, jadi TIDAK ada batas waktu di sini.
+        already_queued = next((t for t in overlaps if t.status == "pending"), None)
 
         if already_scraped:
             return build_success_response({

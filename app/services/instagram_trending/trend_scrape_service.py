@@ -16,7 +16,7 @@ Alur harian (lihat docs/trend-recommendations.md):
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,8 +26,6 @@ from app.domain.trend_recommendations.models import TrendRecommendation
 from app.shared.config import settings
 
 logger = logging.getLogger(__name__)
-
-AI_DEDUPE_WINDOW_HOURS = 24
 
 
 def _instagram_username(topic: TrendRecommendation) -> str | None:
