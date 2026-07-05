@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o"
 
-    viral_discovery_max_topics: int = 10
+    viral_discovery_max_topics: int = 5   # maks topik/hari dari AI discovery, ubah via .env
 
     # Jadwal Celery Beat (WIB) — bisa diganti via .env tanpa ubah kode.
     # Default: viral discovery jalan 2 jam sebelum scrape supaya topik yang
