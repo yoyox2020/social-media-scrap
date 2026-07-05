@@ -67,6 +67,14 @@ class Settings(BaseSettings):
 
     viral_discovery_max_topics: int = 10
 
+    # Jadwal Celery Beat (WIB) — bisa diganti via .env tanpa ubah kode.
+    # Default: viral discovery jalan 2 jam sebelum scrape supaya topik yang
+    # ditemukan punya kesempatan discrape di hari yang sama.
+    viral_discovery_schedule_hour: int = 7
+    viral_discovery_schedule_minute: int = 0
+    instagram_trend_scrape_schedule_hour: int = 9
+    instagram_trend_scrape_schedule_minute: int = 0
+
     # YouTube Data API v3 (fallback saat EnsembleData quota habis)
     youtube_data_api_key: str = ""
 

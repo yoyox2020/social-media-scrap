@@ -82,16 +82,22 @@ celery_app.conf.update(
         # hari ini, submit ke trend_recommendations. Jalan 2 jam SEBELUM
         # instagram-trend-recommendation-daily-09:00 supaya topik yang
         # ditemukan punya kesempatan discrape di hari yang sama.
-        "viral-discovery-daily-07:00": {
+        "viral-discovery-daily": {
             "task": "workers.viral_discovery.daily_scan",
-            "schedule": crontab(hour=7, minute=0),
+            "schedule": crontab(
+                hour=settings.viral_discovery_schedule_hour,
+                minute=settings.viral_discovery_schedule_minute,
+            ),
             "options": {"queue": "default"},
         },
-        # Instagram: scrape topik trend_recommendations (via Apify) setiap hari jam 09:00 WIB
+        # Instagram: scrape topik trend_recommendations (via Apify), jadwal via .env
         # Maks settings.instagram_trend_daily_budget topik/hari, lihat docs/trend-recommendations.md
-        "instagram-trend-recommendation-daily-09:00": {
+        "instagram-trend-recommendation-daily": {
             "task": "workers.instagram_trend_recommendation.daily",
-            "schedule": crontab(hour=9, minute=0),
+            "schedule": crontab(
+                hour=settings.instagram_trend_scrape_schedule_hour,
+                minute=settings.instagram_trend_scrape_schedule_minute,
+            ),
             "options": {"queue": "default"},
         },
         # YouTube: fetch trending Indonesia setiap hari jam 12.00 WIB
