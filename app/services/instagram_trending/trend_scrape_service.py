@@ -35,19 +35,6 @@ def _instagram_username(topic: TrendRecommendation) -> str | None:
     return None
 
 
-async def find_overlapping_topics(db: AsyncSession, keyword: str) -> list[TrendRecommendation]:
-    """
-    Cari topik `trend_recommendations` yang teksnya tumpang tindih dengan `keyword`
-    (ILIKE substring, lintas status/tanggal) — dipakai untuk cek duplikat sebelum
-    trigger AI keyword research baru (lihat docs/setting-tool-calling.md).
-    """
-    return list((await db.scalars(
-        select(TrendRecommendation)
-        .where(TrendRecommendation.topic.ilike(f"%{keyword}%"))
-        .order_by(TrendRecommendation.created_at.desc())
-    )).all())
-
-
 async def get_trend_scrape_summary(db: AsyncSession, recent_limit: int = 10) -> dict:
     """
     Ringkasan pipeline scrape Instagram dari `trend_recommendations` — dipakai
