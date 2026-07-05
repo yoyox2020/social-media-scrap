@@ -399,36 +399,6 @@ async def get_instagram_posts(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GET /instagram/search
-# ─────────────────────────────────────────────────────────────────────────────
-
-@router.get("/search", response_model=dict, summary="[Nonaktif] Cari akun Instagram by keyword")
-async def search_instagram_keyword(
-    q: str = Query(..., min_length=1, max_length=200, description="Keyword, nama akun, atau topik"),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    **Sudah tidak aktif sejak migrasi EnsembleData → Apify.**
-
-    Apify tidak punya fitur cari-akun-by-keyword/hashtag (hanya bisa scrape
-    username yang sudah diketahui) — jadi fitur discovery-by-keyword ini tidak
-    bisa direplikasi. Gunakan `GET /instagram/posts?username=...` kalau sudah
-    tahu username-nya, atau submit topik+akun via `POST /trend-recommendations`
-    supaya diproses otomatis oleh pipeline trend recommendation.
-
-    Detail: docs/apify-instagram-method.md, docs/trend-recommendations.md
-    """
-    raise HTTPException(
-        status_code=501,
-        detail=(
-            "GET /instagram/search dinonaktifkan — Apify (pengganti EnsembleData) "
-            "tidak punya fitur cari-akun-by-keyword/hashtag. Gunakan GET /instagram/posts "
-            "dengan username yang sudah diketahui, atau submit ke POST /trend-recommendations."
-        ),
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # GET /instagram/trending
 # ─────────────────────────────────────────────────────────────────────────────
 
