@@ -73,10 +73,13 @@ _TOOL_PARAMETERS = {
 MAX_ITERATIONS = 8
 
 
+_SUPPORTED_PLATFORMS = {"instagram", "facebook"}
+
+
 def _extract_items(raw_items: list[dict], max_topics: int) -> list[dict]:
     found = []
     for item in raw_items[:max_topics]:
-        accounts = [a for a in item.get("related_accounts", []) if a.get("platform") == "instagram"]
+        accounts = [a for a in item.get("related_accounts", []) if a.get("platform") in _SUPPORTED_PLATFORMS]
         if accounts:
             found.append({**item, "related_accounts": accounts})
     return found
@@ -91,15 +94,17 @@ def _system_prompt(max_topics: int, has_web_search: bool) -> str:
     )
     return (
         f"Kamu adalah AI trend-analyst. Tugasmu HARI INI: {browsing_note} "
-        "topik/isu yang BENAR-BENAR sedang viral di berita Indonesia dan "
-        "Instagram publik — bukan satu keyword tertentu, tapi sapuan terbuka (bisa "
-        "politik, hiburan, olahraga, produk viral, dll). WAJIB sertakan akun "
-        "Instagram nyata (platform='instagram') yang mendorong viralitasnya untuk "
-        "tiap topik — kalau tidak menemukan akun Instagram sama sekali untuk suatu "
-        f"topik, jangan sertakan topik itu. Maksimal {max_topics} topik, jangan "
-        "mengarang untuk mencapai jumlah itu — kalau cuma menemukan lebih sedikit, "
-        "submit yang nyata saja. Setelah menemukan data nyata, panggil tool "
-        f"{_TOOL_NAME}."
+        "topik/isu yang BENAR-BENAR sedang viral di berita Indonesia dan media "
+        "sosial publik (Instagram dan/atau Facebook) — bukan satu keyword "
+        "tertentu, tapi sapuan terbuka (bisa politik, hiburan, olahraga, produk "
+        "viral, dll). WAJIB sertakan minimal SATU akun nyata — Instagram "
+        "(platform='instagram') DAN/ATAU Facebook (platform='facebook') — yang "
+        "mendorong viralitasnya untuk tiap topik. Kalau ada keduanya, sertakan "
+        "keduanya. Kalau tidak menemukan akun Instagram MAUPUN Facebook sama "
+        f"sekali untuk suatu topik, jangan sertakan topik itu. Maksimal {max_topics} "
+        "topik, jangan mengarang untuk mencapai jumlah itu — kalau cuma menemukan "
+        "lebih sedikit, submit yang nyata saja. Setelah menemukan data nyata, "
+        f"panggil tool {_TOOL_NAME}."
     )
 
 

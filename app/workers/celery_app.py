@@ -37,6 +37,7 @@ celery_app = Celery(
         "app.workers.viral_tracking_worker",
         "app.workers.instagram_trending_worker",
         "app.workers.viral_discovery_worker",
+        "app.workers.facebook_trending_worker",
     ],
 )
 
@@ -97,6 +98,16 @@ celery_app.conf.update(
             "schedule": crontab(
                 hour=settings.instagram_trend_scrape_schedule_hour,
                 minute=settings.instagram_trend_scrape_schedule_minute,
+            ),
+            "options": {"queue": "default"},
+        },
+        # Facebook: scrape topik trend_recommendations (via Apify), jadwal via .env
+        # Subsistem B terpisah dari Instagram, lihat docs/flow scrape/flow-scrap-facebook.md
+        "facebook-trend-recommendation-daily": {
+            "task": "workers.facebook_trend_recommendation.daily",
+            "schedule": crontab(
+                hour=settings.facebook_trend_scrape_schedule_hour,
+                minute=settings.facebook_trend_scrape_schedule_minute,
             ),
             "options": {"queue": "default"},
         },

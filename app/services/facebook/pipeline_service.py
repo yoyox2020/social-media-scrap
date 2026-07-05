@@ -1,21 +1,43 @@
 """
 Facebook Pipeline Service.
-Scrape posts dari page/user: page_info → posts → comments → lexicon sentiment
+
+Dua jalur scrape yang SENGAJA terpisah:
+  - scrape_facebook_posts()              — Meta Graph API resmi (token
+    sendiri), CUMA bisa untuk Page yang dikelola sendiri (dipakai
+    GET /facebook/posts, ad-hoc).
+  - scrape_facebook_posts_via_provider()  — provider abstraction (Apify,
+    siap auto-switch), untuk akun MANAPUN termasuk yang ditemukan AI
+    discovery (dipakai pipeline trend_recommendations). Lihat
+    docs/flow scrape/flow-scrap-facebook.md untuk alasan token Meta resmi
+    tidak dipakai di jalur ini (terverifikasi live: diblokir untuk page
+    di luar milik sendiri).
 """
 from __future__ import annotations
 
+import hashlib
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.comments.models import Comment
+from app.domain.entities.models import Entity
 from app.domain.posts.models import Post
 from app.domain.youtube_analysis.models import LexiconAnalysis
 from app.integrations.facebook.connector import FacebookConnector
 from app.shared.config import settings
+
+MAX_POSTS = 12
+MAX_COMMENTS = 50
+
+_HASHTAG_RE = re.compile(r"#(\w+)")
+
+
+def _extract_hashtags(text: str) -> list[str]:
+    return list(dict.fromkeys(_HASHTAG_RE.findall(text or "")))
 
 
 async def scrape_facebook_posts(
@@ -211,3 +233,159 @@ async def _analyze_lexicon(
             score=res.score,
             label=res.label,
         ))
+
+
+async def scrape_facebook_posts_via_provider(
+    db: AsyncSession,
+    identifier: str,
+    max_posts: int = 3,
+    max_comments: int = 10,
+    keyword_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    """
+    Scrape Facebook via provider abstraction (Apify, siap auto-switch —
+    lihat app/services/facebook/providers/). Dipakai pipeline
+    trend_recommendations (run_daily_trend_scrape_facebook) — BUKAN
+    scrape_facebook_posts() di atas yang pakai token Meta resmi.
+
+    Dedup: akun yang sudah discrape hari ini di-skip (tidak panggil provider
+    lagi), pola sama dengan Instagram (app/services/instagram/pipeline_service.py).
+    """
+    from app.services.facebook.providers.registry import search_profile_with_fallback
+
+    max_posts = min(max_posts, MAX_POSTS)
+    max_comments = min(max_comments, MAX_COMMENTS)
+
+    # ── Skip kalau akun ini sudah discrape hari ini ────────────────────────────
+    today_count = await db.scalar(
+        select(func.count()).select_from(Post).where(
+            Post.platform == "facebook",
+            Post.author == identifier,
+            func.date(Post.collected_at) == datetime.now(timezone.utc).date(),
+        )
+    )
+    if today_count:
+        return {
+            "identifier": identifier,
+            "posts_scraped": today_count,
+            "posts_saved": 0,
+            "errors": [],
+            "provider_used": "cached_today",
+            "already_scraped_today": True,
+        }
+
+    errors: list[str] = []
+    provider_used: str | None = None
+    try:
+        rows, provider_used = await search_profile_with_fallback(identifier, max_posts, max_comments)
+    except Exception as exc:
+        errors.append(f"provider: {exc}")
+        rows = []
+
+    if not rows:
+        return {
+            "identifier": identifier, "posts_scraped": 0, "posts_saved": 0,
+            "errors": errors, "provider_used": provider_used,
+        }
+
+    # ── Group baris per post (by postUrl) ─────────────────────────────────────
+    posts_by_url: dict[str, dict[str, Any]] = {}
+    profile_followers = 0
+    for row in rows:
+        post_url = row.get("postUrl", "")
+        if not post_url:
+            continue
+        bucket = posts_by_url.setdefault(post_url, {"meta": row, "comments": []})
+        if row.get("commentText"):
+            bucket["comments"].append(row)
+        if row.get("profileFollowers"):
+            profile_followers = row.get("profileFollowers")
+
+    posts_saved_count = 0
+    for post_url, bucket in posts_by_url.items():
+        meta_row = bucket["meta"]
+        # Facebook tidak punya "shortcode" seperti Instagram — URL post
+        # formatnya variatif (reel/permalink/video/story), jadi external_id
+        # diturunkan dari hash URL-nya sendiri (stabil per post, cukup unik).
+        ext_id = hashlib.sha1(post_url.encode("utf-8")).hexdigest()[:24]
+
+        post_obj = await db.scalar(
+            select(Post).where(Post.platform == "facebook", Post.external_id == ext_id)
+        )
+        is_new = post_obj is None
+
+        if is_new:
+            caption = meta_row.get("postDescription", "") or ""
+            published_at = None
+            if meta_row.get("postTimestamp"):
+                try:
+                    published_at = datetime.fromisoformat(meta_row["postTimestamp"].replace("Z", "+00:00"))
+                except ValueError:
+                    published_at = None
+
+            post_obj = Post(
+                id=uuid.uuid4(),
+                keyword_id=keyword_id,
+                external_id=ext_id,
+                platform="facebook",
+                content=caption,
+                author=identifier,
+                url=post_url,
+                published_at=published_at,
+                collected_at=datetime.now(timezone.utc),
+                metadata_={
+                    "likes":     meta_row.get("postLikesCount", 0),
+                    "comments":  meta_row.get("postCommentsCount", 0),
+                    "followers": profile_followers,
+                    "source":    provider_used,
+                },
+            )
+            db.add(post_obj)
+            await db.flush()
+            posts_saved_count += 1
+
+            for tag in _extract_hashtags(caption):
+                db.add(Entity(post_id=post_obj.id, text=tag, entity_type="HASHTAG"))
+
+            from app.workers.ai_worker import analyze_post_task
+            analyze_post_task.delay(str(post_obj.id), run_sentiment=True, run_ner=False, run_embedding=False)
+
+        # ── Komentar baru ──────────────────────────────────────────────────────
+        if bucket["comments"] and post_obj.id:
+            existing_cmt_ids: set[str] = set(
+                (await db.scalars(select(Comment.external_id).where(Comment.post_id == post_obj.id))).all()
+            )
+            new_comments: list[Comment] = []
+            for cmt in bucket["comments"][:max_comments]:
+                text_ = cmt.get("commentText", "")
+                author = cmt.get("commentAuthor", "")
+                timestamp = cmt.get("commentTimestamp", "")
+                ext_cmt_id = hashlib.sha1(f"{ext_id}|{author}|{text_}|{timestamp}".encode("utf-8")).hexdigest()
+                if ext_cmt_id in existing_cmt_ids:
+                    continue
+
+                comment = Comment(
+                    post_id=post_obj.id,
+                    external_id=ext_cmt_id,
+                    content=text_,
+                    author=author,
+                    published_at=None,
+                    metadata_={"like_count": cmt.get("commentLikesCount", 0)},
+                )
+                db.add(comment)
+                new_comments.append(comment)
+                existing_cmt_ids.add(ext_cmt_id)
+
+            if new_comments:
+                await db.flush()
+                await _analyze_lexicon(db, new_comments, keyword_id)
+
+    await db.commit()
+
+    return {
+        "identifier":     identifier,
+        "posts_scraped":  len(posts_by_url),
+        "posts_saved":    posts_saved_count,
+        "errors":         errors,
+        "provider_used":  provider_used,
+    }

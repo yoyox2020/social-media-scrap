@@ -78,8 +78,23 @@ class Settings(BaseSettings):
     # YouTube Data API v3 (fallback saat EnsembleData quota habis)
     youtube_data_api_key: str = ""
 
-    # Facebook / Meta Graph API
+    # Facebook / Meta Graph API — token resmi cuma bisa akses Page yang
+    # dikelola sendiri (terverifikasi live 05 Juli 2026, lihat
+    # docs/flow scrape/flow-scrap-facebook.md), dipakai GET /facebook/posts
     facebook_access_token: str = ""
+
+    # Facebook — provider abstraction untuk pipeline trend_recommendations
+    # (Subsistem B khusus Facebook, terpisah dari Instagram). Apify satu-
+    # satunya provider aktif sekarang (Meta Graph API TIDAK bisa untuk akun
+    # publik sembarangan, cuma Page milik sendiri) — slot provider lain
+    # (mis. Meta app Business terverifikasi nanti) tinggal ditambah ke
+    # FACEBOOK_SEARCH_PROVIDER_ORDER tanpa ubah kode pemanggil.
+    facebook_search_provider_order: str = "apify"
+    facebook_trend_daily_budget: int = 5
+    facebook_trend_posts_per_topic: int = 3
+    facebook_trend_comments_per_post: int = 10
+    facebook_trend_scrape_schedule_hour: int = 10
+    facebook_trend_scrape_schedule_minute: int = 0
 
     # Instagram session (dari browser cookies — untuk scraping tanpa EnsembleData)
     instagram_session_id: str = ""
