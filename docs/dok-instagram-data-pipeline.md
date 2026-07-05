@@ -7,6 +7,21 @@ dapat akun Instagram-nya (Subsistem B, lihat
 perbaikan yang dibuat 05 Juli 2026 supaya Instagram konsisten dengan platform
 lain (YouTube dkk).
 
+## Cara baca data ini: GET /instagram/posts/search (ditambah 05 Juli 2026)
+
+Endpoint baru khusus cari **konten** (caption/hashtag), bukan username
+(`GET /instagram/posts` sudah menangani itu). Alur:
+1. Cari di `posts.content` (ILIKE) dan `entities` (`entity_type='HASHTAG'`).
+2. Kalau tidak ketemu: cari topik cocok di `trend_recommendations` (baca
+   saja) — ketemu & kuota ada → scrape sekarang; kuota habis → topik tetap
+   `pending`, otomatis kepilih batch berikutnya (kelihatan di
+   `GET /instagram/trend-scrape/status`).
+3. Tidak ketemu keduanya → pesan jelas (Apify tidak bisa cari-by-keyword).
+
+Response per post menggabungkan sentimen POST (`sentiments`) + ringkasan
+sentimen KOMENTAR (`lexicon_analyses`) jadi satu — lihat
+`app/api/v1/instagram/router.py` fungsi `_build_search_items()`.
+
 ## Peta tabel — Instagram vs platform lain
 
 | Data | Tabel | Platform-agnostic? |
