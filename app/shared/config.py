@@ -44,7 +44,10 @@ class Settings(BaseSettings):
     instagram_shared_daily_budget: int = 10   # total kuota harian: search + panggilan Instagram ad-hoc lain
 
     # Instagram trend-recommendation scraping (lihat docs/trend-recommendations.md)
-    instagram_trend_daily_budget: int = 3   # maks topik trend_recommendations di-scrape/hari (Apify berbayar)
+    # Nominal ini SENGAJA mudah diubah (env var, tanpa perlu ubah kode) — nilai
+    # sekarang (5) adalah titik awal pasca-testing, bisa disesuaikan lagi lewat
+    # INSTAGRAM_TREND_DAILY_BUDGET di .env kalau ketentuan berubah nanti.
+    instagram_trend_daily_budget: int = 5   # maks topik trend_recommendations di-scrape/hari (Apify berbayar)
     instagram_trend_posts_per_topic: int = 1
     instagram_trend_comments_per_post: int = 10
 

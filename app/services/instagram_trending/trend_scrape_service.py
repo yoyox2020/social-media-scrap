@@ -54,6 +54,9 @@ async def get_trend_scrape_summary(db: AsyncSession, recent_limit: int = 10) -> 
         .limit(recent_limit)
     )).all()
 
+    from app.services.trend_recommendations.viral_discovery_scrape_service import get_viral_discovery_trace
+    viral_discovery_trace = await get_viral_discovery_trace(db)
+
     return {
         "daily_budget": settings.instagram_trend_daily_budget,
         "schedule": "09:00 WIB otomatis (Celery Beat) — trigger manual: POST /instagram/trend-scrape/run",
@@ -91,6 +94,7 @@ async def get_trend_scrape_summary(db: AsyncSession, recent_limit: int = 10) -> 
             }
             for r in runs
         ],
+        "viral_discovery_trace": viral_discovery_trace,
     }
 
 

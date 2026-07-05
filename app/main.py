@@ -328,6 +328,36 @@ async def scraping_status_page():
   .ig-card .sub { font-size: 0.72rem; color: #64748b; margin-top: 2px; }
   .pill-ig-rank { background: #3b0764; color: #e879f9; }
   .pill-waiting { background: #451a03; color: #fbbf24; }
+  /* Pipeline flow — alur live Subsistem A (AI Discovery) -> Subsistem B (Scrape Worker),
+     melacak batch topik nyata dari viral_discovery_trace, bukan status independen. */
+  .pipeline-flow { display: flex; align-items: flex-start; gap: 0; margin-bottom: 6px; overflow-x: auto; padding: 12px 4px 4px; }
+  .pf-node { display: flex; flex-direction: column; align-items: center; gap: 6px; min-width: 108px; flex-shrink: 0; }
+  .pf-icon { width: 42px; height: 42px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+             font-size: 18px; font-weight: 700; border: 2px solid #334155; background: #1e293b; color: #475569; }
+  .pf-icon.success { border-color: #4ade80; color: #4ade80; background: rgba(74,222,128,0.10); }
+  .pf-icon.failed  { border-color: #f87171; color: #f87171; background: rgba(248,113,113,0.10); }
+  .pf-icon.running { border-color: #60a5fa; color: #60a5fa; background: rgba(96,165,250,0.10); }
+  .pf-icon.waiting { border-color: #fbbf24; color: #fbbf24; background: rgba(251,191,36,0.10); }
+  .pf-icon.idle    { border-color: #334155; color: #475569; }
+  .pf-label { font-size: 0.74rem; color: #cbd5e1; text-align: center; font-weight: 600; }
+  .pf-sub   { font-size: 0.68rem; color: #64748b; text-align: center; max-width: 112px; }
+  .pf-status-text { font-size: 0.66rem; text-align: center; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+  .pf-status-text.success { color: #4ade80; }
+  .pf-status-text.failed  { color: #f87171; }
+  .pf-status-text.running { color: #60a5fa; }
+  .pf-status-text.waiting { color: #fbbf24; }
+  .pf-status-text.idle    { color: #475569; }
+  .pf-connector { flex: 1; min-width: 26px; height: 3px; margin-top: 20px; border-radius: 2px;
+                  background: repeating-linear-gradient(90deg, #334155 0 6px, transparent 6px 12px); }
+  .pf-connector.flowing { background: repeating-linear-gradient(90deg, #4ade80 0 6px, transparent 6px 12px);
+                           background-size: 12px 3px; animation: pf-flow 0.7s linear infinite; }
+  .pf-connector.blocked { background: repeating-linear-gradient(90deg, #f87171 0 6px, transparent 6px 12px); }
+  @keyframes pf-flow { from { background-position: 0 0; } to { background-position: -12px 0; } }
+  .pf-legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 0.7rem; color: #64748b; margin-bottom: 14px; }
+  .pf-legend-item { display: flex; align-items: center; gap: 5px; }
+  .pf-legend-dot { width: 10px; height: 10px; border-radius: 50%; border: 2px solid; }
+  .pf-batch-table { font-size: 0.78rem; }
+  .pf-empty-hint { color: #475569; font-style: italic; font-size: 0.8rem; padding: 10px 0 18px; }
 </style>
 </head>
 <body>
@@ -451,6 +481,29 @@ async def scraping_status_page():
   <tbody id="ig-table"></tbody>
 </table>
 
+<div class="section-title" style="margin-top:24px">Alur Pipeline Live — Subsistem A (AI Discovery) &rarr; Subsistem B (Scrape Worker)</div>
+<div class="pf-legend">
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#4ade80;background:rgba(74,222,128,0.15)"></span> Sukses</div>
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#f87171;background:rgba(248,113,113,0.15)"></span> Gagal / Berhenti Di Sini</div>
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#fbbf24;background:rgba(251,191,36,0.15)"></span> Menunggu</div>
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#334155"></span> Belum Ada Data</div>
+</div>
+<div class="pipeline-flow" id="pipeline-flow"></div>
+<table class="pf-batch-table" id="pf-batch-wrap" style="display:none">
+  <thead>
+    <tr>
+      <th>Topik (batch AI terakhir)</th>
+      <th>Status Sekarang</th>
+      <th>Discrape Via</th>
+      <th>Durasi</th>
+      <th>Waktu Scrape</th>
+      <th>Error</th>
+    </tr>
+  </thead>
+  <tbody id="pf-batch-table"></tbody>
+</table>
+<div class="pf-empty-hint" id="pf-empty-hint" style="display:none">Belum ada run AI Viral Discovery tercatat — jalan otomatis jam 07:00 WIB, atau trigger manual untuk test.</div>
+
 <div class="section-title" style="margin-top:24px">Instagram Trend-Scrape (trend_recommendations)</div>
 <div class="ig-grid">
   <div class="ig-card"><div class="label">Pending</div><div class="value" id="its-pending">-</div><div class="sub">nunggu giliran scrape</div></div>
@@ -524,6 +577,89 @@ function fmt(dt) {
   const d = new Date(dt);
   return d.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta', hour12: false,
     month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function pipelineIcon(status) {
+  return { success: '✓', failed: '✕', running: '↻', waiting: '⏳', idle: '○' }[status] || '○';
+}
+
+// Melacak batch topik NYATA dari run AI Discovery terakhir ke status scrape
+// masing-masing (viral_discovery_trace dari backend) — bukan status
+// independen tiap subsistem, supaya kelihatan persis di mana alurnya berhenti.
+function renderPipelineFlow(trace) {
+  const flowEl = document.getElementById('pipeline-flow');
+  const batchWrap = document.getElementById('pf-batch-wrap');
+  const batchTbody = document.getElementById('pf-batch-table');
+  const emptyHint = document.getElementById('pf-empty-hint');
+  if (!flowEl) return;
+
+  const aiRun = trace && trace.ai_run;
+  const topics = (trace && trace.topics) || [];
+
+  if (!aiRun) {
+    flowEl.innerHTML = '';
+    batchWrap.style.display = 'none';
+    emptyHint.style.display = 'block';
+    return;
+  }
+  emptyHint.style.display = 'none';
+
+  const s1 = aiRun.status === 'success' ? 'success' : 'failed';
+  const s2 = aiRun.status === 'success' && topics.length > 0 ? 'success'
+           : aiRun.status === 'failed' ? 'failed' : 'idle';
+
+  const pendingCount = topics.filter(t => t.current_status === 'pending').length;
+  const usedCount = topics.filter(t => t.current_status === 'used').length;
+  const s3 = topics.length === 0 ? 'idle' : (pendingCount > 0 ? 'waiting' : 'success');
+
+  const attempted = topics.filter(t => t.scrape_attempt);
+  const anyFailed = attempted.some(t => t.scrape_attempt.status === 'failed');
+  const anySuccess = attempted.some(t => t.scrape_attempt.status === 'success');
+  let s4;
+  if (attempted.length === 0) s4 = topics.length > 0 ? 'waiting' : 'idle';
+  else if (anyFailed) s4 = 'failed';   // ada yang gagal -> tandai perlu perhatian
+  else if (anySuccess) s4 = 'success';
+  else s4 = 'waiting';
+
+  const s5 = topics.length === 0 ? 'idle' : (usedCount === topics.length ? 'success' : (usedCount > 0 ? 'waiting' : 'idle'));
+
+  const nodes = [
+    { label: 'AI Discovery',    sub: 'Claude web_search',      status: s1 },
+    { label: 'Submit ke DB',    sub: `${topics.length} topik ditemukan`, status: s2 },
+    { label: 'Antrian Pending', sub: `${pendingCount} nunggu`, status: s3 },
+    { label: 'Scrape Worker',   sub: 'Apify/EnsembleData',      status: s4 },
+    { label: 'Selesai',         sub: `${usedCount}/${topics.length} used`, status: s5 },
+  ];
+
+  flowEl.innerHTML = nodes.map((n, i) => {
+    const node = `<div class="pf-node">
+      <div class="pf-icon ${n.status}">${pipelineIcon(n.status)}</div>
+      <div class="pf-label">${n.label}</div>
+      <div class="pf-sub">${n.sub}</div>
+      <div class="pf-status-text ${n.status}">${n.status}</div>
+    </div>`;
+    if (i === nodes.length - 1) return node;
+    const connClass = n.status === 'failed' ? 'blocked' : ((n.status === 'success' || n.status === 'waiting') ? 'flowing' : '');
+    return node + `<div class="pf-connector ${connClass}"></div>`;
+  }).join('');
+
+  if (topics.length === 0) {
+    batchWrap.style.display = 'none';
+  } else {
+    batchWrap.style.display = '';
+    batchTbody.innerHTML = topics.map(t => {
+      const sa = t.scrape_attempt;
+      const statusPillClass = t.current_status === 'used' ? 'pill-success' : 'pill-waiting';
+      return `<tr>
+        <td>${t.topic}</td>
+        <td><span class="pill ${statusPillClass}">${t.current_status}</span></td>
+        <td style="color:#94a3b8;font-size:.75rem">${sa ? (sa.api_source || '-') : '-'}</td>
+        <td style="color:#94a3b8">${sa && sa.duration_seconds != null ? sa.duration_seconds + 's' : '-'}</td>
+        <td style="color:#94a3b8;font-size:.75rem">${sa ? fmt(sa.started_at) : '-'}</td>
+        <td class="error-text" title="${(sa && sa.error_message) || ''}">${(sa && sa.error_message) || '-'}</td>
+      </tr>`;
+    }).join('');
+  }
 }
 
 function fmtTaskName(name) {
@@ -894,6 +1030,7 @@ async function load() {
     // ── Instagram trend-scrape (trend_recommendations + AI keyword search) ──
     const its = d.instagram_trend_scrape || {};
     const itsSummary = its.summary || {};
+    renderPipelineFlow(its.viral_discovery_trace);
     document.getElementById('its-pending').textContent    = itsSummary.pending_with_instagram_account || 0;
     document.getElementById('its-used').textContent       = itsSummary.used_with_instagram_account || 0;
     document.getElementById('its-ai-pending').textContent = itsSummary.ai_keyword_search_pending || 0;
