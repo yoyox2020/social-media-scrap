@@ -1,10 +1,19 @@
 """
-Viral discovery harian — Claude (via web_search) menyapu berita + Instagram
-publik Indonesia untuk menemukan topik yang BENAR-BENAR viral HARI INI (bukan
-satu keyword tertentu, sapuan terbuka), hasilnya di-submit ke
-trend_recommendations (status=pending) supaya diambil pipeline scrape
-Instagram yang SUDAH ADA (budget harian, jadwal 09:00 WIB) — lihat
-docs/trend-recommendations.md.
+Viral discovery harian — AI menyapu berita + Instagram publik Indonesia untuk
+menemukan topik yang BENAR-BENAR viral HARI INI (bukan satu keyword tertentu,
+sapuan terbuka), hasilnya di-submit ke trend_recommendations (status=pending)
+supaya diambil pipeline scrape Instagram yang SUDAH ADA (budget harian,
+jadwal 09:00 WIB) — lihat docs/trend-recommendations.md.
+
+Provider AI bisa diganti via .env TANPA ubah kode:
+    AI_DISCOVERY_PROVIDER=anthropic | openai | ollama
+
+CATATAN PENTING: cuma provider "anthropic" (Claude) yang punya web_search
+bawaan — bisa benar-benar cari data hari ini. "openai" dan "ollama" TIDAK
+BISA browsing sama sekali (function calling saja), jadi hasilnya cuma dari
+pengetahuan training model (bisa basi/salah), BUKAN topik viral hari ini yang
+sebenarnya. Dipertahankan supaya provider genuinely bisa diganti, tapi kalau
+butuh hasil akurat, pakai "anthropic".
 
 Dipanggil oleh app/services/trend_recommendations/viral_discovery_scrape_service.py
 (bukan file trend_scrape_service.py yang dibekukan) sebagai bagian dari task
@@ -16,6 +25,7 @@ proses yang sama.
 """
 from __future__ import annotations
 
+import json
 import logging
 
 from app.shared.config import settings
@@ -63,10 +73,25 @@ _TOOL_PARAMETERS = {
 MAX_ITERATIONS = 8
 
 
-def _system_prompt(max_topics: int) -> str:
+def _extract_items(raw_items: list[dict], max_topics: int) -> list[dict]:
+    found = []
+    for item in raw_items[:max_topics]:
+        accounts = [a for a in item.get("related_accounts", []) if a.get("platform") == "instagram"]
+        if accounts:
+            found.append({**item, "related_accounts": accounts})
+    return found
+
+
+def _system_prompt(max_topics: int, has_web_search: bool) -> str:
+    browsing_note = (
+        "gunakan web_search untuk menemukan"
+        if has_web_search
+        else "sebutkan (dari pengetahuanmu — CATATAN: kamu tidak punya akses internet, "
+             "jadi ini mungkin bukan data hari ini yang sebenarnya, beri tahu itu di skor rendah)"
+    )
     return (
-        "Kamu adalah AI trend-analyst. Tugasmu HARI INI: gunakan web_search untuk "
-        "menemukan topik/isu yang BENAR-BENAR sedang viral di berita Indonesia dan "
+        f"Kamu adalah AI trend-analyst. Tugasmu HARI INI: {browsing_note} "
+        "topik/isu yang BENAR-BENAR sedang viral di berita Indonesia dan "
         "Instagram publik — bukan satu keyword tertentu, tapi sapuan terbuka (bisa "
         "politik, hiburan, olahraga, produk viral, dll). WAJIB sertakan akun "
         "Instagram nyata (platform='instagram') yang mendorong viralitasnya untuk "
@@ -80,14 +105,31 @@ def _system_prompt(max_topics: int) -> str:
 
 async def find_daily_viral_topics() -> list[dict]:
     """
-    Sapuan terbuka harian via Claude (web_search + tool use) untuk topik+akun
-    Instagram yang benar-benar viral hari ini. Return list item siap dipakai
-    `TrendRecommendationItem` (topic/score/related_accounts) — HANYA yang
-    punya minimal 1 akun Instagram. Return list kosong kalau Claude tidak
-    menemukan apapun atau API key belum di-set.
+    Sapuan terbuka harian untuk topik+akun Instagram yang viral hari ini.
+    Provider dipilih dari settings.ai_discovery_provider (anthropic/openai/ollama).
+    Return list item siap dipakai `TrendRecommendationItem`
+    (topic/score/related_accounts) — HANYA yang punya minimal 1 akun Instagram.
     """
+    provider = settings.ai_discovery_provider
+
+    if provider == "anthropic":
+        return await _find_via_anthropic()
+    if provider == "openai":
+        return await _find_via_openai()
+    if provider == "ollama":
+        return await _find_via_ollama()
+
+    logger.warning("find_daily_viral_topics: ai_discovery_provider tidak dikenal: %s", provider)
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Provider: Anthropic (Claude) — satu-satunya yang punya web_search bawaan
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _find_via_anthropic() -> list[dict]:
     if not settings.anthropic_api_key:
-        logger.warning("find_daily_viral_topics: ANTHROPIC_API_KEY belum di-set, dilewati")
+        logger.warning("find_daily_viral_topics[anthropic]: ANTHROPIC_API_KEY belum di-set, dilewati")
         return []
 
     import anthropic
@@ -109,7 +151,7 @@ async def find_daily_viral_topics() -> list[dict]:
         response = client.messages.create(
             model=settings.anthropic_model,
             max_tokens=4096,
-            system=_system_prompt(max_topics),
+            system=_system_prompt(max_topics, has_web_search=True),
             thinking={"type": "adaptive"},
             tools=tools,
             messages=messages,
@@ -117,7 +159,7 @@ async def find_daily_viral_topics() -> list[dict]:
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason == "refusal":
-            logger.warning("find_daily_viral_topics: Claude refusal")
+            logger.warning("find_daily_viral_topics[anthropic]: Claude refusal")
             return []
 
         if response.stop_reason == "pause_turn":
@@ -129,11 +171,8 @@ async def find_daily_viral_topics() -> list[dict]:
 
         tool_results = []
         for block in tool_uses:
-            items = block.input.get("items", [])[:max_topics]
-            for item in items:
-                accounts = [a for a in item.get("related_accounts", []) if a.get("platform") == "instagram"]
-                if accounts:
-                    found_items.append({**item, "related_accounts": accounts})
+            items = block.input.get("items", [])
+            found_items.extend(_extract_items(items, max_topics))
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -143,5 +182,76 @@ async def find_daily_viral_topics() -> list[dict]:
         break  # cukup satu putaran submit, tidak perlu lanjut agentic loop
 
     found_items = found_items[:max_topics]
-    logger.info("find_daily_viral_topics: ditemukan %d topik viral (dengan akun instagram)", len(found_items))
+    logger.info("find_daily_viral_topics[anthropic]: ditemukan %d topik (dengan akun instagram)", len(found_items))
     return found_items
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Provider: OpenAI — function calling saja, TIDAK ADA browsing bawaan
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _find_via_openai() -> list[dict]:
+    if not settings.openai_api_key:
+        logger.warning("find_daily_viral_topics[openai]: OPENAI_API_KEY belum di-set, dilewati")
+        return []
+
+    from openai import OpenAI
+
+    client = OpenAI(api_key=settings.openai_api_key)
+    max_topics = settings.viral_discovery_max_topics
+
+    tools = [{
+        "type": "function",
+        "function": {"name": _TOOL_NAME, "description": _TOOL_DESCRIPTION, "parameters": _TOOL_PARAMETERS},
+    }]
+    messages: list[dict] = [
+        {"role": "system", "content": _system_prompt(max_topics, has_web_search=False)},
+        {"role": "user", "content": "Cari topik/akun yang sedang viral hari ini (berita + Instagram publik Indonesia)."},
+    ]
+
+    found_items: list[dict] = []
+    response = client.chat.completions.create(model=settings.openai_model, messages=messages, tools=tools)
+    msg = response.choices[0].message
+
+    for call in msg.tool_calls or []:
+        if call.function.name != _TOOL_NAME:
+            continue
+        args = json.loads(call.function.arguments)
+        found_items.extend(_extract_items(args.get("items", []), max_topics))
+
+    logger.info("find_daily_viral_topics[openai]: ditemukan %d topik (TANPA browsing — cek akurasi)", len(found_items))
+    return found_items[:max_topics]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Provider: Ollama (lokal) — endpoint kompatibel OpenAI, TIDAK ADA browsing
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _find_via_ollama() -> list[dict]:
+    from openai import OpenAI
+
+    base_url = f"{settings.ollama_base_url}/v1"
+    client = OpenAI(base_url=base_url, api_key="ollama")  # api_key diabaikan Ollama, tapi wajib diisi
+    max_topics = settings.viral_discovery_max_topics
+
+    tools = [{
+        "type": "function",
+        "function": {"name": _TOOL_NAME, "description": _TOOL_DESCRIPTION, "parameters": _TOOL_PARAMETERS},
+    }]
+    messages: list[dict] = [
+        {"role": "system", "content": _system_prompt(max_topics, has_web_search=False)},
+        {"role": "user", "content": "Cari topik/akun yang sedang viral hari ini (berita + Instagram publik Indonesia)."},
+    ]
+
+    found_items: list[dict] = []
+    response = client.chat.completions.create(model=settings.ollama_model_name, messages=messages, tools=tools)
+    msg = response.choices[0].message
+
+    for call in msg.tool_calls or []:
+        if call.function.name != _TOOL_NAME:
+            continue
+        args = json.loads(call.function.arguments)
+        found_items.extend(_extract_items(args.get("items", []), max_topics))
+
+    logger.info("find_daily_viral_topics[ollama]: ditemukan %d topik (TANPA browsing — cek akurasi)", len(found_items))
+    return found_items[:max_topics]

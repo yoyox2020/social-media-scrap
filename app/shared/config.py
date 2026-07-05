@@ -51,10 +51,20 @@ class Settings(BaseSettings):
     instagram_trend_posts_per_topic: int = 1
     instagram_trend_comments_per_post: int = 10
 
-    # Anthropic (Claude) — dipakai untuk viral discovery harian (lihat
-    # app/ai/llm/viral_discovery_service.py)
+    # Viral discovery harian (lihat app/ai/llm/viral_discovery_service.py) —
+    # provider AI bisa diganti via .env TANPA ubah kode (ai_discovery_provider:
+    # anthropic | openai | ollama). CATATAN: cuma Claude yang punya web_search
+    # bawaan — OpenAI/Ollama tidak bisa browsing sama sekali, jadi hasilnya
+    # dari pengetahuan training model (bisa basi), bukan data hari ini yang
+    # sebenarnya. Gunakan Claude untuk hasil akurat.
+    ai_discovery_provider: str = "anthropic"
+
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-opus-4-8"
+
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o"
+
     viral_discovery_max_topics: int = 10
 
     # YouTube Data API v3 (fallback saat EnsembleData quota habis)
