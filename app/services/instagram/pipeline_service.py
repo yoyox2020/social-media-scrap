@@ -1,12 +1,13 @@
 """
-Instagram Pipeline Service — via Apify (pengganti EnsembleData).
+Instagram Pipeline Service — via provider pencarian (Apify + fallback EnsembleData).
 
 Orkestrasi scraping Instagram:
-  Apify actor (1 call) → dataset (post+comment per baris)
+  Provider search-by-username (1 call, auto-fallback) → dataset (post+comment per baris)
   → group per post → simpan posts + comments ke DB → lexicon sentiment
 
 Lihat docs/apify-instagram-method.md untuk detail Actor & gotcha input schema.
 Lihat docs/trend-recommendations.md untuk alur budget harian trend_recommendations.
+Lihat app/services/instagram/providers/ untuk abstraksi provider search.
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.domain.comments.models import Comment
 from app.domain.posts.models import Post
 from app.domain.youtube_analysis.models import LexiconAnalysis
-from app.integrations.apify.instagram import scrape_instagram_via_apify
+from app.services.instagram.providers.registry import search_profile_with_fallback
 
 MAX_POSTS = 12
 MAX_COMMENTS = 50
@@ -69,11 +70,12 @@ async def scrape_instagram_posts(
 
     errors: list[str] = []
     user_info: dict[str, Any] = {"username": username}
+    provider_used: str | None = None
 
     try:
-        rows = await scrape_instagram_via_apify(username, latest_posts=max_posts, latest_comments=max_comments)
+        rows, provider_used = await search_profile_with_fallback(username, max_posts, max_comments)
     except Exception as exc:
-        errors.append(f"apify: {exc}")
+        errors.append(f"provider: {exc}")
         rows = []
 
     if not rows:
@@ -83,6 +85,7 @@ async def scrape_instagram_posts(
             "posts_scraped": 0,
             "posts_saved": 0,
             "errors": errors,
+            "provider_used": provider_used,
             "_posts_data": [],
         }
 
@@ -211,6 +214,7 @@ async def scrape_instagram_posts(
         "posts_scraped": len(posts_by_url),
         "posts_saved":   posts_saved_count,
         "errors":        errors,
+        "provider_used": provider_used,
         "_posts_data":   posts_data,
     }
 

@@ -37,15 +37,22 @@ class Settings(BaseSettings):
     apify_api_token: str = ""
     apify_actor_id: str = "ycQuEFDDZmgX7BAsL"  # social-media-sentiment-analysis-tool
 
+    # Instagram search provider — cari & scrape profil by username, dengan
+    # auto-fallback antar provider (lihat app/services/instagram/providers/)
+    instagram_search_provider_order: str = "apify,ensembledata"  # urutan fallback, config-only
+    instagram_search_daily_min: int = 3       # minimal panggilan search dijamin tersedia/hari
+    instagram_shared_daily_budget: int = 10   # total kuota harian: search + panggilan Instagram ad-hoc lain
+
     # Instagram trend-recommendation scraping (lihat docs/trend-recommendations.md)
     instagram_trend_daily_budget: int = 3   # maks topik trend_recommendations di-scrape/hari (Apify berbayar)
     instagram_trend_posts_per_topic: int = 1
     instagram_trend_comments_per_post: int = 10
 
-    # Anthropic (Claude) — AI keyword research fallback saat GET /instagram/posts/search
-    # tidak ketemu di DB (lihat docs/setting-tool-calling.md § keyword search fallback)
+    # Anthropic (Claude) — dipakai untuk viral discovery harian (lihat
+    # app/ai/llm/viral_discovery_service.py)
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-opus-4-8"
+    viral_discovery_max_topics: int = 10
 
     # YouTube Data API v3 (fallback saat EnsembleData quota habis)
     youtube_data_api_key: str = ""

@@ -212,7 +212,20 @@ async def get_instagram_posts(
     should_scrape = (existing_count == 0) or (force_refresh and not scraped_today)
 
     if should_scrape:
+        from app.domain.scrape_runs.models import ScrapeRun
         from app.services.instagram.pipeline_service import scrape_instagram_posts
+        from app.services.instagram.quota_service import enforce_quota
+
+        await enforce_quota(db, operation="search")
+
+        started_at = datetime.now(timezone.utc)
+        scrape_run = ScrapeRun(
+            keyword_text=f"search:{username}", platform="instagram", api_source="provider_fallback",
+            status="running", triggered_by="manual_api", started_at=started_at,
+        )
+        db.add(scrape_run)
+        await db.flush()
+
         scrape_result = await scrape_instagram_posts(
             db=db,
             username=username,
@@ -220,6 +233,15 @@ async def get_instagram_posts(
             max_comments=max_comments,
             keyword_id=None,
         )
+
+        scrape_run.status = "success" if scrape_result.get("posts_scraped", 0) > 0 else "failed"
+        scrape_run.api_source = scrape_result.get("provider_used") or "provider_fallback"
+        scrape_run.videos_fetched = scrape_result.get("posts_scraped", 0)
+        scrape_run.videos_new = scrape_result.get("posts_saved", 0)
+        scrape_run.error_message = "; ".join(scrape_result.get("errors", [])[:3]) or None
+        scrape_run.finished_at = datetime.now(timezone.utc)
+        scrape_run.duration_seconds = (scrape_run.finished_at - started_at).total_seconds()
+        await db.commit()
 
     # ── Ambil posts dari DB ───────────────────────────────────────────────────
     rows = (await db.execute(text("""

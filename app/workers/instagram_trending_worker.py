@@ -62,23 +62,51 @@ def instagram_scrape_username_task(
     max_comments: int = 5,
 ):
     """
-    Scrape sembarang username Instagram secara async (background), via Apify.
-    Manual/on-demand — tidak kena budget harian trend_recommendations.
-    Simpan posts + comments + lexicon ke DB.
-    Bisa dipanggil dari POST /instagram/scrape.
+    Scrape sembarang username Instagram secara async (background), via provider
+    search-and-scrape (Apify + fallback EnsembleData — lihat
+    app/services/instagram/providers/). Manual/on-demand — tidak kena budget
+    harian trend_recommendations, tapi kena kuota harian bersama
+    (app/services/instagram/quota_service.py). Simpan posts + comments +
+    lexicon ke DB. Bisa dipanggil dari POST /instagram/scrape.
     """
+    from datetime import datetime, timezone
+
+    from app.domain.scrape_runs.models import ScrapeRun
     from app.infrastructure.database.connection import AsyncSessionLocal
     from app.services.instagram.pipeline_service import scrape_instagram_posts
+    from app.services.instagram.quota_service import enforce_quota
+
+    clean_username = username.strip().lstrip("@").lower()
 
     async def _run():
         async with AsyncSessionLocal() as db:
-            return await scrape_instagram_posts(
+            await enforce_quota(db, operation="search")
+
+            started_at = datetime.now(timezone.utc)
+            scrape_run = ScrapeRun(
+                keyword_text=f"search:{clean_username}", platform="instagram", api_source="provider_fallback",
+                status="running", triggered_by="manual_cli", started_at=started_at,
+            )
+            db.add(scrape_run)
+            await db.flush()
+
+            result = await scrape_instagram_posts(
                 db=db,
-                username=username.strip().lstrip("@").lower(),
+                username=clean_username,
                 max_posts=max_posts,
                 max_comments=max_comments,
                 keyword_id=None,
             )
+
+            scrape_run.status = "success" if result.get("posts_scraped", 0) > 0 else "failed"
+            scrape_run.api_source = result.get("provider_used") or "provider_fallback"
+            scrape_run.videos_fetched = result.get("posts_scraped", 0)
+            scrape_run.videos_new = result.get("posts_saved", 0)
+            scrape_run.error_message = "; ".join(result.get("errors", [])[:3]) or None
+            scrape_run.finished_at = datetime.now(timezone.utc)
+            scrape_run.duration_seconds = (scrape_run.finished_at - started_at).total_seconds()
+            await db.commit()
+            return result
 
     try:
         result = asyncio.run(_run())
