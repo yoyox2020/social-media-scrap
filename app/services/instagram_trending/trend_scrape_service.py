@@ -62,6 +62,7 @@ async def get_trend_scrape_summary(db: AsyncSession, recent_limit: int = 10) -> 
             "used_with_instagram_account":    len(used),
             "total_with_instagram_account":   len(ig_topics),
             "ai_keyword_search_pending":      sum(1 for t, _ in pending if t.source == "ai_keyword_search"),
+            "ai_viral_discovery_pending":     sum(1 for t, _ in pending if t.source == "ai_viral_discovery"),
         },
         "pending_topics": [
             {
@@ -80,6 +81,7 @@ async def get_trend_scrape_summary(db: AsyncSession, recent_limit: int = 10) -> 
                 "topic":            r.keyword_text,
                 "status":           r.status,
                 "triggered_by":     r.triggered_by,
+                "api_source":       r.api_source,
                 "videos_fetched":   r.videos_fetched,
                 "videos_new":       r.videos_new,
                 "duration_seconds": round(r.duration_seconds, 2) if r.duration_seconds is not None else None,

@@ -455,7 +455,8 @@ async def scraping_status_page():
 <div class="ig-grid">
   <div class="ig-card"><div class="label">Pending</div><div class="value" id="its-pending">-</div><div class="sub">nunggu giliran scrape</div></div>
   <div class="ig-card"><div class="label">Sudah Discrape</div><div class="value" id="its-used">-</div><div class="sub">status=used</div></div>
-  <div class="ig-card"><div class="label">Dari AI Search</div><div class="value" id="its-ai-pending">-</div><div class="sub">trigger keyword miss</div></div>
+  <div class="ig-card"><div class="label">Dari AI Search (lama)</div><div class="value" id="its-ai-pending">-</div><div class="sub">riwayat keyword miss</div></div>
+  <div class="ig-card"><div class="label">Dari AI Viral Discovery</div><div class="value" id="its-ai-viral-pending">-</div><div class="sub">sapuan harian 07:00 WIB</div></div>
   <div class="ig-card"><div class="label">Budget Harian</div><div class="value" id="its-budget">-</div><div class="sub">topik/hari (Apify)</div></div>
 </div>
 <table>
@@ -477,6 +478,7 @@ async def scraping_status_page():
     <tr>
       <th>Topik</th>
       <th>Status</th>
+      <th>Sumber</th>
       <th>Post Baru</th>
       <th>Durasi</th>
       <th>Waktu Mulai</th>
@@ -895,6 +897,7 @@ async function load() {
     document.getElementById('its-pending').textContent    = itsSummary.pending_with_instagram_account || 0;
     document.getElementById('its-used').textContent       = itsSummary.used_with_instagram_account || 0;
     document.getElementById('its-ai-pending').textContent = itsSummary.ai_keyword_search_pending || 0;
+    document.getElementById('its-ai-viral-pending').textContent = itsSummary.ai_viral_discovery_pending || 0;
     document.getElementById('its-budget').textContent     = its.daily_budget ?? '-';
 
     const itsPendingTbody = document.getElementById('its-pending-table');
@@ -914,13 +917,17 @@ async function load() {
     const itsRunsTbody = document.getElementById('its-runs-table');
     const itsRuns = its.recent_runs || [];
     if (itsRuns.length === 0) {
-      itsRunsTbody.innerHTML = '<tr><td colspan="6" style="color:#475569;font-style:italic;padding:12px">Belum ada riwayat scrape</td></tr>';
+      itsRunsTbody.innerHTML = '<tr><td colspan="7" style="color:#475569;font-style:italic;padding:12px">Belum ada riwayat scrape</td></tr>';
     } else {
       itsRunsTbody.innerHTML = itsRuns.map(r => {
         const pillClass = r.status === 'success' ? 'pill-success' : (r.status === 'failed' ? 'pill-failed' : 'pill-running');
+        const sourcePill = r.api_source === 'anthropic_web_search'
+          ? '<span class="pill pill-waiting">AI Discovery</span>'
+          : `<span style="color:#64748b;font-size:.72rem">${r.api_source || '-'}</span>`;
         return `<tr>
           <td>${r.topic}</td>
           <td><span class="pill ${pillClass}">${r.status}</span></td>
+          <td>${sourcePill}</td>
           <td class="${(r.videos_new||0)>0?'green':''}">${r.videos_new ?? 0}</td>
           <td style="color:#94a3b8">${r.duration_seconds ?? '-'}s</td>
           <td style="color:#94a3b8;font-size:.75rem">${fmt(r.started_at)}</td>

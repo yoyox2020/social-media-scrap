@@ -36,6 +36,7 @@ celery_app = Celery(
         "app.workers.youtube_worker",
         "app.workers.viral_tracking_worker",
         "app.workers.instagram_trending_worker",
+        "app.workers.viral_discovery_worker",
     ],
 )
 
@@ -75,6 +76,15 @@ celery_app.conf.update(
         "retry-missing-embeddings-every-6h": {
             "task": "workers.retry_missing_embeddings",
             "schedule": crontab(minute=30, hour="1,7,13,19"),
+            "options": {"queue": "default"},
+        },
+        # Viral discovery: Claude (web_search) cari topik+akun Instagram viral
+        # hari ini, submit ke trend_recommendations. Jalan 2 jam SEBELUM
+        # instagram-trend-recommendation-daily-09:00 supaya topik yang
+        # ditemukan punya kesempatan discrape di hari yang sama.
+        "viral-discovery-daily-07:00": {
+            "task": "workers.viral_discovery.daily_scan",
+            "schedule": crontab(hour=7, minute=0),
             "options": {"queue": "default"},
         },
         # Instagram: scrape topik trend_recommendations (via Apify) setiap hari jam 09:00 WIB
