@@ -34,15 +34,27 @@ class SentimentAnalyzer:
     _instance: SentimentAnalyzer | None = None
 
     def __init__(self, model_name: str | None = None, cache_dir: str | None = None):
-        from transformers import pipeline
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
         from app.shared.config import settings
 
         self.model_name = model_name or settings.indobert_model_name
+        resolved_cache_dir = cache_dir or settings.models_cache_dir
+
+        # cache_dir cuma relevan saat DOWNLOAD model/tokenizer — kalau diteruskan
+        # langsung ke pipeline(cache_dir=...), transformers 4.45.x ikut
+        # menyisipkannya ke argumen tokenizer saat inference (bukan cuma
+        # download) dan crash: "_batch_encode_plus() got an unexpected
+        # keyword argument 'cache_dir'". Load tokenizer/model eksplisit dulu
+        # (cache_dir cuma dipakai di sini), baru bungkus jadi pipeline tanpa
+        # cache_dir sama sekali.
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name, cache_dir=resolved_cache_dir)
+        model = AutoModelForSequenceClassification.from_pretrained(self.model_name, cache_dir=resolved_cache_dir)
+
         self._pipeline = pipeline(
             "text-classification",
-            model=self.model_name,
-            cache_dir=cache_dir or settings.models_cache_dir,
+            model=model,
+            tokenizer=tokenizer,
             truncation=True,
             max_length=_MAX_LENGTH,
             device=-1,  # CPU; set 0 untuk GPU

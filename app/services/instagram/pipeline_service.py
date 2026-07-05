@@ -17,10 +17,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.comments.models import Comment
+from app.domain.entities.models import Entity
 from app.domain.posts.models import Post
 from app.domain.youtube_analysis.models import LexiconAnalysis
 from app.services.instagram.providers.registry import search_profile_with_fallback
@@ -67,6 +68,29 @@ async def scrape_instagram_posts(
     """
     max_posts = min(max_posts, MAX_POSTS)
     max_comments = min(max_comments, MAX_COMMENTS)
+
+    # ── Skip kalau akun ini sudah discrape hari ini ────────────────────────────
+    # Beberapa topik trend_recommendations berbeda bisa mengarah ke akun
+    # Instagram yang sama — cek ini sebelum panggil third-party (bukan tabel
+    # counter baru, dihitung langsung dari `posts` yang sudah ada).
+    today_count = await db.scalar(
+        select(func.count()).select_from(Post).where(
+            Post.platform == "instagram",
+            Post.author == username,
+            func.date(Post.collected_at) == datetime.now(timezone.utc).date(),
+        )
+    )
+    if today_count:
+        return {
+            "username": username,
+            "user_info": {"username": username},
+            "posts_scraped": today_count,
+            "posts_saved": 0,
+            "errors": [],
+            "provider_used": "cached_today",
+            "already_scraped_today": True,
+            "_posts_data": [],
+        }
 
     errors: list[str] = []
     user_info: dict[str, Any] = {"username": username}
@@ -159,13 +183,22 @@ async def scrape_instagram_posts(
                     "likes":     meta_row.get("postLikesCount", 0),
                     "comments":  meta_row.get("postCommentsCount", 0),
                     "shortcode": shortcode,
-                    "hashtags":  _extract_hashtags(caption),
-                    "source":    "apify",
+                    "photo_url": meta_row.get("photoUrl"),
+                    "source":    provider_used,
                 },
             )
             db.add(post_obj)
             await db.flush()
             posts_saved_count += 1
+
+            for tag in _extract_hashtags(caption):
+                db.add(Entity(post_id=post_obj.id, text=tag, entity_type="HASHTAG"))
+
+            # Sentimen (IndoBERT) butuh torch/transformers — cuma ada di
+            # container worker-ai, jadi didispatch sebagai task Celery, BUKAN
+            # dipanggil in-process (container ini tidak punya ML deps-nya).
+            from app.workers.ai_worker import analyze_post_task
+            analyze_post_task.delay(str(post_obj.id), run_sentiment=True, run_ner=False, run_embedding=False)
 
         # ── Komentar baru ──────────────────────────────────────────────────────
         new_comments: list[Comment] = []

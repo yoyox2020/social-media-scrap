@@ -47,6 +47,12 @@ class EnsembleDataInstagramProvider(BaseInstagramSearchProvider):
                 caption = post.get("caption")
                 caption_text = caption.get("text", "") if isinstance(caption, dict) else (caption or "")
 
+                # Bentuk umum respons private-API Instagram — belum diverifikasi
+                # live (subscription EnsembleData masih expired), sesuaikan kalau
+                # field aslinya berbeda begitu subscription aktif lagi.
+                image_candidates = (post.get("image_versions2") or {}).get("candidates") or []
+                photo_url = image_candidates[0].get("url") if image_candidates else None
+
                 base = {
                     "postUrl": f"https://www.instagram.com/p/{shortcode}/",
                     "postDescription": caption_text,
@@ -55,6 +61,7 @@ class EnsembleDataInstagramProvider(BaseInstagramSearchProvider):
                     "postCommentsCount": post.get("comment_count", 0),
                     "profileFollowers": user_data.get("follower_count", 0),
                     "profileDescription": user_data.get("biography", ""),
+                    "photoUrl": photo_url,
                 }
 
                 comments: list[dict[str, Any]] = []
