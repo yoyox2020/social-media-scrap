@@ -250,6 +250,36 @@ bisa gagal sendiri-sendiri tanpa menjatuhkan yang lain (persis yang kelihatan
 di dashboard: A gagal karena saldo Anthropic habis, B tetap jalan normal
 pakai data lama).
 
+### Known issue — celah concurrent-run di Subsistem B (ditemukan 05 Juli 2026)
+
+Verifikasi langsung ke DB produksi (`scrape_runs`, `trend_recommendations`)
+menemukan:
+
+- `trend_recommendations` (topic + recommendation_date): **0 duplikat** —
+  logika upsert `submit_recommendations()` benar.
+- `scrape_runs`: **1 kasus duplikat** — topik *"Drawing Shopee Cup 2026"*
+  ter-scrape 2x pada 2026-07-03, jaraknya 2 detik (20:29:41 dan 20:29:43),
+  keduanya `triggered_by='celery_beat'` dan **overlap** (run kedua mulai
+  sebelum run pertama selesai).
+
+**Penyebab:** `run_daily_trend_scrape()` (frozen, Subsistem B) tidak punya
+locking/proteksi concurrent-run. Fungsi ini query topik `status='pending'`
+setiap kali dipanggil — kalau terpanggil 2x berdekatan (jadwal beat + trigger
+manual `POST /instagram/trend-scrape/run`, atau 2x manual saat testing),
+kedua panggilan bisa melihat topik yang sama masih `pending` dan men-scrape-nya
+dua-duanya sebelum salah satu sempat menandai `used`. Catatan tambahan:
+`triggered_by='celery_beat'` di-hardcode di dalam fungsi itu sendiri,
+sehingga label ini tidak membedakan run otomatis vs manual — keduanya
+tertulis sama.
+
+**Dampak:** tidak merusak data (topik tetap jadi `used` normal), tapi boros
+1 unit kuota Apify untuk topik yang sama. Sejauh ini kasus tunggal (bukan
+pola harian berulang) — kemungkinan besar dari testing di sesi ini.
+
+**Status:** didokumentasikan, **belum diperbaiki** — perbaikan (locking/
+guard) akan menyentuh `run_daily_trend_scrape()` yang frozen, jadi menunggu
+konfirmasi eksplisit sebelum diubah.
+
 ### Jadwal Celery Beat — bisa diatur via `.env` (ditambahkan 05 Juli 2026)
 
 Awalnya jam eksekusi (07:00 dan 09:00 WIB) di-hardcode sebagai `crontab()` di
@@ -391,7 +421,7 @@ Semua perubahan sudah di-commit ke git dan di-push ke GitHub, serta di-deploy
 1. **Dua subsistem berantai, bukan satu sistem monolitik.** A (AI discovery)
    menulis ke `trend_recommendations`; B (scrape worker) membaca dari situ.
    Tidak ada pemanggilan langsung antar keduanya — masing-masing bisa gagal
-   sendiri tanpa menjatuhkan yang lain.
+   sendiri tanpa menjatuhkan yang laapakahin.
 2. **Semua panggilan ke pihak ketiga dibungkus jadi "provider yang bisa
    ditukar"** — pola yang sama (registry dict + fallback/pilihan berurutan,
    config-driven) dipakai di 2 tempat: scrape Instagram (Apify → EnsembleData,
