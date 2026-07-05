@@ -11,8 +11,8 @@ sesuai permintaan:
 
 > **Catatan penting:** `trend_recommendations` (model, `submit_recommendations()`,
 > endpoint publik `POST/GET /trend-recommendations`, `run_daily_trend_scrape()`)
-> **dibekukan** — kedua fitur di bawah menulis ke situ lewat fungsi yang sudah
-> ada, tidak pernah mengubah isinya. Lihat `docs/trend-recommendations.md`
+> **dibekukan** — kedua fitur di bawah menulis/membaca situ lewat fungsi yang
+> sudah ada, tidak pernah mengubah logic intinya. Lihat `docs/trend-recommendations.md`
 > untuk dokumentasi fitur inti itu.
 
 ---
@@ -88,9 +88,7 @@ INSTAGRAM_SEARCH_PROVIDER_ORDER=apify
 INSTAGRAM_SEARCH_PROVIDER_ORDER=ensembledata,apify
 ```
 Ganti urutan/nonaktifkan provider yang **sudah terdaftar** = murni ubah baris
-di atas, **restart** container (tidak perlu `--force-recreate` karena bukan
-env var baru, tapi ganti isi env var yang sudah ada tetap butuh restart
-biasa supaya proses baca ulang `.env`).
+di atas + restart container supaya proses baca ulang `.env`.
 
 **Batasan jujur:** kalau nanti mau tambah provider yang **benar-benar baru**
 (belum pernah ada, misal Actor Apify lain atau API pihak ketiga lain), tetap
@@ -104,35 +102,35 @@ baru itu harus ditulis sekali. Yang dijamin "tanpa ubah kode" adalah
 **reorder/nonaktifkan provider yang sudah ada**, bukan menambah yang sama
 sekali baru dari udara.
 
-### Kuota harian ("minimal 3, sisa dipakai di API Instagram lain")
+### Kuota harian search ad-hoc ("minimal 3, sisa dipakai di API Instagram lain")
 
 **File:** `app/services/instagram/quota_service.py`
 
 Tidak ada tabel counter baru — dihitung ulang tiap kali dari tabel
 `scrape_runs` yang sudah ada (pola yang sama dengan `ig_scraped_today` di
-dashboard).
+dashboard). **Ini kuota terpisah** dari budget harian `trend_recommendations`
+di bawah — dibedakan lewat `triggered_by` (`manual_api`/`manual_cli` di sini,
+`celery_beat` untuk pipeline trend).
 
 ```python
-# Config (app/shared/config.py)
+# Config (app/shared/config.py / .env)
 instagram_search_daily_min: int = 3       # minimal panggilan search dijamin/hari
 instagram_shared_daily_budget: int = 10   # total kuota harian (search + API lain)
 ```
 
 Logika `enforce_quota(db, operation="search")`:
 1. Hitung berapa panggilan **search** hari ini (`keyword_text LIKE 'search:%'`)
-   dan total panggilan Instagram ad-hoc hari ini (di luar pipeline
-   `trend_recommendations` yang budgetnya terpisah — dibedakan lewat
-   `triggered_by IN ('manual_api','manual_cli')`, TIDAK `'celery_beat'`).
+   dan total panggilan Instagram ad-hoc hari ini (`triggered_by IN
+   ('manual_api','manual_cli')`, TIDAK `'celery_beat'`).
 2. Kalau search belum sampai **3** hari itu → selalu boleh (floor terjamin).
 3. Kalau sudah lewat 3 tapi total belum sampai **10** → masih boleh (pakai
    sisa kuota bersama).
-4. Kalau sudah 10 → ditolak (`ExternalAPIError`, HTTP-level muncul sebagai error biasa).
+4. Kalau sudah 10 → ditolak (`ExternalAPIError`).
 
 Dipanggil di 2 titik pemicu manual: `GET /instagram/posts` dan
 `POST /instagram/scrape` (`instagram_scrape_username_task`). Pipeline harian
-`trend_recommendations` (jadwal 09:00 WIB) **tidak kena kuota ini sama
-sekali** — dia punya budget sendiri (`instagram_trend_daily_budget=3`) yang
-sudah ada sebelum sesi ini dan tidak disentuh.
+`trend_recommendations` (Subsistem B di bawah) **tidak kena kuota ini sama
+sekali** — dia punya budget & logika seleksi sendiri.
 
 ### Bukti kerja nyata (diverifikasi 04-05 Juli 2026)
 
@@ -160,41 +158,40 @@ otomatis coba EnsembleData, dan baru benar-benar gagal kalau keduanya mati).
 
 ### Apa yang dikerjakan
 
-Task terjadwal baru yang **setiap hari jam 07:00 WIB** menyuruh Claude
-(dengan kemampuan `web_search`) mencari topik/isu yang **benar-benar viral
-hari itu** — bukan satu keyword tertentu, tapi sapuan terbuka lintas berita
-Indonesia + Instagram publik (politik, hiburan, olahraga, produk viral, dll).
-Untuk tiap topik, WAJIB ada akun Instagram nyata yang terkait — kalau tidak
-ketemu akunnya, topik itu tidak disertakan.
+Task terjadwal baru (Subsistem A) yang **setiap hari** (jam diatur via `.env`,
+default 07:00 WIB) menyuruh AI (Claude/OpenAI/Ollama, pilih via `.env`)
+mencari topik/isu yang **benar-benar viral hari itu** — bukan satu keyword
+tertentu, tapi sapuan terbuka lintas berita Indonesia + Instagram publik
+(politik, hiburan, olahraga, produk viral, dll). Untuk tiap topik, WAJIB ada
+akun Instagram nyata yang terkait — kalau tidak ketemu akunnya, topik itu
+tidak disertakan.
 
-Hasilnya otomatis masuk ke `trend_recommendations` (status `pending`),
-lalu ikut antrian pipeline scrape Instagram yang **sudah ada** (budget 3
-topik/hari, jadwal 09:00 WIB) — **2 jam setelah** viral discovery jalan,
-supaya topik yang baru ditemukan berpeluang langsung discrape di hari yang
-sama.
+Hasilnya masuk ke `trend_recommendations` (status `pending`) lewat fungsi
+frozen `submit_recommendations()`, lalu dikonsumsi oleh pipeline scrape
+Instagram yang **sudah ada** (Subsistem B, jam diatur via `.env`, default
+09:00 WIB — 2 jam setelah A, supaya topik baru berpeluang langsung discrape
+di hari yang sama).
 
 ### Struktur folder & file
 
 ```
 app/ai/llm/
-└── viral_discovery_service.py        (BARU — otak AI-nya)
+└── viral_discovery_service.py        (BARU — otak AI-nya, provider Claude/OpenAI/Ollama)
 
 app/services/trend_recommendations/
 └── viral_discovery_scrape_service.py (BARU — orkestrasi, TERPISAH dari
                                         trend_scrape_service.py yang dibekukan)
 
 app/workers/
-├── viral_discovery_worker.py         (BARU — task Celery)
-└── celery_app.py                     (diubah — tambah 1 baris include + 1 beat schedule)
+├── viral_discovery_worker.py         (BARU — task Celery Subsistem A)
+└── celery_app.py                     (diubah — +1 include, +2 beat schedule, jam via .env)
 ```
 
-### Cara kerja (alur lengkap)
+### Cara kerja — dua subsistem berantai, bukan satu sistem monolitik
 
 ```
-07:00 WIB — Celery Beat trigger workers.viral_discovery.daily_scan
-        │
-        ▼
-viral_discovery_worker.viral_discovery_daily_task
+[Subsistem A — default 07:00 WIB, jam diatur via .env]
+Celery Beat → workers.viral_discovery.daily_scan
         │
         ▼
 viral_discovery_scrape_service.run_daily_viral_discovery(db)
@@ -203,59 +200,119 @@ viral_discovery_scrape_service.run_daily_viral_discovery(db)
         │
         ├─ 2. Panggil viral_discovery_service.find_daily_viral_topics()
         │       │
-        │       ├─ Claude (model: claude-opus-4-8) + tool web_search
+        │       ├─ provider dari AI_DISCOVERY_PROVIDER (anthropic/openai/ollama)
+        │       ├─ hanya "anthropic" (Claude) yang punya web_search bawaan —
+        │       │   openai/ollama function-calling saja, TIDAK bisa browsing
         │       ├─ System prompt: "cari topik viral HARI INI, berita + IG
         │       │   publik Indonesia, WAJIB ada akun instagram nyata,
-        │       │   maks 10 topik, jangan mengarang"
-        │       └─ Claude panggil tool submit_trend_topics(items=[...])
+        │       │   maks viral_discovery_max_topics topik, jangan mengarang"
+        │       └─ tool submit_trend_topics(items=[...])
         │           → return list [{topic, score, related_accounts}, ...]
         │
         ├─ 3. Kalau ada hasil: panggil submit_recommendations() — FUNGSI
-        │       FROZEN yang sudah ada, dipanggil apa adanya (sama seperti
-        │       yang dipakai POST /trend-recommendations publik)
+        │       FROZEN, dipanggil apa adanya (sama seperti yang dipakai
+        │       POST /trend-recommendations publik)
         │       → topik masuk trend_recommendations, status='pending',
         │         source='ai_viral_discovery'
         │
         └─ 4. Update ScrapeRun: status=success/failed, videos_fetched=jumlah
                topik ditemukan, videos_new=jumlah yang benar-benar 'created'
 
+                    ↓ (topik menunggu di tabel trend_recommendations)
 
-09:00 WIB — pipeline scrape harian (SUDAH ADA, tidak diubah) ambil topik
-            pending (termasuk yang baru dari viral discovery), scrape via
-            provider abstraction di atas, tandai 'used' kalau berhasil.
+[Subsistem B — default 09:00 WIB, jam diatur via .env, SUDAH ADA sebelum sesi ini, TIDAK DIUBAH]
+run_daily_trend_scrape() — app/services/instagram_trending/trend_scrape_service.py
+        │
+        ├─ Ambil SEMUA TrendRecommendation dengan status='pending'
+        │   (lintas tanggal — bukan cuma hari ini), urutkan SCORE TERTINGGI
+        │   dulu (bukan berdasarkan terbaru/tanggal submit)
+        ├─ Filter yang punya akun Instagram valid
+        ├─ Ambil sejumlah `instagram_trend_daily_budget` (skrng 5) teratas
+        │   dari hasil filter+sort itu — SATU pool tunggal, tidak ada split
+        │   "3 terbaru + 3 pending lama"
+        │
+        └─ Untuk tiap topik terpilih: scrape via provider abstraction (Apify,
+           fallback EnsembleData)
+              berhasil (>=1 post)? → topic.status = 'used'
+              gagal (exception/0 post)? → ScrapeRun dicatat status='failed',
+                TAPI topic.status TETAP 'pending' (tidak ada flag "gagal"
+                terpisah di topiknya) → otomatis ikut diranking ulang lagi
+                besok kalau scorenya masih masuk top-budget
 ```
 
-### Konfigurasi
+**Poin penting yang sering disalahpahami:**
+- Tidak ada pembagian eksplisit "3 topik terbaru + 3 topik pending lama, sisanya masuk antrian berikutnya". Seleksinya murni **satu ranking by score**, dipotong di angka budget. Topik pending yang tidak kebagian (score lebih rendah) otomatis "menunggu giliran" hanya karena dia tetap `status='pending'` dan ikut di-query ulang besok — bukan karena ada struktur antrian terpisah.
+- Tidak ada kolom/flag "failed" di tabel `trend_recommendations` sendiri. Kegagalan hanya tercatat di baris `ScrapeRun` (log per-attempt); topiknya sendiri tetap `pending` sampai suatu saat berhasil di-scrape (jadi `used`) atau tergeser keluar dari `trend_recommendations` lewat mekanisme eviction `submit_recommendations()` (skor terendah tergusur kalau `MAX_PER_DAY=20` per tanggal penuh dan ada topik baru dengan skor lebih tinggi).
+
+Keduanya cuma terhubung lewat tabel `trend_recommendations` — A menulis, B
+membaca. Tidak ada pemanggilan langsung antar keduanya, jadi masing-masing
+bisa gagal sendiri-sendiri tanpa menjatuhkan yang lain (persis yang kelihatan
+di dashboard: A gagal karena saldo Anthropic habis, B tetap jalan normal
+pakai data lama).
+
+### Jadwal Celery Beat — bisa diatur via `.env` (ditambahkan 05 Juli 2026)
+
+Awalnya jam eksekusi (07:00 dan 09:00 WIB) di-hardcode sebagai `crontab()` di
+`celery_app.py`. Sekarang dibaca dari config, default tetap sama seperti
+sebelumnya:
+
+```bash
+# .env
+VIRAL_DISCOVERY_SCHEDULE_HOUR=7
+VIRAL_DISCOVERY_SCHEDULE_MINUTE=0
+INSTAGRAM_TREND_SCRAPE_SCHEDULE_HOUR=9
+INSTAGRAM_TREND_SCRAPE_SCHEDULE_MINUTE=0
+```
+
+Ganti jam = ubah 4 baris ini di `.env`, lalu `docker compose up -d
+--force-recreate --no-deps api worker worker-beat worker-ai` (perlu
+`--force-recreate`, bukan `restart` biasa, karena env var baru) supaya
+proses baca ulang `.env`; kemudian install ulang paket yang ikut terhapus
+(`pip install apify-client anthropic openai` di tiap container yang
+di-recreate — gotcha bawaan server ini, `docker compose build` gagal karena
+`Network is unreachable` ke PyPI).
+
+### Konfigurasi lengkap
 
 ```python
 # app/shared/config.py
-anthropic_api_key: str = ""              # sudah ada dari fitur sebelumnya
+ai_discovery_provider: str = "anthropic"     # anthropic | openai | ollama
+anthropic_api_key: str = ""
 anthropic_model: str = "claude-opus-4-8"
-viral_discovery_max_topics: int = 10     # BARU — batas topik per hari, sengaja
-                                          # di bawah MAX_PER_DAY=20 (batas trend_
-                                          # recommendations) supaya tidak
-                                          # memonopoli slot harian
+openai_api_key: str = ""
+openai_model: str = "gpt-4o"
+viral_discovery_max_topics: int = 10         # batas topik/hari, sengaja di
+                                              # bawah MAX_PER_DAY=20 (batas
+                                              # trend_recommendations) supaya
+                                              # tidak memonopoli slot harian
+
+instagram_trend_daily_budget: int = 5        # maks topik discrape/hari (Subsistem B)
+instagram_trend_posts_per_topic: int = 1
+instagram_trend_comments_per_post: int = 10
+
+viral_discovery_schedule_hour: int = 7
+viral_discovery_schedule_minute: int = 0
+instagram_trend_scrape_schedule_hour: int = 9
+instagram_trend_scrape_schedule_minute: int = 0
 ```
 
-```python
-# app/workers/celery_app.py — beat schedule baru
-"viral-discovery-daily-07:00": {
-    "task": "workers.viral_discovery.daily_scan",
-    "schedule": crontab(hour=7, minute=0),
-    "options": {"queue": "default"},
-},
-```
+**Catatan provider AI:** ganti `AI_DISCOVERY_PROVIDER` di `.env` = ganti
+manual saja, **tidak ada auto-fallback** antar provider AI (beda dengan
+provider scraping Instagram di atas yang auto-fallback). Kalau provider
+gagal (mis. saldo habis), run hari itu gagal — bukan otomatis coba provider
+lain. Hanya "anthropic" yang genuinely bisa browsing web hari ini; openai/
+ollama function-calling saja (hasil bisa basi, dari pengetahuan training).
 
 ### Cara pantau "bukti status pencarian tiap hari"
 
-Sesuai permintaan, setiap run viral discovery meninggalkan jejak yang bisa
-dilihat tanpa psql manual:
-
 1. **Dashboard publik**: `http://187.77.125.10:8000/scraping-status`
    → section "Instagram Trend-Scrape" — kartu **"Dari AI Viral Discovery"**
-   (jumlah topik pending dari sumber ini) dan tabel **"Riwayat Scrape
-   Instagram"** — kolom **"Sumber"** menampilkan pill khusus **"AI
-   Discovery"** untuk baris yang berasal dari `anthropic_web_search`.
+   (jumlah topik pending dari sumber ini), tabel **"Riwayat Scrape
+   Instagram"** dengan kolom **"Sumber"** (pill "AI Discovery" untuk baris
+   dari `anthropic_web_search`), dan diagram **"Alur Pipeline Live"** —
+   animasi titik-titik menunjukkan tepat di subsistem mana batch hari itu
+   berhenti (real, berbasis korelasi run AI terakhir → topik yang dihasilkan
+   → status scrape tiap topik itu, bukan status independen tiap subsistem).
 
 2. **API (butuh login)**: `GET /api/v1/instagram/trend-scrape/status`
    ```json
@@ -273,11 +330,12 @@ dilihat tanpa psql manual:
          "videos_new": 4,
          "started_at": "2026-07-06T00:00:12+00:00"
        }
-     ]
+     ],
+     "viral_discovery_trace": { "ai_run": {...}, "topics": [...] }
    }
    ```
 
-3. **Trigger manual** (tanpa nunggu jam 07:00, untuk testing):
+3. **Trigger manual** (tanpa nunggu jadwal, untuk testing):
    ```bash
    docker exec social_intel_worker python -c "
    from app.workers.viral_discovery_worker import viral_discovery_daily_task
@@ -288,14 +346,16 @@ dilihat tanpa psql manual:
 ### Status verifikasi (05 Juli 2026)
 
 ✅ Seluruh pipeline **terbukti berjalan benar secara teknis** — ScrapeRun
-tercatat, error ditangani dengan baik, task selesai tanpa crash.
+tercatat, error ditangani dengan baik, task selesai tanpa crash. Jadwal
+07:00/09:00 WIB terbukti live dibaca dari `.env` (dicek langsung lewat
+`printenv` di dalam container dan `celery_app.conf.beat_schedule`).
 
 ❌ **Belum bisa dibuktikan menghasilkan topik nyata** — satu-satunya test run
 gagal karena **saldo API Anthropic habis** ("Your credit balance is too low
 to access the Anthropic API"). Ini murni masalah billing eksternal, bukan
 bug kode. Begitu saldo di-top-up di [console Anthropic](https://console.anthropic.com/settings/billing),
-fitur ini otomatis jalan penuh — baik lewat jadwal 07:00 WIB besok maupun
-trigger manual di atas.
+fitur ini otomatis jalan penuh — baik lewat jadwal terjadwal maupun trigger
+manual di atas.
 
 ---
 
@@ -303,54 +363,52 @@ trigger manual di atas.
 
 | File | Status | Keterangan |
 |---|---|---|
-| `app/shared/config.py` | diubah | tambah 6 setting baru (provider order, kuota, viral_discovery_max_topics) |
+| `app/shared/config.py` | diubah | provider order, kuota, `viral_discovery_max_topics`, jadwal beat |
 | `app/services/instagram/providers/*.py` | **baru** | abstraksi provider (5 file) |
-| `app/services/instagram/quota_service.py` | **baru** | kuota harian |
+| `app/services/instagram/quota_service.py` | **baru** | kuota harian search ad-hoc |
 | `app/services/instagram/pipeline_service.py` | diubah | 1 baris: pakai provider abstraction, bukan Apify langsung |
 | `app/api/v1/instagram/router.py` | diubah | `GET /instagram/posts`: wire quota check + catat ScrapeRun |
 | `app/workers/instagram_trending_worker.py` | diubah | `scrape_username_task`: wire quota check + catat ScrapeRun |
-| `app/ai/llm/viral_discovery_service.py` | **baru** | otak AI viral discovery |
+| `app/ai/llm/viral_discovery_service.py` | **baru** | otak AI viral discovery (multi-provider) |
 | `app/services/trend_recommendations/viral_discovery_scrape_service.py` | **baru** | orkestrasi (terpisah dari file frozen) |
-| `app/workers/viral_discovery_worker.py` | **baru** | task Celery |
-| `app/workers/celery_app.py` | diubah | +1 worker module, +1 beat schedule |
-| `app/services/instagram_trending/trend_scrape_service.py` | diubah | HANYA `get_trend_scrape_summary()` (fungsi baca-saja) ditambah 2 field baru |
-| `app/main.py` | diubah | dashboard: kartu + kolom baru untuk AI Viral Discovery |
+| `app/workers/viral_discovery_worker.py` | **baru** | task Celery Subsistem A |
+| `app/workers/celery_app.py` | diubah | +1 worker module, +2 beat schedule, jam via config/.env |
+| `app/services/instagram_trending/trend_scrape_service.py` | diubah | HANYA `get_trend_scrape_summary()` (fungsi baca-saja) ditambah field baru + `viral_discovery_trace` |
+| `app/main.py` | diubah | dashboard: kartu, kolom, dan diagram alur pipeline live untuk AI Viral Discovery |
 
 **Tidak diubah sama sekali** (frozen, sesuai instruksi): `app/domain/trend_recommendations/*`,
 `app/services/trend_recommendations/service.py`, `app/api/v1/trend_recommendations.py`,
-fungsi `run_daily_trend_scrape()` di dalam `trend_scrape_service.py`.
+fungsi `run_daily_trend_scrape()` di dalam `trend_scrape_service.py` (hanya
+fungsi baca `get_trend_scrape_summary()` di file yang sama yang ditambah).
 
-Semua perubahan sudah di-commit ke git (`78f8255`, `63e321b`), di-push ke
-GitHub, dan di-deploy + diverifikasi jalan di server production
-(187.77.125.10).
+Semua perubahan sudah di-commit ke git dan di-push ke GitHub, serta di-deploy
++ diverifikasi jalan di server production (187.77.125.10).
 
+---
 
+## Inti Desain — Ringkasan
 
-1. Dua subsistem berantai (bukan satu sistem monolitik)
-
-[07:00 WIB] Subsistem A — AI Viral Discovery
-    AI (Claude/OpenAI/Ollama, pilih via .env) cari topik+akun IG viral HARI INI
-    → submit ke trend_recommendations (status=pending)
-
-           ↓ (topik menunggu di database)
-
-[09:00 WIB] Subsistem B — Scrape Worker (sudah ada sebelumnya, tidak diubah)
-    Ambil topik pending → scrape akun via provider (Apify, fallback EnsembleData)
-    → berhasil? tandai 'used'. gagal? tetap 'pending', dicoba lagi besok
-Keduanya cuma terhubung lewat tabel trend_recommendations — A menulis, B membaca. Tidak ada pemanggilan langsung antar keduanya, jadi masing-masing bisa gagal sendiri-sendiri tanpa menjatuhkan yang lain (persis yang kelihatan di screenshot kemarin: A gagal karena saldo habis, B tetap jalan normal pakai data lama).
-
-2. Semua panggilan ke pihak ketiga dibungkus jadi "provider yang bisa ditukar"
-Ada 2 titik yang sama-sama pakai pola ini (registry dict + fallback berurutan, config-driven):
-
-Scrape Instagram (app/services/instagram/providers/): Apify dulu, EnsembleData kalau Apify gagal.
-AI Discovery (app/ai/llm/viral_discovery_service.py): Claude/OpenAI/Ollama, dipilih via AI_DISCOVERY_PROVIDER.
-Prinsipnya sama persis di keduanya: kode pemanggil tidak pernah tahu/peduli provider mana yang sebenarnya jalan — tinggal ganti urutan/provider di .env, restart, selesai.
-
-3. Kuota & nominal semuanya di config, bukan hardcode
-instagram_trend_daily_budget=5, instagram_search_daily_min=3, instagram_shared_daily_budget=10, viral_discovery_max_topics=10 — semua angka ini murni parameter .env, dihitung ulang tiap saat dari data scrape_runs/trend_recommendations yang sudah ada (tidak ada tabel counter baru).
-
-4. Monitoring melacak batch nyata, bukan status independen
-Dashboard /scraping-status mengambil 1 run AI terakhir, cari topik persis yang dihasilkan run itu, lalu cek status scrape masing-masing topik itu — sehingga diagram alur menunjukkan tepat di mana proses berhenti untuk batch itu, bukan cuma "lampu hijau/merah" yang tidak nyambung satu sama lain.
-
-5. Satu aturan yang mengikat semuanya
-trend_recommendations (tabel, endpoint publik, fungsi submit_recommendations(), worker konsumen) tidak pernah diubah — semua fitur baru hari ini cuma menambah cara baru untuk MENULIS ke situ (AI discovery) atau membaca statusnya (monitoring), tidak pernah menyentuh logic intinya.
+1. **Dua subsistem berantai, bukan satu sistem monolitik.** A (AI discovery)
+   menulis ke `trend_recommendations`; B (scrape worker) membaca dari situ.
+   Tidak ada pemanggilan langsung antar keduanya — masing-masing bisa gagal
+   sendiri tanpa menjatuhkan yang lain.
+2. **Semua panggilan ke pihak ketiga dibungkus jadi "provider yang bisa
+   ditukar"** — pola yang sama (registry dict + fallback/pilihan berurutan,
+   config-driven) dipakai di 2 tempat: scrape Instagram (Apify → EnsembleData,
+   auto-fallback) dan AI discovery (Claude/OpenAI/Ollama, pilih manual via
+   `AI_DISCOVERY_PROVIDER`, tidak auto-fallback).
+3. **Kuota, budget, dan jadwal semuanya di config, bukan hardcode** —
+   `instagram_trend_daily_budget`, `instagram_search_daily_min`,
+   `instagram_shared_daily_budget`, `viral_discovery_max_topics`, dan jam
+   Celery Beat (`*_schedule_hour`/`*_schedule_minute`) semua bisa diubah
+   lewat `.env` tanpa ubah kode.
+4. **Monitoring melacak batch nyata, bukan status independen** — dashboard
+   `/scraping-status` mengambil 1 run AI terakhir, cari topik persis yang
+   dihasilkan run itu, lalu cek status scrape masing-masing topik itu,
+   sehingga diagram alur menunjukkan tepat di mana proses berhenti untuk
+   batch itu.
+5. **Satu aturan yang mengikat semuanya**: `trend_recommendations` (tabel,
+   endpoint publik, `submit_recommendations()`, `run_daily_trend_scrape()`)
+   tidak pernah diubah — semua fitur baru cuma menambah cara baru untuk
+   MENULIS ke situ (AI discovery) atau MEMBACA statusnya (monitoring), tidak
+   pernah menyentuh logic intinya.
