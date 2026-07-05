@@ -154,6 +154,12 @@ Instagram (09:00), supaya tidak rebutan resource. Configurable via `.env`:
 - **Provider cuma 1 (Apify)** — kalau Apify gagal untuk suatu akun, TIDAK
   ada fallback lain saat ini (slot kosong, siap diisi begitu ada provider
   lain, misal Meta app Business terverifikasi, atau pihak ketiga lain).
-- **Belum terintegrasi ke dashboard `/scraping-status`** — monitoring
-  "Sedang Berjalan Sekarang" & pipeline flow diagram saat ini cuma pantau
-  Instagram; belum diminta untuk Facebook di sesi ini.
+- **Pipeline flow diagram (Subsistem A→B) belum menampilkan Facebook** —
+  diagram itu spesifik korelasi 1 run AI Discovery ke topiknya, dibiarkan
+  Instagram-only untuk sekarang (belum diminta). **Monitoring dasar SUDAH
+  ada** (ditambahkan setelah dokumen ini pertama ditulis): section
+  "Facebook Trend-Scrape" (cards + pending topics + riwayat run) sejajar
+  dengan Instagram di `/scraping-status`, dan "Sedang Berjalan Sekarang"
+  sekarang gabungan Instagram+Facebook dengan kolom Platform. Lihat
+  `get_facebook_trend_scrape_summary()` di
+  `app/services/facebook/trend_scrape_service.py`.
