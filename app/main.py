@@ -513,6 +513,7 @@ async def scraping_status_page():
 <table>
   <thead>
     <tr>
+      <th>Platform</th>
       <th>Topik / Akun</th>
       <th>Dipicu Oleh</th>
       <th>Sumber</th>
@@ -557,6 +558,42 @@ async def scraping_status_page():
     </tr>
   </thead>
   <tbody id="its-runs-table"></tbody>
+</table>
+
+<div class="section-title" style="margin-top:24px">Facebook Trend-Scrape (trend_recommendations)</div>
+<div class="ig-grid">
+  <div class="ig-card"><div class="label">Pending</div><div class="value" id="fts-pending">-</div><div class="sub">nunggu giliran scrape</div></div>
+  <div class="ig-card"><div class="label">Sudah Discrape</div><div class="value" id="fts-used">-</div><div class="sub">status=used</div></div>
+  <div class="ig-card"><div class="label">Budget Harian</div><div class="value" id="fts-budget">-</div><div class="sub">topik/hari (Apify)</div></div>
+  <div class="ig-card"><div class="label">Jadwal</div><div class="value" id="fts-schedule" style="font-size:1rem">-</div><div class="sub">Celery Beat</div></div>
+</div>
+<table>
+  <thead>
+    <tr>
+      <th>Topik</th>
+      <th>Score</th>
+      <th>Akun FB</th>
+      <th>Sumber</th>
+      <th>Dibuat</th>
+    </tr>
+  </thead>
+  <tbody id="fts-pending-table"></tbody>
+</table>
+
+<div class="section-title" style="margin-top:24px">Riwayat Scrape Facebook (trend_recommendations)</div>
+<table>
+  <thead>
+    <tr>
+      <th>Topik</th>
+      <th>Status</th>
+      <th>Sumber</th>
+      <th>Post Baru</th>
+      <th>Durasi</th>
+      <th>Waktu Mulai</th>
+      <th>Error</th>
+    </tr>
+  </thead>
+  <tbody id="fts-runs-table"></tbody>
 </table>
 
 <div class="section-title" style="margin-top:24px">Riwayat Scraping Keyword</div>
@@ -1069,16 +1106,62 @@ async function load() {
       </tr>`).join('');
     }
 
-    const itsRunningTbody = document.getElementById('its-running-table');
-    const itsRunning = its.running_now || [];
-    const triggerLabel = { manual_api: 'Manual (Frontend/API)', manual_cli: 'Manual (CLI)', celery_beat: 'Otomatis (Jadwal)' };
-    if (itsRunning.length === 0) {
-      itsRunningTbody.innerHTML = '<tr><td colspan="4" style="color:#475569;font-style:italic;padding:12px">Tidak ada scraping yang sedang berjalan</td></tr>';
+    // ── Facebook trend-scrape (trend_recommendations) ────────────────────────
+    const fts = d.facebook_trend_scrape || {};
+    const ftsSummary = fts.summary || {};
+    document.getElementById('fts-pending').textContent  = ftsSummary.pending_with_facebook_account || 0;
+    document.getElementById('fts-used').textContent     = ftsSummary.used_with_facebook_account || 0;
+    document.getElementById('fts-budget').textContent   = fts.daily_budget ?? '-';
+    document.getElementById('fts-schedule').textContent = fts.schedule ?? '-';
+
+    const ftsPendingTbody = document.getElementById('fts-pending-table');
+    const ftsPending = fts.pending_topics || [];
+    if (ftsPending.length === 0) {
+      ftsPendingTbody.innerHTML = '<tr><td colspan="5" style="color:#475569;font-style:italic;padding:12px">Tidak ada topik pending</td></tr>';
     } else {
-      itsRunningTbody.innerHTML = itsRunning.map(r => {
+      ftsPendingTbody.innerHTML = ftsPending.map(t => `<tr>
+        <td>${t.topic}</td>
+        <td>${(t.score||0).toFixed(2)}</td>
+        <td>@${t.facebook_identifier || '-'}</td>
+        <td style="color:#64748b;font-size:.72rem">${t.source || '-'}</td>
+        <td style="color:#94a3b8;font-size:.75rem">${fmt(t.created_at)}</td>
+      </tr>`).join('');
+    }
+
+    const ftsRunsTbody = document.getElementById('fts-runs-table');
+    const ftsRuns = fts.recent_runs || [];
+    if (ftsRuns.length === 0) {
+      ftsRunsTbody.innerHTML = '<tr><td colspan="7" style="color:#475569;font-style:italic;padding:12px">Belum ada riwayat scrape</td></tr>';
+    } else {
+      ftsRunsTbody.innerHTML = ftsRuns.map(r => {
+        const pillClass = r.status === 'success' ? 'pill-success' : (r.status === 'failed' ? 'pill-failed' : 'pill-running');
+        return `<tr>
+          <td>${r.topic}</td>
+          <td><span class="pill ${pillClass}">${r.status}</span></td>
+          <td style="color:#64748b;font-size:.72rem">${r.api_source || '-'}</td>
+          <td class="${(r.videos_new||0)>0?'green':''}">${r.videos_new ?? 0}</td>
+          <td style="color:#94a3b8">${r.duration_seconds ?? '-'}s</td>
+          <td style="color:#94a3b8;font-size:.75rem">${fmt(r.started_at)}</td>
+          <td class="error-text" title="${r.error_message||''}">${r.error_message || '-'}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    // ── Sedang Berjalan Sekarang — gabungan Instagram + Facebook ─────────────
+    const itsRunningTbody = document.getElementById('its-running-table');
+    const triggerLabel = { manual_api: 'Manual (Frontend/API)', manual_cli: 'Manual (CLI)', celery_beat: 'Otomatis (Jadwal)' };
+    const allRunning = [
+      ...(its.running_now || []).map(r => ({ ...r, platform: 'Instagram' })),
+      ...(fts.running_now || []).map(r => ({ ...r, platform: 'Facebook' })),
+    ];
+    if (allRunning.length === 0) {
+      itsRunningTbody.innerHTML = '<tr><td colspan="5" style="color:#475569;font-style:italic;padding:12px">Tidak ada scraping yang sedang berjalan</td></tr>';
+    } else {
+      itsRunningTbody.innerHTML = allRunning.map(r => {
         const secs = r.elapsed_seconds || 0;
         const elapsed = secs < 60 ? `${secs.toFixed(0)}d` : `${Math.floor(secs/60)}m ${(secs%60).toFixed(0)}d`;
         return `<tr>
+          <td><span class="pill ${r.platform === 'Facebook' ? 'pill-waiting' : 'pill-success'}">${r.platform}</span></td>
           <td><span class="live-dot"></span>${r.topic}</td>
           <td>${triggerLabel[r.triggered_by] || r.triggered_by}</td>
           <td style="color:#64748b;font-size:.72rem">${r.api_source || '-'}</td>

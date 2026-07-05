@@ -133,3 +133,81 @@ async def run_daily_trend_scrape_facebook(db: AsyncSession) -> dict:
 
     logger.info("run_daily_trend_scrape_facebook: %d topik diproses", len(results))
     return {"processed": len(results), "results": results}
+
+
+async def get_facebook_trend_scrape_summary(db: AsyncSession, recent_limit: int = 10) -> dict:
+    """
+    Ringkasan pipeline scrape Facebook dari `trend_recommendations` — dipakai
+    baik oleh endpoint publik `GET /youtube/monitor-public` (dashboard
+    `/scraping-status`) maupun endpoint ber-auth kalau nanti dibutuhkan.
+    Mirroring get_trend_scrape_summary() Instagram, TAPI dipisah karena
+    sumbernya beda kolom (related_account platform='facebook').
+    """
+    all_topics = (await db.scalars(select(TrendRecommendation))).all()
+    fb_topics = [(t, _facebook_identifier(t)) for t in all_topics if _facebook_identifier(t)]
+    pending = [(t, u) for t, u in fb_topics if t.status == "pending"]
+    used = [(t, u) for t, u in fb_topics if t.status == "used"]
+    pending_sorted = sorted(pending, key=lambda tu: tu[0].score, reverse=True)
+
+    runs = (await db.scalars(
+        select(ScrapeRun)
+        .where(ScrapeRun.platform == "facebook")
+        .order_by(ScrapeRun.started_at.desc())
+        .limit(recent_limit)
+    )).all()
+
+    now = datetime.now(timezone.utc)
+    running_runs = (await db.scalars(
+        select(ScrapeRun)
+        .where(ScrapeRun.platform == "facebook", ScrapeRun.status == "running")
+        .order_by(ScrapeRun.started_at.desc())
+    )).all()
+
+    return {
+        "daily_budget": settings.facebook_trend_daily_budget,
+        "schedule": (
+            f"{settings.facebook_trend_scrape_schedule_hour:02d}:"
+            f"{settings.facebook_trend_scrape_schedule_minute:02d} WIB otomatis (Celery Beat)"
+        ),
+        "summary": {
+            "pending_with_facebook_account": len(pending),
+            "used_with_facebook_account":    len(used),
+            "total_with_facebook_account":   len(fb_topics),
+        },
+        "pending_topics": [
+            {
+                "topic":               t.topic,
+                "score":               t.score,
+                "facebook_identifier": u,
+                "source":              t.source,
+                "recommendation_date": t.recommendation_date.isoformat(),
+                "created_at":          t.created_at.isoformat(),
+            }
+            for t, u in pending_sorted
+        ],
+        "recent_runs": [
+            {
+                "topic":            r.keyword_text,
+                "status":           r.status,
+                "triggered_by":     r.triggered_by,
+                "api_source":       r.api_source,
+                "videos_fetched":   r.videos_fetched,
+                "videos_new":       r.videos_new,
+                "duration_seconds": round(r.duration_seconds, 2) if r.duration_seconds is not None else None,
+                "error_message":    r.error_message,
+                "started_at":       r.started_at.isoformat(),
+                "finished_at":      r.finished_at.isoformat() if r.finished_at else None,
+            }
+            for r in runs
+        ],
+        "running_now": [
+            {
+                "topic":           r.keyword_text,
+                "triggered_by":    r.triggered_by,
+                "api_source":      r.api_source,
+                "started_at":      r.started_at.isoformat(),
+                "elapsed_seconds": round((now - r.started_at).total_seconds(), 1),
+            }
+            for r in running_runs
+        ],
+    }
