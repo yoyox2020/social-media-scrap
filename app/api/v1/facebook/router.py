@@ -2,15 +2,16 @@
 Facebook API endpoints.
 
 GET  /facebook/posts?username=X    — scrape (via Apify) + ambil post dari page/profil manapun (maks 10)
-GET  /facebook/search?q=keyword    — cari page Facebook berdasarkan keyword (Meta Graph API, TERBUKTI mati — lihat docs/flow scrape/flow-scrap-facebook.md)
+GET  /facebook/posts/search?q=...  — cari post yang SUDAH discrape berdasarkan keyword (bukan username)
+GET  /facebook/search?q=keyword    — cari PAGE Facebook (Meta Graph API, TERBUKTI mati — lihat docs/flow scrape/flow-scrap-facebook.md)
 """
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy import text
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.users.models import User
@@ -186,6 +187,180 @@ async def get_facebook_posts(
             "dominant":       counter.most_common(1)[0][0] if counter else "netral",
             "total_analyzed": total_analyzed,
         },
+        "items": items,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /facebook/posts/search — cari post berdasarkan keyword/hashtag (BUKAN username)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _build_fb_search_items(db: AsyncSession, post_rows) -> list[dict]:
+    """Gabung post + komentar + sentimen (post & komentar) jadi satu ringkasan per post."""
+    if not post_rows:
+        return []
+    post_ids = [r["id"] for r in post_rows]
+
+    sentiment_rows = (await db.execute(text("""
+        SELECT post_id, label, score FROM sentiments WHERE post_id = ANY(:ids)
+    """), {"ids": post_ids})).mappings().all()
+    sentiment_by_post = {s["post_id"]: {"label": s["label"], "score": s["score"]} for s in sentiment_rows}
+
+    comment_rows = (await db.execute(text("""
+        SELECT c.post_id, c.content, c.author, c.published_at, la.label AS lexicon_label
+        FROM comments c
+        LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+        WHERE c.post_id = ANY(:ids)
+        ORDER BY c.created_at DESC
+    """), {"ids": post_ids})).mappings().all()
+
+    comments_by_post: dict = {}
+    for c in comment_rows:
+        comments_by_post.setdefault(c["post_id"], []).append({
+            "content":      c["content"],
+            "author":       c["author"],
+            "published_at": c["published_at"].isoformat() if c["published_at"] else None,
+            "sentiment":    c["lexicon_label"] or "netral",
+        })
+
+    items = []
+    for r in post_rows:
+        meta = r["metadata"] or {}
+        post_comments = comments_by_post.get(r["id"], [])
+        cmt_dist = Counter(c["sentiment"] for c in post_comments)
+        items.append({
+            "post_id":        str(r["id"]),
+            "external_id":    r["external_id"],
+            "author":         r["author"],
+            "message":        r["content"],
+            "url":            r["url"],
+            "likes":          meta.get("likes", 0),
+            "comments_count": meta.get("comments", 0),
+            "published_at":   r["published_at"].isoformat() if r["published_at"] else None,
+            "sentiment": {
+                "post":             sentiment_by_post.get(r["id"]),
+                "comments_summary": {lbl: cmt_dist.get(lbl, 0) for lbl in ["positif", "negatif", "netral"]},
+            },
+            "comments": post_comments,
+        })
+    return items
+
+
+@router.get("/posts/search", response_model=dict,
+            summary="Cari post Facebook yang sudah di-scrape berdasarkan keyword/hashtag")
+async def search_facebook_posts(
+    q: str = Query(..., min_length=1, max_length=200, description="Keyword atau hashtag (boleh pakai # atau tidak)"),
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Cari post Facebook berdasarkan isi CAPTION atau HASHTAG yang sudah
+    tersimpan dari scrape sebelumnya — BUKAN cari page baru (itu
+    `GET /facebook/search`, dan itu sudah mati sejak Meta hapus endpoint-nya).
+
+    **Alur:**
+    1. Cari di `posts.content` dan tabel `entities` (hashtag).
+    2. Kalau tidak ketemu: cari topik yang cocok di `trend_recommendations`
+       (dibaca saja, tidak mengubah logikanya). Kalau ketemu topik dengan
+       akun Facebook → scrape SEKARANG via Apify, langsung return hasilnya.
+    3. Kalau tidak ketemu post maupun topik sama sekali → Apify tidak bisa
+       cari-by-keyword sendiri, jadi tidak ada akun yang bisa discrape;
+       submit manual kalau tahu akunnya via `POST /trend-recommendations`.
+    """
+    q_clean = q.strip().lstrip("#")
+    if not q_clean:
+        raise HTTPException(status_code=422, detail="Keyword tidak boleh kosong")
+
+    # ── 1. Cari di posts.content atau hashtag (entities) ───────────────────────
+    post_rows = (await db.execute(text("""
+        SELECT DISTINCT p.id, p.external_id, p.content, p.author, p.url,
+               p.published_at, p.metadata
+        FROM posts p
+        LEFT JOIN entities e ON e.post_id = p.id AND e.entity_type = 'HASHTAG'
+        WHERE p.platform = 'facebook'
+          AND (p.content ILIKE :kw OR e.text ILIKE :kw_exact)
+        ORDER BY p.published_at DESC NULLS LAST
+        LIMIT :limit
+    """), {"kw": f"%{q_clean}%", "kw_exact": q_clean, "limit": limit})).mappings().all()
+
+    if post_rows:
+        items = await _build_fb_search_items(db, post_rows)
+        return build_success_response({"query": q_clean, "source": "database", "total": len(items), "items": items})
+
+    # ── 2. Tidak ketemu -> cari topik cocok di trend_recommendations ───────────
+    from app.domain.trend_recommendations.models import TrendRecommendation
+
+    candidate_topics = (await db.scalars(
+        select(TrendRecommendation)
+        .where(TrendRecommendation.topic.ilike(f"%{q_clean}%"))
+        .order_by(TrendRecommendation.score.desc())
+    )).all()
+
+    matched_topic = None
+    matched_identifier = None
+    for t in candidate_topics:
+        for acc in t.related_accounts or []:
+            if acc.get("platform") == "facebook" and acc.get("username"):
+                matched_topic = t
+                matched_identifier = acc["username"]
+                break
+        if matched_topic:
+            break
+
+    if not matched_topic:
+        return build_success_response({
+            "query": q_clean, "source": "not_found", "total": 0, "items": [],
+            "message": (
+                "Tidak ditemukan post maupun topik terkait keyword ini. Apify tidak "
+                "bisa cari akun by keyword — kalau tahu akun Facebook-nya, submit "
+                "manual via POST /trend-recommendations."
+            ),
+        })
+
+    # ── 3. Ketemu topik -> scrape sekarang via Apify ────────────────────────────
+    from app.domain.scrape_runs.models import ScrapeRun
+    from app.services.facebook.pipeline_service import scrape_facebook_posts_via_provider
+
+    started_at = datetime.now(timezone.utc)
+    scrape_run = ScrapeRun(
+        keyword_text=f"search:{matched_identifier}", platform="facebook", api_source="apify",
+        status="running", triggered_by="manual_api", started_at=started_at,
+    )
+    db.add(scrape_run)
+    await db.commit()  # commit status='running' segera supaya kelihatan di monitor live
+
+    scrape_result = await scrape_facebook_posts_via_provider(
+        db=db, identifier=matched_identifier, max_posts=5, max_comments=5, keyword_id=None,
+    )
+
+    scrape_run.status = "success" if scrape_result.get("posts_scraped", 0) > 0 else "failed"
+    scrape_run.api_source = scrape_result.get("provider_used") or "apify"
+    scrape_run.videos_fetched = scrape_result.get("posts_scraped", 0)
+    scrape_run.videos_new = scrape_result.get("posts_saved", 0)
+    scrape_run.error_message = "; ".join(scrape_result.get("errors", [])[:3]) or None
+    scrape_run.finished_at = datetime.now(timezone.utc)
+    scrape_run.duration_seconds = (scrape_run.finished_at - started_at).total_seconds()
+
+    if scrape_run.status == "success":
+        matched_topic.status = "used"
+
+    await db.commit()
+
+    # ── Re-query post yang baru discrape untuk akun ini ────────────────────────
+    fresh_rows = (await db.execute(text("""
+        SELECT p.id, p.external_id, p.content, p.author, p.url, p.published_at, p.metadata
+        FROM posts p
+        WHERE p.platform = 'facebook' AND p.author = :identifier
+        ORDER BY p.published_at DESC NULLS LAST
+        LIMIT :limit
+    """), {"identifier": matched_identifier, "limit": limit})).mappings().all()
+
+    items = await _build_fb_search_items(db, fresh_rows)
+    return build_success_response({
+        "query": q_clean, "source": "scraped_now", "total": len(items),
+        "topic": matched_topic.topic, "facebook_identifier": matched_identifier,
+        "note": "Sentimen post baru diproses async (Celery) — mungkin belum muncul kalau baru saja discrape.",
         "items": items,
     })
 
