@@ -88,7 +88,7 @@ def instagram_scrape_username_task(
                 status="running", triggered_by="manual_cli", started_at=started_at,
             )
             db.add(scrape_run)
-            await db.flush()
+            await db.commit()  # commit status='running' segera supaya kelihatan di monitor live (bukan cuma flush)
 
             result = await scrape_instagram_posts(
                 db=db,

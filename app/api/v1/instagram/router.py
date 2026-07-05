@@ -224,7 +224,7 @@ async def get_instagram_posts(
             status="running", triggered_by="manual_api", started_at=started_at,
         )
         db.add(scrape_run)
-        await db.flush()
+        await db.commit()  # commit status='running' segera supaya kelihatan di monitor live (bukan cuma flush)
 
         scrape_result = await scrape_instagram_posts(
             db=db,

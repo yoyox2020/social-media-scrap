@@ -57,6 +57,13 @@ async def get_trend_scrape_summary(db: AsyncSession, recent_limit: int = 10) -> 
     from app.services.trend_recommendations.viral_discovery_scrape_service import get_viral_discovery_trace
     viral_discovery_trace = await get_viral_discovery_trace(db)
 
+    now = datetime.now(timezone.utc)
+    running_runs = (await db.scalars(
+        select(ScrapeRun)
+        .where(ScrapeRun.platform == "instagram", ScrapeRun.status == "running")
+        .order_by(ScrapeRun.started_at.desc())
+    )).all()
+
     return {
         "daily_budget": settings.instagram_trend_daily_budget,
         "schedule": "09:00 WIB otomatis (Celery Beat) — trigger manual: POST /instagram/trend-scrape/run",
@@ -95,6 +102,16 @@ async def get_trend_scrape_summary(db: AsyncSession, recent_limit: int = 10) -> 
             for r in runs
         ],
         "viral_discovery_trace": viral_discovery_trace,
+        "running_now": [
+            {
+                "topic":           r.keyword_text,
+                "triggered_by":    r.triggered_by,
+                "api_source":      r.api_source,
+                "started_at":      r.started_at.isoformat(),
+                "elapsed_seconds": round((now - r.started_at).total_seconds(), 1),
+            }
+            for r in running_runs
+        ],
     }
 
 
@@ -141,7 +158,7 @@ async def run_daily_trend_scrape(db: AsyncSession) -> dict:
             started_at=started_at,
         )
         db.add(scrape_run)
-        await db.flush()
+        await db.commit()  # commit status='running' segera supaya kelihatan di monitor live (bukan cuma flush)
 
         try:
             result = await scrape_instagram_posts(

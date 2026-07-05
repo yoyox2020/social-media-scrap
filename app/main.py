@@ -353,6 +353,11 @@ async def scraping_status_page():
                            background-size: 12px 3px; animation: pf-flow 0.7s linear infinite; }
   .pf-connector.blocked { background: repeating-linear-gradient(90deg, #f87171 0 6px, transparent 6px 12px); }
   @keyframes pf-flow { from { background-position: 0 0; } to { background-position: -12px 0; } }
+  /* Indikator "sedang berjalan sekarang" — trigger baru (frontend/manual/jadwal) */
+  .live-dot { width: 9px; height: 9px; border-radius: 50%; background: #60a5fa; display: inline-block;
+              margin-right: 6px; animation: live-pulse 1.4s ease-in-out infinite; }
+  @keyframes live-pulse { 0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(96,165,250,0.5); }
+                          50% { opacity: 0.6; box-shadow: 0 0 0 5px rgba(96,165,250,0); } }
   .pf-legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 0.7rem; color: #64748b; margin-bottom: 14px; }
   .pf-legend-item { display: flex; align-items: center; gap: 5px; }
   .pf-legend-dot { width: 10px; height: 10px; border-radius: 50%; border: 2px solid; }
@@ -503,6 +508,19 @@ async def scraping_status_page():
   <tbody id="pf-batch-table"></tbody>
 </table>
 <div class="pf-empty-hint" id="pf-empty-hint" style="display:none">Belum ada run AI Viral Discovery tercatat — jalan otomatis jam 07:00 WIB, atau trigger manual untuk test.</div>
+
+<div class="section-title" style="margin-top:24px">Sedang Berjalan Sekarang</div>
+<table>
+  <thead>
+    <tr>
+      <th>Topik / Akun</th>
+      <th>Dipicu Oleh</th>
+      <th>Sumber</th>
+      <th>Sudah Berjalan</th>
+    </tr>
+  </thead>
+  <tbody id="its-running-table"></tbody>
+</table>
 
 <div class="section-title" style="margin-top:24px">Instagram Trend-Scrape (trend_recommendations)</div>
 <div class="ig-grid">
@@ -1049,6 +1067,24 @@ async function load() {
         <td>${t.is_ai_keyword_search ? '<span class="pill pill-waiting">AI Search</span>' : '<span style="color:#64748b;font-size:.72rem">manual</span>'}</td>
         <td style="color:#94a3b8;font-size:.75rem">${fmt(t.created_at)}</td>
       </tr>`).join('');
+    }
+
+    const itsRunningTbody = document.getElementById('its-running-table');
+    const itsRunning = its.running_now || [];
+    const triggerLabel = { manual_api: 'Manual (Frontend/API)', manual_cli: 'Manual (CLI)', celery_beat: 'Otomatis (Jadwal)' };
+    if (itsRunning.length === 0) {
+      itsRunningTbody.innerHTML = '<tr><td colspan="4" style="color:#475569;font-style:italic;padding:12px">Tidak ada scraping yang sedang berjalan</td></tr>';
+    } else {
+      itsRunningTbody.innerHTML = itsRunning.map(r => {
+        const secs = r.elapsed_seconds || 0;
+        const elapsed = secs < 60 ? `${secs.toFixed(0)}d` : `${Math.floor(secs/60)}m ${(secs%60).toFixed(0)}d`;
+        return `<tr>
+          <td><span class="live-dot"></span>${r.topic}</td>
+          <td>${triggerLabel[r.triggered_by] || r.triggered_by}</td>
+          <td style="color:#64748b;font-size:.72rem">${r.api_source || '-'}</td>
+          <td style="color:#60a5fa;font-weight:600">${elapsed}</td>
+        </tr>`;
+      }).join('');
     }
 
     const itsRunsTbody = document.getElementById('its-runs-table');
