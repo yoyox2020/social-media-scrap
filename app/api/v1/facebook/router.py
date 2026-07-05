@@ -1,8 +1,8 @@
 """
 Facebook API endpoints.
 
-GET  /facebook/posts?username=X    — scrape + ambil post dari page/profil (maks 10)
-GET  /facebook/search?q=keyword    — cari page Facebook berdasarkan keyword
+GET  /facebook/posts?username=X    — scrape (via Apify) + ambil post dari page/profil manapun (maks 10)
+GET  /facebook/search?q=keyword    — cari page Facebook berdasarkan keyword (Meta Graph API, TERBUKTI mati — lihat docs/flow scrape/flow-scrap-facebook.md)
 """
 from __future__ import annotations
 
@@ -36,16 +36,25 @@ async def get_facebook_posts(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Scrape post dari Facebook page atau profil, simpan ke DB, analisis sentimen komentar.
+    Scrape post dari Facebook page/profil manapun via provider abstraction
+    (Apify — lihat app/services/facebook/providers/), simpan ke DB, analisis
+    sentimen post (IndoBERT) + komentar (lexicon).
+
+    **Kenapa Apify, bukan Meta Graph API resmi:** token Meta terverifikasi
+    live cuma bisa akses Page yang dikelola sendiri — diblokir total untuk
+    page publik manapun di luar itu (butuh "Page Public Content Access" yang
+    harus di-approve Meta, lihat docs/flow scrape/flow-scrap-facebook.md).
+    Apify terbukti bisa untuk page publik manapun.
 
     - Jika data sudah ada dan `force_refresh=false` → return dari DB
-    - Jika belum ada atau `force_refresh=true` → scrape via Facebook Graph API
+    - Jika belum ada atau `force_refresh=true` → scrape via Apify
+    - Dedup akun-per-hari otomatis (skip panggil Apify kalau sudah discrape hari ini)
 
     **Yang di-scrape per post:**
-    - Pesan/caption, likes, shares, komentar (dengan lexicon sentiment)
+    - Caption, likes, komentar, hashtag (→ entities), sentimen post+komentar
 
     **Response:**
-    - `page_info` : info page (nama, followers, kategori, dll)
+    - `page_info` : followers (kalau ada dari hasil scrape)
     - `items`     : list post dengan nested `comments` + `sentiment_summary`
     - `sentiment` : distribusi global sentimen komentar
     """
@@ -58,14 +67,13 @@ async def get_facebook_posts(
 
     scrape_result: dict | None = None
     if existing_count == 0 or force_refresh:
-        from app.services.facebook.pipeline_service import scrape_facebook_posts
-        scrape_result = await scrape_facebook_posts(
+        from app.services.facebook.pipeline_service import scrape_facebook_posts_via_provider
+        scrape_result = await scrape_facebook_posts_via_provider(
             db=db,
             identifier=identifier,
             max_posts=max_posts,
             max_comments=max_comments,
             keyword_id=None,
-            access_token=settings.facebook_access_token or None,
         )
 
     # ── Ambil posts dari DB ───────────────────────────────────────────────────
@@ -77,7 +85,9 @@ async def get_facebook_posts(
         LIMIT :limit
     """), {"author": identifier, "limit": max_posts})).mappings().all()
 
-    page_info: dict = scrape_result.get("page_info", {}) if scrape_result else {"username": identifier}
+    page_info: dict = {"username": identifier}
+    if rows and (rows[0]["metadata"] or {}).get("followers"):
+        page_info["followers"] = rows[0]["metadata"]["followers"]
 
     # ── Batch-fetch komentar ──────────────────────────────────────────────────
     post_ids = [str(r["id"]) for r in rows]
@@ -161,6 +171,7 @@ async def get_facebook_posts(
         "scrape":    {
             "posts_scraped": scrape_result.get("posts_scraped", 0) if scrape_result else 0,
             "posts_new":     scrape_result.get("posts_saved", 0) if scrape_result else 0,
+            "provider_used": scrape_result.get("provider_used") if scrape_result else None,
             "errors":        scrape_result.get("errors", []) if scrape_result else [],
         } if scrape_result else None,
         "page_info": page_info,
