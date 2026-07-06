@@ -1,14 +1,22 @@
 """
 Facebook API endpoints.
 
-GET  /facebook/posts?username=X    — scrape (via Apify) + ambil post dari page/profil manapun (maks 10)
-GET  /facebook/posts/search?q=...  — cari post yang SUDAH discrape berdasarkan keyword (bukan username)
-GET  /facebook/search?q=keyword    — cari PAGE Facebook (Meta Graph API, TERBUKTI mati — lihat docs/flow scrape/flow-scrap-facebook.md)
+GET  /facebook/profile              — profil ringkas (followers/nama) dari page/profile manapun (Apify, live)
+GET  /facebook/posts?username=X     — scrape (via Apify) + ambil post dari page/profil manapun (maks 10)
+GET  /facebook/posts/search?q=...   — cari post yang SUDAH discrape berdasarkan keyword (bukan username)
+GET  /facebook/trending              — topik trending Facebook dari trend_recommendations
+GET  /facebook/analysis/summary      — ringkasan menyeluruh hasil analisis sentimen Facebook
+GET  /facebook/comments              — list komentar Facebook dengan filter
+POST /facebook/scrape                — trigger scraping Facebook identifier secara background (Celery)
+POST /facebook/trend-scrape/run      — trigger manual batch scrape trend_recommendations
+GET  /facebook/trend-scrape/status   — monitoring pipeline scrape trend_recommendations
+GET  /facebook/search?q=keyword      — cari PAGE Facebook (Meta Graph API, TERBUKTI mati — lihat docs/flow scrape/flow-scrap-facebook.md)
 """
 from __future__ import annotations
 
+import uuid
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, text
@@ -21,6 +29,51 @@ from app.shared.config import settings
 from app.shared.utils import build_success_response
 
 router = APIRouter(prefix="/facebook", tags=["facebook"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /facebook/profile
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/profile", response_model=dict, summary="Profil ringkas Facebook dari page/profile (Apify, live)")
+async def get_facebook_profile(
+    username: str = Query(..., min_length=1, max_length=200, description="Username / slug Facebook (tanpa @)"),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Ambil profil ringkas Facebook (followers, nama, deskripsi) via Apify —
+    LIVE lookup langsung ke provider, TIDAK disimpan ke DB (beda dengan
+    `GET /facebook/posts` yang men-scrape+simpan post).
+
+    Cuma minta 1 post (paling murah) semata-mata untuk dapat data profil
+    yang menyertai tiap baris hasil Apify (`profileFollowers`,
+    `profileDescription`, dst).
+    """
+    identifier = username.strip().lstrip("@")
+
+    from app.services.facebook.providers.registry import search_profile_with_fallback
+    from app.shared.exceptions import ExternalAPIError
+
+    try:
+        rows, provider_used = await search_profile_with_fallback(identifier, max_posts=1, max_comments=1)
+    except ExternalAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Tidak ada data untuk @{identifier} (provider: {provider_used})")
+
+    row = rows[0]
+    return build_success_response({
+        "platform":  "facebook",
+        "username":  identifier,
+        "provider_used": provider_used,
+        "profile": {
+            "name":        row.get("profileName", identifier),
+            "description": row.get("profileDescription", ""),
+            "followers":   row.get("profileFollowers", 0),
+            "url":         row.get("profileUrl") or f"https://www.facebook.com/{identifier}",
+        },
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -363,6 +416,457 @@ async def search_facebook_posts(
         "note": "Sentimen post baru diproses async (Celery) — mungkin belum muncul kalau baru saja discrape.",
         "items": items,
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /facebook/trending
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/trending", response_model=dict, summary="Topik trending Facebook dari trend_recommendations")
+async def get_facebook_trending(
+    recommendation_date: date | None = Query(default=None, description="Default: hari ini"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Ambil topik viral Facebook (dari `trend_recommendations`, diisi AI discovery
+    harian atau submit manual via `POST /trend-recommendations`) beserta post +
+    sentimen komentar hasil scrape.
+
+    Scraping otomatis berjalan tiap hari (Celery Beat, jadwal di .env), maksimal
+    `settings.facebook_trend_daily_budget` topik/hari (urut score tertinggi).
+    `status='used'` berarti sudah discrape, `status='pending'` berarti masih
+    menunggu giliran.
+    """
+    from app.domain.trend_recommendations.models import TrendRecommendation
+
+    target_date = recommendation_date or date.today()
+    topics = (await db.scalars(
+        select(TrendRecommendation)
+        .where(TrendRecommendation.recommendation_date == target_date)
+        .order_by(TrendRecommendation.score.desc())
+    )).all()
+
+    fb_topics = []
+    for t in topics:
+        fb_account = next(
+            (a for a in (t.related_accounts or []) if a.get("platform") == "facebook"),
+            None,
+        )
+        if fb_account:
+            fb_topics.append((t, fb_account["username"]))
+
+    if not fb_topics:
+        return build_success_response({
+            "platform":      "facebook",
+            "date":          target_date.isoformat(),
+            "total_topics":  0,
+            "daily_budget":  settings.facebook_trend_daily_budget,
+            "message": "Belum ada topik trending Facebook untuk tanggal ini. Submit via POST /trend-recommendations.",
+            "topics": [],
+        })
+
+    result_topics = []
+    for topic, username in fb_topics:
+        rows = (await db.execute(text("""
+            SELECT p.id, p.external_id, p.content, p.url, p.published_at, p.metadata
+            FROM posts p
+            WHERE p.platform = 'facebook' AND p.author = :username
+            ORDER BY p.published_at DESC NULLS LAST
+            LIMIT 2
+        """), {"username": username})).mappings().all()
+
+        post_ids = [str(r["id"]) for r in rows]
+        comments_by_post: dict[str, list] = {pid: [] for pid in post_ids}
+        all_labels: list[str] = []
+
+        if post_ids:
+            ids_sql = ", ".join(f"'{pid}'" for pid in post_ids)
+            cmt_rows = (await db.execute(text(f"""
+                SELECT c.id, c.external_id, c.content, c.author, c.post_id::text AS post_id,
+                       la.label AS sentiment, la.score
+                FROM comments c
+                LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+                WHERE c.post_id::text IN ({ids_sql})
+                ORDER BY la.score DESC NULLS LAST
+                LIMIT 25
+            """))).mappings().all()
+
+            for cr in cmt_rows:
+                pid = cr["post_id"]
+                if cr["sentiment"]:
+                    all_labels.append(cr["sentiment"])
+                bucket = comments_by_post.setdefault(pid, [])
+                if len(bucket) < 5:
+                    bucket.append({
+                        "id":         str(cr["id"]),
+                        "comment_id": cr["external_id"],
+                        "content":    cr["content"],
+                        "author":     cr["author"],
+                        "sentiment":  cr["sentiment"],
+                        "score":      round(float(cr["score"]), 3) if cr["score"] is not None else None,
+                    })
+
+        counter = Counter(all_labels)
+        total_analyzed = sum(counter.values())
+
+        posts_out = []
+        for r in rows:
+            pid = str(r["id"])
+            meta = r["metadata"] or {}
+            posts_out.append({
+                "post_id":      r["external_id"],
+                "url":          r["url"] or f"https://www.facebook.com/{r['external_id']}",
+                "message":      (r["content"] or "")[:200],
+                "likes":        meta.get("likes", 0),
+                "comment_count": meta.get("comments", 0),
+                "published_at": r["published_at"].isoformat() if r["published_at"] else None,
+                "comments":     comments_by_post.get(pid, []),
+            })
+
+        result_topics.append({
+            "topic":              topic.topic,
+            "score":              topic.score,
+            "status":             topic.status,
+            "facebook_identifier": username,
+            "sentiment": {
+                lbl: {
+                    "count":      counter.get(lbl, 0),
+                    "percentage": round(counter.get(lbl, 0) / total_analyzed * 100, 1) if total_analyzed else 0.0,
+                }
+                for lbl in ["positif", "negatif", "netral"]
+            },
+            "posts": posts_out,
+        })
+
+    return build_success_response({
+        "platform":       "facebook",
+        "date":           target_date.isoformat(),
+        "total_topics":   len(result_topics),
+        "daily_budget":   settings.facebook_trend_daily_budget,
+        "schedule": (
+            f"{settings.facebook_trend_scrape_schedule_hour:02d}:"
+            f"{settings.facebook_trend_scrape_schedule_minute:02d} WIB otomatis (Celery Beat)"
+        ),
+        "topics":         result_topics,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /facebook/analysis/summary — ringkasan MENYELURUH hasil analisis sentimen
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/analysis/summary", response_model=dict,
+            summary="Ringkasan menyeluruh hasil analisis sentimen Facebook (semua akun)")
+async def get_facebook_analysis_summary(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Ringkasan MENYELURUH hasil scrape + analisis sentimen Facebook, lintas SEMUA
+    akun/topik yang pernah discrape — baik dari pipeline `trend_recommendations`
+    maupun scrape manual (`POST /facebook/scrape`). Beda dengan `/trending` yang
+    cuma menampilkan topik dari `trend_recommendations` per tanggal tertentu.
+
+    - `overall`: total post/komentar/sudah dianalisis + breakdown sentimen keseluruhan
+    - `per_account`: breakdown yang sama, dipecah per akun (urut jumlah komentar terbanyak)
+    """
+    overall_row = (await db.execute(text("""
+        SELECT
+            count(DISTINCT p.id) AS total_posts,
+            count(c.id)          AS total_comments,
+            count(la.id)         AS total_analyzed,
+            count(*) FILTER (WHERE la.label = 'positif') AS positif,
+            count(*) FILTER (WHERE la.label = 'negatif') AS negatif,
+            count(*) FILTER (WHERE la.label = 'netral')  AS netral
+        FROM posts p
+        LEFT JOIN comments c ON c.post_id = p.id
+        LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+        WHERE p.platform = 'facebook'
+    """))).mappings().first()
+
+    per_account_rows = (await db.execute(text("""
+        SELECT
+            p.author AS username,
+            count(DISTINCT p.id) AS post_count,
+            count(c.id)          AS comment_count,
+            count(la.id)         AS analyzed_count,
+            count(*) FILTER (WHERE la.label = 'positif') AS positif,
+            count(*) FILTER (WHERE la.label = 'negatif') AS negatif,
+            count(*) FILTER (WHERE la.label = 'netral')  AS netral
+        FROM posts p
+        LEFT JOIN comments c ON c.post_id = p.id
+        LEFT JOIN lexicon_analyses la ON la.comment_id = c.id
+        WHERE p.platform = 'facebook'
+        GROUP BY p.author
+        ORDER BY comment_count DESC
+    """))).mappings().all()
+
+    def _pct(count: int, total: int) -> float:
+        return round(count / total * 100, 1) if total else 0.0
+
+    total_comments = overall_row["total_comments"] or 0
+
+    return build_success_response({
+        "overall": {
+            "total_posts":    overall_row["total_posts"],
+            "total_comments": total_comments,
+            "total_analyzed": overall_row["total_analyzed"],
+            "fully_analyzed": overall_row["total_analyzed"] == total_comments,
+            "sentiment": {
+                "positif": {"count": overall_row["positif"], "percentage": _pct(overall_row["positif"], total_comments)},
+                "negatif": {"count": overall_row["negatif"], "percentage": _pct(overall_row["negatif"], total_comments)},
+                "netral":  {"count": overall_row["netral"],  "percentage": _pct(overall_row["netral"], total_comments)},
+            },
+        },
+        "per_account": [
+            {
+                "username":       r["username"],
+                "post_count":     r["post_count"],
+                "comment_count":  r["comment_count"],
+                "analyzed_count": r["analyzed_count"],
+                "fully_analyzed": r["analyzed_count"] == r["comment_count"],
+                "sentiment": {
+                    "positif": r["positif"],
+                    "negatif": r["negatif"],
+                    "netral":  r["netral"],
+                },
+            }
+            for r in per_account_rows
+        ],
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /facebook/comments
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/comments", response_model=dict, summary="List komentar Facebook dengan filter")
+async def list_facebook_comments(
+    username: str | None = Query(default=None, description="Filter per username/page pemilik post"),
+    post_id: str | None = Query(default=None, description="Facebook post_id (external_id)"),
+    post_uuid: uuid.UUID | None = Query(default=None, description="UUID internal post di DB"),
+    sentiment: str | None = Query(default=None, description="positif | negatif | netral"),
+    date_from: date | None = Query(default=None, description="Filter dari tanggal (created_at)"),
+    date_to: date | None = Query(default=None, description="Filter sampai tanggal (created_at)"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    List komentar Facebook yang sudah di-scrape.
+
+    Setiap komentar terikat ke satu post spesifik melalui `post_id` (FK).
+    Filter tersedia:
+    - `username`  — pemilik post/page (bukan author komentar)
+    - `post_id`   — Facebook post external_id
+    - `post_uuid` — UUID internal post di DB
+    - `sentiment` — positif | negatif | netral
+    - `date_from` / `date_to` — rentang tanggal scrape komentar
+
+    Response setiap item menyertakan info post induknya (`post_id`, `post_url`, `message`)
+    sehingga relasi komentar → post selalu jelas.
+    """
+    filters = ["p.platform = 'facebook'"]
+    params: dict = {"limit": limit, "offset": offset}
+
+    if username:
+        filters.append("p.author = :username")
+        params["username"] = username.strip().lstrip("@").lower()
+    if post_uuid:
+        filters.append("c.post_id = :post_uuid")
+        params["post_uuid"] = str(post_uuid)
+    elif post_id:
+        filters.append("p.external_id = :post_ext_id")
+        params["post_ext_id"] = post_id.strip()
+    if sentiment:
+        filters.append("la.label = :sentiment")
+        params["sentiment"] = sentiment
+    if date_from:
+        filters.append("c.created_at >= :date_from")
+        params["date_from"] = datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc)
+    if date_to:
+        filters.append("c.created_at <= :date_to")
+        params["date_to"] = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59, tzinfo=timezone.utc)
+
+    where_clause = " AND ".join(filters)
+    join_type = "JOIN" if sentiment else "LEFT JOIN"
+
+    count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
+    total: int = (await db.scalar(text(f"""
+        SELECT COUNT(*)
+        FROM comments c
+        JOIN posts p ON c.post_id = p.id
+        {join_type} lexicon_analyses la ON la.comment_id = c.id
+        WHERE {where_clause}
+    """), count_params)) or 0
+
+    rows = (await db.execute(text(f"""
+        SELECT
+            c.id,
+            c.external_id          AS comment_id,
+            c.content,
+            c.author               AS comment_author,
+            c.created_at           AS scraped_at,
+            c.metadata,
+            p.id                   AS post_uuid,
+            p.external_id          AS post_id,
+            p.author               AS post_owner,
+            p.content              AS caption,
+            p.url                  AS post_url,
+            p.published_at         AS post_published_at,
+            la.label               AS sentiment,
+            la.score               AS sentiment_score
+        FROM comments c
+        JOIN posts p ON c.post_id = p.id
+        {join_type} lexicon_analyses la ON la.comment_id = c.id
+        WHERE {where_clause}
+        ORDER BY c.created_at DESC
+        OFFSET :offset LIMIT :limit
+    """), params)).mappings().all()
+
+    items = []
+    for r in rows:
+        meta = r["metadata"] or {}
+        items.append({
+            "id":             str(r["id"]),
+            "comment_id":     r["comment_id"],
+            "content":        r["content"],
+            "author":         r["comment_author"],
+            "sentiment":      r["sentiment"],
+            "sentiment_score": round(float(r["sentiment_score"]), 3) if r["sentiment_score"] is not None else None,
+            "like_count":     meta.get("like_count", 0),
+            "scraped_at":     r["scraped_at"].isoformat() if r["scraped_at"] else None,
+            "post": {
+                "post_uuid":    str(r["post_uuid"]),
+                "post_id":      r["post_id"],
+                "post_owner":   r["post_owner"],
+                "message":      (r["caption"] or "")[:200],
+                "post_url":     r["post_url"] or f"https://www.facebook.com/{r['post_id']}",
+                "published_at": r["post_published_at"].isoformat() if r["post_published_at"] else None,
+            },
+        })
+
+    return build_success_response({
+        "platform": "facebook",
+        "filter": {
+            "username":  username,
+            "post_id":   post_id,
+            "post_uuid": str(post_uuid) if post_uuid else None,
+            "sentiment": sentiment,
+            "date_from": str(date_from) if date_from else None,
+            "date_to":   str(date_to) if date_to else None,
+        },
+        "total":  total,
+        "offset": offset,
+        "limit":  limit,
+        "items":  items,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /facebook/scrape — trigger scraping identifier via Celery (background)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/scrape", response_model=dict, status_code=202,
+             summary="Trigger scraping Facebook identifier secara background (Celery)")
+async def trigger_facebook_scrape(
+    username: str = Query(..., min_length=1, max_length=200, description="Username / Page ID Facebook (tanpa @)"),
+    max_posts: int = Query(default=5, ge=1, le=10, description="Maks post per identifier (1-10)"),
+    max_comments: int = Query(default=5, ge=0, le=50, description="Maks komentar per post (0-50)"),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Trigger scraping Facebook secara async via Celery worker.
+
+    Berbeda dengan `GET /facebook/posts` yang scrape inline (request harus tunggu
+    selesai), endpoint ini langsung return **202 Accepted** dan scraping berjalan
+    di background.
+
+    **Gunakan ini untuk:**
+    - Scrape identifier baru tanpa memblok response
+    - Trigger ulang scrape identifier yang sudah ada
+    - Integrasi dengan scheduler / cron eksternal
+
+    **Cek hasil setelah selesai:**
+    `GET /facebook/posts?username={username}` — ambil dari DB
+    `GET /facebook/comments?username={username}` — list komentar
+    """
+    from app.workers.facebook_trending_worker import facebook_scrape_identifier_task
+
+    clean_identifier = username.strip().lstrip("@")
+    task = facebook_scrape_identifier_task.delay(
+        identifier=clean_identifier,
+        max_posts=max_posts,
+        max_comments=max_comments,
+    )
+
+    return build_success_response({
+        "status":       "queued",
+        "task_id":      task.id,
+        "username":     clean_identifier,
+        "max_posts":    max_posts,
+        "max_comments": max_comments,
+        "message":      f"Scraping @{clean_identifier} dijadwalkan. Cek hasilnya di GET /facebook/posts?username={clean_identifier}",
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /facebook/trend-scrape/run — trigger manual batch harian (trend_recommendations)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/trend-scrape/run", response_model=dict, status_code=202,
+             summary="Trigger manual batch scrape trend_recommendations (tanpa nunggu jadwal harian)")
+async def trigger_facebook_trend_scrape_run(
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Trigger manual proses scraping batch harian Facebook dari `trend_recommendations`
+    (sama seperti yang jalan otomatis via Celery Beat, jadwal di .env).
+
+    Tetap mengikuti budget `settings.facebook_trend_daily_budget` — topik yang
+    sudah `status='used'` tidak di-scrape ulang. Gunakan ini untuk testing atau
+    kalau tidak mau menunggu jadwal harian.
+    """
+    from app.workers.facebook_trending_worker import facebook_trend_recommendation_daily_task
+
+    task = facebook_trend_recommendation_daily_task.delay()
+
+    return build_success_response({
+        "status":  "queued",
+        "task_id": task.id,
+        "message": "Batch scrape trend_recommendations dijadwalkan di background.",
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /facebook/trend-scrape/status — monitoring pipeline trend_recommendations
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/trend-scrape/status", response_model=dict,
+            summary="Monitoring pipeline scrape trend_recommendations (pending/used, riwayat run)")
+async def get_facebook_trend_scrape_status(
+    recent_limit: int = Query(default=10, ge=1, le=50, description="Jumlah riwayat scrape_runs terakhir"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Snapshot status pipeline Facebook trend-recommendations, tanpa perlu psql manual:
+
+    - Ringkasan berapa topik `pending` vs `used` yang punya akun Facebook
+      (lintas tanggal, bukan cuma hari ini — supaya kelihatan backlog-nya)
+    - Daftar topik `pending` yang akan diambil giliran berikutnya (urut score)
+    - Riwayat run terakhir dari `scrape_runs` (sukses/gagal, durasi, error)
+
+    Scraping otomatis jalan tiap hari (Celery Beat, jadwal di .env), maksimal
+    `settings.facebook_trend_daily_budget` topik/hari. Kalau sebuah topik gagal
+    di-scrape (0 post), statusnya TETAP `pending` dan otomatis dicoba lagi di run
+    berikutnya — tidak perlu campur tangan manual.
+    """
+    from app.services.facebook.trend_scrape_service import get_facebook_trend_scrape_summary
+
+    return build_success_response(await get_facebook_trend_scrape_summary(db, recent_limit=recent_limit))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
