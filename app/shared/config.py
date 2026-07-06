@@ -53,10 +53,9 @@ class Settings(BaseSettings):
 
     # Viral discovery harian (lihat app/ai/llm/viral_discovery_service.py) —
     # provider AI bisa diganti via .env TANPA ubah kode (ai_discovery_provider:
-    # anthropic | openai | ollama). CATATAN: cuma Claude yang punya web_search
-    # bawaan — OpenAI/Ollama tidak bisa browsing sama sekali, jadi hasilnya
-    # dari pengetahuan training model (bisa basi), bukan data hari ini yang
-    # sebenarnya. Gunakan Claude untuk hasil akurat.
+    # anthropic | openai | ollama). Claude punya web_search bawaan (server-side,
+    # infrastruktur Anthropic sendiri). Ollama browsing lewat tool_search custom
+    # (Tavily, lihat tavily_api_key) — OpenAI belum diberi tool ini.
     ai_discovery_provider: str = "anthropic"
 
     anthropic_api_key: str = ""
@@ -64,6 +63,10 @@ class Settings(BaseSettings):
 
     openai_api_key: str = ""
     openai_model: str = "gpt-4o"
+
+    # Tavily — web search untuk provider Ollama (model lokal tidak punya
+    # browsing bawaan, jadi butuh tool search eksternal). Daftar di tavily.com.
+    tavily_api_key: str = ""
 
     viral_discovery_max_topics: int = 5   # maks topik/hari dari AI discovery, ubah via .env
 
