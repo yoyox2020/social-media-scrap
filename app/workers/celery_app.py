@@ -65,19 +65,16 @@ celery_app.conf.update(
         "viral-tracking-detect-every-6h": {
             "task": "workers.viral_tracking.detect_viral_posts",
             "schedule": crontab(minute=0, hour="0,6,12,18"),
-            "options": {"queue": "default"},
         },
         # Viral tracking: resume semua tracker aktif setiap hari jam 12:00 WIB
         "viral-tracking-daily-check-12:00": {
             "task": "workers.viral_tracking.daily_check",
             "schedule": crontab(hour=12, minute=0),
-            "options": {"queue": "default"},
         },
         # Auto-retry embedding untuk posts yang belum punya embedding (setiap 6 jam)
         "retry-missing-embeddings-every-6h": {
             "task": "workers.retry_missing_embeddings",
             "schedule": crontab(minute=30, hour="1,7,13,19"),
-            "options": {"queue": "default"},
         },
         # Viral discovery: Claude (web_search) cari topik+akun Instagram viral
         # hari ini, submit ke trend_recommendations. Jalan 2 jam SEBELUM
@@ -89,7 +86,6 @@ celery_app.conf.update(
                 hour=settings.viral_discovery_schedule_hour,
                 minute=settings.viral_discovery_schedule_minute,
             ),
-            "options": {"queue": "default"},
         },
         # Instagram: scrape topik trend_recommendations (via Apify), jadwal via .env
         # Maks settings.instagram_trend_daily_budget topik/hari, lihat docs/trend-recommendations.md
@@ -99,7 +95,6 @@ celery_app.conf.update(
                 hour=settings.instagram_trend_scrape_schedule_hour,
                 minute=settings.instagram_trend_scrape_schedule_minute,
             ),
-            "options": {"queue": "default"},
         },
         # Facebook: scrape topik trend_recommendations (via Apify), jadwal via .env
         # Subsistem B terpisah dari Instagram, lihat docs/flow scrape/flow-scrap-facebook.md
@@ -109,7 +104,6 @@ celery_app.conf.update(
                 hour=settings.facebook_trend_scrape_schedule_hour,
                 minute=settings.facebook_trend_scrape_schedule_minute,
             ),
-            "options": {"queue": "default"},
         },
         # YouTube: fetch trending Indonesia setiap hari jam 12.00 WIB
         # project_id kosong → task otomatis pilih project pertama dari DB
@@ -123,7 +117,6 @@ celery_app.conf.update(
                 "limit": 10,
                 "max_pages_per_keyword": 2,
             },
-            "options": {"queue": "default"},
         },
     },
 )
