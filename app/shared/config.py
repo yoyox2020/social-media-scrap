@@ -37,6 +37,12 @@ class Settings(BaseSettings):
     apify_api_token: str = ""
     apify_actor_id: str = "ycQuEFDDZmgX7BAsL"  # social-media-sentiment-analysis-tool
 
+    # Apify — Facebook SEARCH by keyword (beda dari apify_actor_id di atas yang
+    # cuma bisa scrape profil yang SUDAH diketahui namanya). Dipakai
+    # POST /facebook/discover untuk cari topik+akun Facebook langsung tanpa
+    # AI menebak. Pay-per-result (~$0.003/hasil), pakai apify_api_token yang sama.
+    facebook_search_actor_id: str = "danek/facebook-search-ppr"
+
     # Instagram search provider — cari & scrape profil by username, dengan
     # auto-fallback antar provider (lihat app/services/instagram/providers/)
     instagram_search_provider_order: str = "apify,ensembledata"  # urutan fallback, config-only

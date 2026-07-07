@@ -8,6 +8,7 @@ GET  /facebook/trending              — topik trending Facebook dari trend_reco
 GET  /facebook/analysis/summary      — ringkasan menyeluruh hasil analisis sentimen Facebook
 GET  /facebook/comments              — list komentar Facebook dengan filter
 POST /facebook/scrape                — trigger scraping Facebook identifier secara background (Celery)
+POST /facebook/discover?keyword=...  — cari topik+akun Facebook by keyword LANGSUNG (Apify search, tanpa AI menebak), submit ke trend_recommendations
 POST /facebook/trend-scrape/run      — trigger manual batch scrape trend_recommendations
 GET  /facebook/trend-scrape/status   — monitoring pipeline scrape trend_recommendations
 GET  /facebook/search?q=keyword      — cari PAGE Facebook (Meta Graph API, TERBUKTI mati — lihat docs/flow scrape/flow-scrap-facebook.md)
@@ -838,6 +839,44 @@ async def trigger_facebook_trend_scrape_run(
         "task_id": task.id,
         "message": "Batch scrape trend_recommendations dijadwalkan di background.",
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /facebook/discover — search Facebook by keyword LANGSUNG (tanpa AI
+# menebak akun), submit hasilnya ke trend_recommendations
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/discover", response_model=dict,
+             summary="Cari topik+akun Facebook by keyword LANGSUNG (Apify search, tanpa AI menebak), submit ke trend_recommendations")
+async def trigger_facebook_discover(
+    keyword: str = Query(..., min_length=1, max_length=255, description="Kata kunci/topik yang mau dicari di Facebook"),
+    max_results: int = Query(default=10, ge=1, le=20, description="Maks post yang di-scrape dari hasil search (pay-per-result di Apify)"),
+    location: str | None = Query(default=None, description="Filter lokasi opsional, mis. 'Indonesia' (diteruskan ke Apify)"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Alternatif AI viral discovery KHUSUS Facebook — search Facebook LANGSUNG
+    by keyword via Apify (`facebook-search-ppr`), identifier akun diambil dari
+    data `author` yang sudah terstruktur di hasil pencarian (BUKAN ditebak
+    AI). Beda dengan `POST /facebook/trend-scrape/run` yang cuma menjalankan
+    ULANG batch topik yang SUDAH ADA — endpoint ini MENCARI topik BARU.
+
+    - Kalau ketemu akun: langsung submit ke `trend_recommendations`
+      (`source='manual_facebook_search'`, `status='pending'`) — topiknya
+      lalu ikut antrian budget harian scrape normal (BUKAN langsung
+      discrape saat itu juga).
+    - Response menyertakan `sample_posts` (5 post pertama + identifier yang
+      berhasil diekstrak) supaya kelihatan transparan apa yang sebenarnya
+      ditemukan, bukan cuma "berhasil"/"gagal".
+
+    **Biaya**: pay-per-result di Apify (~$0.003/hasil per Juli 2026) — akun
+    Apify FREE dibatasi 5 hasil per panggilan.
+    """
+    from app.services.facebook.trend_scrape_service import discover_facebook_topic_by_keyword
+
+    result = await discover_facebook_topic_by_keyword(db, keyword.strip(), max_results=max_results, location=location)
+    return build_success_response(result)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

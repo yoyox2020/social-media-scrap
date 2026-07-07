@@ -211,3 +211,74 @@ async def get_facebook_trend_scrape_summary(db: AsyncSession, recent_limit: int 
             for r in running_runs
         ],
     }
+
+
+# Default score untuk topik hasil POST /facebook/discover — 0.9 (bukan 1.0)
+# supaya kalau ada topik AI viral discovery lain dengan skor lebih tinggi di
+# hari yang sama, topik itu tetap menang slot budget harian. Gampang diubah:
+# ganti angka ini kalau mau prioritas beda.
+DISCOVER_DEFAULT_SCORE = 0.9
+
+
+async def discover_facebook_topic_by_keyword(
+    db: AsyncSession, keyword: str, max_results: int = 10, location: str | None = None,
+) -> dict:
+    """
+    Search Facebook LANGSUNG by keyword (Apify `facebook-search-ppr`, lihat
+    app/integrations/apify/facebook_search.py) — TIDAK ada AI menebak akun
+    sama sekali, identifier akun diambil langsung dari data `author` yang
+    sudah terstruktur di hasil pencarian. Dipicu manual via
+    POST /facebook/discover, BUKAN bagian dari jadwal Celery Beat.
+
+    Hasil (kalau ada akun yang ketemu) langsung di-submit ke
+    trend_recommendations (source='manual_facebook_search', status='pending')
+    lewat submit_recommendations() yang SUDAH ADA — topiknya lalu ikut antrian
+    budget harian run_daily_trend_scrape_facebook() seperti topik AI biasa,
+    BUKAN langsung discrape saat itu juga.
+    """
+    from app.integrations.apify.facebook_search import extract_identifier, search_facebook_by_keyword
+    from app.domain.trend_recommendations.schemas import TrendRecommendationBatchCreate, TrendRecommendationItem
+    from app.services.trend_recommendations.service import submit_recommendations
+
+    try:
+        raw_posts = await search_facebook_by_keyword(keyword, max_results=max_results, location=location)
+    except Exception as exc:
+        logger.error("discover_facebook_topic_by_keyword: search gagal untuk keyword=%r: %s", keyword, exc)
+        return {"keyword": keyword, "posts_found": 0, "accounts_found": [], "submitted": None, "error": str(exc)}
+
+    seen: set[str] = set()
+    accounts: list[dict] = []
+    sample_posts: list[dict] = []
+    for post in raw_posts:
+        identifier = extract_identifier(post.get("author"))
+        if identifier and identifier not in seen:
+            seen.add(identifier)
+            accounts.append({"platform": "facebook", "username": identifier})
+        sample_posts.append({
+            "message":  (post.get("message") or "")[:200],
+            "author":   (post.get("author") or {}).get("name", ""),
+            "url":      post.get("url", ""),
+            "identifier_extracted": identifier,
+        })
+
+    if not accounts:
+        return {
+            "keyword": keyword, "posts_found": len(raw_posts), "accounts_found": [],
+            "submitted": None, "sample_posts": sample_posts,
+            "message": "Post ditemukan tapi tidak ada identifier akun yang bisa diekstrak — cek sample_posts.",
+        }
+
+    body = TrendRecommendationBatchCreate(
+        items=[TrendRecommendationItem(topic=keyword, score=DISCOVER_DEFAULT_SCORE, related_accounts=accounts)],
+        source="manual_facebook_search",
+    )
+    result = await submit_recommendations(db, body)
+
+    logger.info(
+        "discover_facebook_topic_by_keyword: keyword=%r posts=%d akun=%d submitted=%s",
+        keyword, len(raw_posts), len(accounts), result,
+    )
+    return {
+        "keyword": keyword, "posts_found": len(raw_posts), "accounts_found": accounts,
+        "submitted": result, "sample_posts": sample_posts[:5],
+    }
