@@ -109,6 +109,20 @@ async def run_daily_trend_scrape_tiktok(db: AsyncSession) -> dict:
 
         await db.commit()
 
+        # Topik masih 'pending' (belum 'used') -> cek apakah sudah kehabisan
+        # jatah percobaan, tandai 'failed_permanent' kalau sudah (lihat
+        # app/services/trend_recommendations/service.py).
+        if topic.status == "pending":
+            from app.services.trend_recommendations.service import mark_failed_permanent_if_exhausted
+
+            became_permanent = await mark_failed_permanent_if_exhausted(db, topic)
+            if became_permanent:
+                await db.commit()
+                logger.warning(
+                    "run_daily_trend_scrape_tiktok: topik '%s' ditandai failed_permanent (gagal berulang, identifier=%s)",
+                    topic.topic, identifier,
+                )
+
     logger.info("run_daily_trend_scrape_tiktok: %d topik diproses", len(results))
     return {"processed": len(results), "results": results}
 
@@ -120,6 +134,7 @@ async def get_tiktok_trend_scrape_summary(db: AsyncSession, recent_limit: int = 
     tt_topics = [(t, _tiktok_identifier(t)) for t in all_topics if _tiktok_identifier(t)]
     pending = [(t, u) for t, u in tt_topics if t.status == "pending"]
     used = [(t, u) for t, u in tt_topics if t.status == "used"]
+    failed_permanent = [(t, u) for t, u in tt_topics if t.status == "failed_permanent"]
     pending_sorted = sorted(pending, key=lambda tu: tu[0].score, reverse=True)
 
     runs = (await db.scalars(
@@ -143,9 +158,10 @@ async def get_tiktok_trend_scrape_summary(db: AsyncSession, recent_limit: int = 
             f"{settings.tiktok_trend_scrape_schedule_minute:02d} WIB otomatis (Celery Beat)"
         ),
         "summary": {
-            "pending_with_tiktok_account": len(pending),
-            "used_with_tiktok_account":    len(used),
-            "total_with_tiktok_account":   len(tt_topics),
+            "pending_with_tiktok_account":          len(pending),
+            "used_with_tiktok_account":             len(used),
+            "failed_permanent_with_tiktok_account": len(failed_permanent),
+            "total_with_tiktok_account":            len(tt_topics),
         },
         "pending_topics": [
             {
@@ -153,6 +169,13 @@ async def get_tiktok_trend_scrape_summary(db: AsyncSession, recent_limit: int = 
                 "recommendation_date": t.recommendation_date.isoformat(), "created_at": t.created_at.isoformat(),
             }
             for t, u in pending_sorted
+        ],
+        "failed_permanent_topics": [
+            {
+                "topic": t.topic, "tiktok_identifier": u, "source": t.source,
+                "recommendation_date": t.recommendation_date.isoformat(),
+            }
+            for t, u in failed_permanent
         ],
         "recent_runs": [
             {

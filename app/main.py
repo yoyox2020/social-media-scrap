@@ -565,6 +565,7 @@ async def scraping_status_page():
 <div class="ig-grid">
   <div class="ig-card"><div class="label">Pending</div><div class="value" id="fts-pending">-</div><div class="sub">nunggu giliran scrape</div></div>
   <div class="ig-card"><div class="label">Sudah Discrape</div><div class="value" id="fts-used">-</div><div class="sub">status=used</div></div>
+  <div class="ig-card"><div class="label">Gagal Permanen</div><div class="value" id="fts-failed-permanent">-</div><div class="sub">menyerah setelah 3x gagal</div></div>
   <div class="ig-card"><div class="label">Budget Harian</div><div class="value" id="fts-budget">-</div><div class="sub">topik/hari (Apify)</div></div>
   <div class="ig-card"><div class="label">Jadwal</div><div class="value" id="fts-schedule" style="font-size:1rem">-</div><div class="sub">Celery Beat</div></div>
 </div>
@@ -601,6 +602,7 @@ async def scraping_status_page():
 <div class="ig-grid">
   <div class="ig-card"><div class="label">Pending</div><div class="value" id="tts-pending">-</div><div class="sub">nunggu giliran scrape</div></div>
   <div class="ig-card"><div class="label">Sudah Discrape</div><div class="value" id="tts-used">-</div><div class="sub">status=used</div></div>
+  <div class="ig-card"><div class="label">Gagal Permanen</div><div class="value" id="tts-failed-permanent">-</div><div class="sub">menyerah setelah 3x gagal</div></div>
   <div class="ig-card"><div class="label">Budget Harian</div><div class="value" id="tts-budget">-</div><div class="sub">topik/hari (Apify)</div></div>
   <div class="ig-card"><div class="label">Jadwal</div><div class="value" id="tts-schedule" style="font-size:1rem">-</div><div class="sub">Celery Beat</div></div>
 </div>
@@ -1149,6 +1151,7 @@ async function load() {
     const ftsSummary = fts.summary || {};
     document.getElementById('fts-pending').textContent  = ftsSummary.pending_with_facebook_account || 0;
     document.getElementById('fts-used').textContent     = ftsSummary.used_with_facebook_account || 0;
+    document.getElementById('fts-failed-permanent').textContent = ftsSummary.failed_permanent_with_facebook_account || 0;
     document.getElementById('fts-budget').textContent   = fts.daily_budget ?? '-';
     document.getElementById('fts-schedule').textContent = fts.schedule ?? '-';
 
@@ -1190,6 +1193,7 @@ async function load() {
     const ttsSummary = tts.summary || {};
     document.getElementById('tts-pending').textContent  = ttsSummary.pending_with_tiktok_account || 0;
     document.getElementById('tts-used').textContent     = ttsSummary.used_with_tiktok_account || 0;
+    document.getElementById('tts-failed-permanent').textContent = ttsSummary.failed_permanent_with_tiktok_account || 0;
     document.getElementById('tts-budget').textContent   = tts.daily_budget ?? '-';
     document.getElementById('tts-schedule').textContent = tts.schedule ?? '-';
 

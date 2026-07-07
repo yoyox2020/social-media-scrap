@@ -1,12 +1,19 @@
 from datetime import date
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.domain.scrape_runs.models import ScrapeRun
 from app.domain.trend_recommendations.models import TrendRecommendation
 from app.domain.trend_recommendations.schemas import TrendRecommendationBatchCreate, TrendRecommendationItem
 
 MAX_PER_DAY = 20
+
+# Berapa kali percobaan scrape boleh gagal (status='failed' di scrape_runs,
+# keyword_text=topic) sebelum topik ditandai 'failed_permanent' -- supaya
+# tidak terus buang jatah budget harian utk topik yg akunnya jelas tidak akan
+# pernah berhasil (invalid/kosong permanen). Gampang diubah: cuma angka ini.
+FAILED_PERMANENT_THRESHOLD = 3
 
 
 async def submit_recommendations(
@@ -99,3 +106,35 @@ async def submit_recommendations(
         "evicted": evicted,
         "rejected": rejected,
     }
+
+
+async def mark_failed_permanent_if_exhausted(db: AsyncSession, topic: TrendRecommendation) -> bool:
+    """
+    Kalau topik ini sudah gagal discrape >= FAILED_PERMANENT_THRESHOLD kali
+    (dihitung dari scrape_runs, keyword_text=topic.topic, status='failed'),
+    ubah status jadi 'failed_permanent' supaya tidak terus kepilih di batch
+    harian manapun (query `WHERE status='pending'` yang sudah ada otomatis
+    tidak lagi mengambil topik ini, tidak perlu ubah query apa pun).
+
+    Dipanggil oleh app/services/facebook/trend_scrape_service.py dan
+    app/services/tiktok/trend_scrape_service.py SETELAH satu percobaan gagal
+    tercatat. TIDAK dipanggil dari Instagram (run_daily_trend_scrape() masih
+    dibekukan, butuh izin terpisah).
+
+    Catatan: hitungan gagal ini LINTAS PLATFORM (kolom `status` di
+    trend_recommendations satu untuk seluruh topik, bukan per-platform) --
+    kalau topik yang sama punya akun di >1 platform, gagal di satu platform
+    ikut menghabiskan jatah topik itu utk platform lain juga. Trade-off yang
+    disengaja demi kesederhanaan (skema tabel dibekukan, tidak nambah kolom
+    baru per-platform).
+
+    Return True kalau topik BARU SAJA ditandai failed_permanent (buat log).
+    """
+    failed_count = await db.scalar(
+        select(func.count()).select_from(ScrapeRun)
+        .where(ScrapeRun.keyword_text == topic.topic, ScrapeRun.status == "failed")
+    )
+    if (failed_count or 0) >= FAILED_PERMANENT_THRESHOLD:
+        topic.status = "failed_permanent"
+        return True
+    return False
