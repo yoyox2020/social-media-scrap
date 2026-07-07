@@ -31,12 +31,17 @@ async def run_daily_viral_discovery(db: AsyncSession) -> dict:
     """
     from app.ai.llm.viral_discovery_service import find_daily_viral_topics
     from app.services.trend_recommendations.service import submit_recommendations
+    from app.shared.config import settings
 
     started_at = datetime.now(timezone.utc)
     scrape_run = ScrapeRun(
         keyword_text="ai_viral_discovery",
         platform="instagram",
-        api_source="anthropic_web_search",
+        # api_source = provider AI yang SEDANG aktif (settings.ai_discovery_provider,
+        # bisa "anthropic"/"openai"/"ollama") — BUKAN hardcode "anthropic_web_search"
+        # lagi, supaya dashboard /scraping-status kelihatan benar kalau provider
+        # di .env diganti (lihat memory project_ollama_websearch_quality).
+        api_source=settings.ai_discovery_provider,
         status="running",
         triggered_by="celery_beat",
         started_at=started_at,
@@ -116,11 +121,14 @@ async def get_viral_discovery_trace(db: AsyncSession) -> dict:
         # Cari upaya scrape TERBARU untuk topik ini, apapun hasilnya — supaya
         # topik yang masih 'pending' karena GAGAL discrape (bukan cuma belum
         # kebagian giliran) tetap kelihatan alasannya, bukan diam-diam kosong.
+        # TIDAK filter platform di sini (dulu cuma "instagram", jadi topik yang
+        # akunnya cuma Facebook tidak pernah ketemu attempt-nya walau genuinely
+        # sudah diproses Subsistem B Facebook) — keyword_text=topic.topic sudah
+        # cukup unik per hari untuk pencocokan lintas platform.
         run = (await db.scalars(
             select(ScrapeRun)
             .where(
                 ScrapeRun.keyword_text == topic.topic,
-                ScrapeRun.platform == "instagram",
                 ScrapeRun.started_at > ai_run.started_at,
             )
             .order_by(ScrapeRun.started_at.desc())
@@ -144,6 +152,7 @@ async def get_viral_discovery_trace(db: AsyncSession) -> dict:
     return {
         "ai_run": {
             "status":      ai_run.status,
+            "api_source":  ai_run.api_source,  # provider AI yang sebenarnya jalan (anthropic/openai/ollama)
             "started_at":  ai_run.started_at.isoformat(),
             "finished_at": ai_run.finished_at.isoformat() if ai_run.finished_at else None,
             "error_message": ai_run.error_message,

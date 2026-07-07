@@ -678,8 +678,9 @@ function renderPipelineFlow(trace) {
 
   const s5 = topics.length === 0 ? 'idle' : (usedCount === topics.length ? 'success' : (usedCount > 0 ? 'waiting' : 'idle'));
 
+  const providerLabel = { anthropic: 'Claude web_search', openai: 'OpenAI (tanpa browsing)', ollama: 'Ollama + Firecrawl/Tavily' };
   const nodes = [
-    { label: 'AI Discovery',    sub: 'Claude web_search',      status: s1 },
+    { label: 'AI Discovery',    sub: providerLabel[aiRun.api_source] || aiRun.api_source || '-', status: s1 },
     { label: 'Submit ke DB',    sub: `${topics.length} topik ditemukan`, status: s2 },
     { label: 'Antrian Pending', sub: `${pendingCount} nunggu`, status: s3 },
     { label: 'Scrape Worker',   sub: 'Apify/EnsembleData',      status: s4 },
