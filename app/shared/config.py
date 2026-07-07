@@ -114,6 +114,16 @@ class Settings(BaseSettings):
     facebook_trend_scrape_schedule_hour: int = 10
     facebook_trend_scrape_schedule_minute: int = 0
 
+    # TikTok — provider abstraction untuk pipeline trend_recommendations
+    # (Subsistem B khusus TikTok, terpisah dari Instagram/Facebook), jadwal
+    # 11:00 WIB (1 jam setelah Facebook) supaya tidak rebutan resource/tumpang
+    # tindih waktu proses.
+    tiktok_trend_daily_budget: int = 5
+    tiktok_trend_posts_per_topic: int = 3
+    tiktok_trend_comments_per_post: int = 10
+    tiktok_trend_scrape_schedule_hour: int = 11
+    tiktok_trend_scrape_schedule_minute: int = 0
+
     # Instagram session (dari browser cookies — untuk scraping tanpa EnsembleData)
     instagram_session_id: str = ""
     instagram_csrf_token: str = ""

@@ -597,6 +597,42 @@ async def scraping_status_page():
   <tbody id="fts-runs-table"></tbody>
 </table>
 
+<div class="section-title" style="margin-top:24px">TikTok Trend-Scrape (trend_recommendations)</div>
+<div class="ig-grid">
+  <div class="ig-card"><div class="label">Pending</div><div class="value" id="tts-pending">-</div><div class="sub">nunggu giliran scrape</div></div>
+  <div class="ig-card"><div class="label">Sudah Discrape</div><div class="value" id="tts-used">-</div><div class="sub">status=used</div></div>
+  <div class="ig-card"><div class="label">Budget Harian</div><div class="value" id="tts-budget">-</div><div class="sub">topik/hari (Apify)</div></div>
+  <div class="ig-card"><div class="label">Jadwal</div><div class="value" id="tts-schedule" style="font-size:1rem">-</div><div class="sub">Celery Beat</div></div>
+</div>
+<table>
+  <thead>
+    <tr>
+      <th>Topik</th>
+      <th>Score</th>
+      <th>Akun TikTok</th>
+      <th>Sumber</th>
+      <th>Dibuat</th>
+    </tr>
+  </thead>
+  <tbody id="tts-pending-table"></tbody>
+</table>
+
+<div class="section-title" style="margin-top:24px">Riwayat Scrape TikTok (trend_recommendations)</div>
+<table>
+  <thead>
+    <tr>
+      <th>Topik</th>
+      <th>Status</th>
+      <th>Sumber</th>
+      <th>Post Baru</th>
+      <th>Durasi</th>
+      <th>Waktu Mulai</th>
+      <th>Error</th>
+    </tr>
+  </thead>
+  <tbody id="tts-runs-table"></tbody>
+</table>
+
 <div class="section-title" style="margin-top:24px">Riwayat Scraping Keyword</div>
 <table>
   <thead>
@@ -1149,13 +1185,56 @@ async function load() {
       }).join('');
     }
 
-    // ── Sedang Berjalan Sekarang — gabungan Instagram + Facebook ─────────────
+    // ── TikTok trend-scrape (trend_recommendations) ──────────────────────────
+    const tts = d.tiktok_trend_scrape || {};
+    const ttsSummary = tts.summary || {};
+    document.getElementById('tts-pending').textContent  = ttsSummary.pending_with_tiktok_account || 0;
+    document.getElementById('tts-used').textContent     = ttsSummary.used_with_tiktok_account || 0;
+    document.getElementById('tts-budget').textContent   = tts.daily_budget ?? '-';
+    document.getElementById('tts-schedule').textContent = tts.schedule ?? '-';
+
+    const ttsPendingTbody = document.getElementById('tts-pending-table');
+    const ttsPending = tts.pending_topics || [];
+    if (ttsPending.length === 0) {
+      ttsPendingTbody.innerHTML = '<tr><td colspan="5" style="color:#475569;font-style:italic;padding:12px">Tidak ada topik pending</td></tr>';
+    } else {
+      ttsPendingTbody.innerHTML = ttsPending.map(t => `<tr>
+        <td>${t.topic}</td>
+        <td>${(t.score||0).toFixed(2)}</td>
+        <td>@${t.tiktok_identifier || '-'}</td>
+        <td style="color:#64748b;font-size:.72rem">${t.source || '-'}</td>
+        <td style="color:#94a3b8;font-size:.75rem">${fmt(t.created_at)}</td>
+      </tr>`).join('');
+    }
+
+    const ttsRunsTbody = document.getElementById('tts-runs-table');
+    const ttsRuns = tts.recent_runs || [];
+    if (ttsRuns.length === 0) {
+      ttsRunsTbody.innerHTML = '<tr><td colspan="7" style="color:#475569;font-style:italic;padding:12px">Belum ada riwayat scrape</td></tr>';
+    } else {
+      ttsRunsTbody.innerHTML = ttsRuns.map(r => {
+        const pillClass = r.status === 'success' ? 'pill-success' : (r.status === 'failed' ? 'pill-failed' : 'pill-running');
+        return `<tr>
+          <td>${r.topic}</td>
+          <td><span class="pill ${pillClass}">${r.status}</span></td>
+          <td style="color:#64748b;font-size:.72rem">${r.api_source || '-'}</td>
+          <td class="${(r.videos_new||0)>0?'green':''}">${r.videos_new ?? 0}</td>
+          <td style="color:#94a3b8">${r.duration_seconds ?? '-'}s</td>
+          <td style="color:#94a3b8;font-size:.75rem">${fmt(r.started_at)}</td>
+          <td class="error-text" title="${r.error_message||''}">${r.error_message || '-'}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    // ── Sedang Berjalan Sekarang — gabungan Instagram + Facebook + TikTok ────
     const itsRunningTbody = document.getElementById('its-running-table');
     const triggerLabel = { manual_api: 'Manual (Frontend/API)', manual_cli: 'Manual (CLI)', celery_beat: 'Otomatis (Jadwal)' };
     const allRunning = [
       ...(its.running_now || []).map(r => ({ ...r, platform: 'Instagram' })),
       ...(fts.running_now || []).map(r => ({ ...r, platform: 'Facebook' })),
+      ...(tts.running_now || []).map(r => ({ ...r, platform: 'TikTok' })),
     ];
+    const platformPill = { Facebook: 'pill-waiting', TikTok: 'pill-fallback', Instagram: 'pill-success' };
     if (allRunning.length === 0) {
       itsRunningTbody.innerHTML = '<tr><td colspan="5" style="color:#475569;font-style:italic;padding:12px">Tidak ada scraping yang sedang berjalan</td></tr>';
     } else {
@@ -1163,7 +1242,7 @@ async function load() {
         const secs = r.elapsed_seconds || 0;
         const elapsed = secs < 60 ? `${secs.toFixed(0)}d` : `${Math.floor(secs/60)}m ${(secs%60).toFixed(0)}d`;
         return `<tr>
-          <td><span class="pill ${r.platform === 'Facebook' ? 'pill-waiting' : 'pill-success'}">${r.platform}</span></td>
+          <td><span class="pill ${platformPill[r.platform] || 'pill-success'}">${r.platform}</span></td>
           <td><span class="live-dot"></span>${r.topic}</td>
           <td>${triggerLabel[r.triggered_by] || r.triggered_by}</td>
           <td style="color:#64748b;font-size:.72rem">${r.api_source || '-'}</td>

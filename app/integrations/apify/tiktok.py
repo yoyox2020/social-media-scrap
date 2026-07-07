@@ -2,9 +2,11 @@
 Apify TikTok — actor `clockworks/tiktok-scraper` (settings.tiktok_actor_id).
 
 SATU actor untuk semuanya (beda dengan Facebook yang butuh 2 actor terpisah):
-scrape profil yang sudah diketahui (`profiles`), search by keyword
-(`searchQueries`, Fase 2 — belum dipakai di sini), atau by hashtag
-(`hashtags`, Fase 2). File ini baru cover scrape-by-profile (Fase 1).
+scrape profil yang sudah diketahui (`profiles`) ATAU search by keyword
+(`searchQueries`). Search mode TERBUKTI LIVE mengembalikan bentuk data yang
+IDENTIK dengan mode profil (item video + `authorMeta` lengkap) — beda dengan
+Facebook yang harus extract akun dari URL post secara manual, di sini tinggal
+baca `authorMeta.name` langsung, jauh lebih simpel & akurat.
 
 Bentuk data DIVERIFIKASI LIVE (bukan tebakan) 07 Juli 2026 — lihat
 docs/update-fix-tiktok.md untuk detail lengkap:
@@ -96,3 +98,39 @@ async def scrape_tiktok_via_apify(
     dengan app/integrations/apify/facebook.py dan instagram.py).
     """
     return await asyncio.to_thread(_run_actor_sync, identifier, max_posts, max_comments)
+
+
+def _run_search_sync(query: str, max_results: int) -> list[dict[str, Any]]:
+    if not settings.apify_api_token:
+        raise ExternalAPIError(service="Apify", message="APIFY_API_TOKEN belum di-set di .env")
+
+    client = ApifyClient(settings.apify_api_token)
+    run_input: dict[str, Any] = {
+        "searchQueries": [query],
+        "resultsPerPage": max_results,
+        "commentsPerPost": 0,  # discover cuma butuh akun, tidak perlu komentar (hemat biaya)
+        "shouldDownloadVideos": False,
+        "shouldDownloadCovers": False,
+        "shouldDownloadAvatars": False,
+        "shouldDownloadSlideshowImages": False,
+        "shouldDownloadMusicCovers": False,
+    }
+
+    logger.info("[Apify] tiktok-scraper (search) query=%r input=%s", query, run_input)
+    run = client.actor(settings.tiktok_actor_id).call(run_input=run_input)
+
+    if run.status != "SUCCEEDED":
+        raise ExternalAPIError(service="Apify", message=f"Run status={run.status} untuk query={query!r}")
+
+    return list(client.dataset(run.default_dataset_id).iterate_items())
+
+
+async def search_tiktok_by_keyword(query: str, max_results: int = 10) -> list[dict[str, Any]]:
+    """
+    Search TikTok LANGSUNG by keyword (BUKAN scrape profil yang sudah
+    diketahui) — actor yang SAMA dengan scrape_tiktok_via_apify, cuma input
+    beda (`searchQueries` alih-alih `profiles`). Hasilnya video yang cocok
+    dengan keyword, masing-masing punya `authorMeta.name` — akun ASLI yang
+    genuinely bikin konten soal topik itu, bukan tebakan AI.
+    """
+    return await asyncio.to_thread(_run_search_sync, query, max_results)

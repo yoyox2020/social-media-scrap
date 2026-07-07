@@ -2384,6 +2384,7 @@ async def scrape_monitor_public(
 
     from app.services.instagram_trending.trend_scrape_service import get_trend_scrape_summary
     from app.services.facebook.trend_scrape_service import get_facebook_trend_scrape_summary
+    from app.services.tiktok.trend_scrape_service import get_tiktok_trend_scrape_summary
 
     return build_success_response({
         "worker_alive": is_alive,
@@ -2441,6 +2442,7 @@ async def scrape_monitor_public(
         },
         "instagram_trend_scrape": await get_trend_scrape_summary(db, recent_limit=15),
         "facebook_trend_scrape": await get_facebook_trend_scrape_summary(db, recent_limit=15),
+        "tiktok_trend_scrape": await get_tiktok_trend_scrape_summary(db, recent_limit=15),
         "runs_pagination": {
             "page": runs_page,
             "limit": runs_limit,

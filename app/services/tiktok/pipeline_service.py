@@ -96,10 +96,18 @@ async def scrape_tiktok_posts_via_provider(
         raw_posts = []
 
     posts_saved = 0
+    posts_found = 0  # HANYA item dengan "id" valid (post asli) -- lihat catatan di bawah
     for raw in raw_posts:
         ext_id = raw.get("id")
         if not ext_id:
+            # Akun tanpa video sama sekali: actor balikin 1 item placeholder
+            # {"authorMeta": ..., "note": "Profile has no videos..."} TANPA
+            # field "id". Kalau ini ikut dihitung sebagai "post_scraped",
+            # verified=True di trend_scrape_service akan salah tandai topik
+            # 'used' padahal TIDAK ADA data yang tersimpan sama sekali
+            # (ditemukan+diperbaiki 07 Juli 2026, lihat docs/update-fix-tiktok.md).
             continue
+        posts_found += 1
 
         existing = await db.scalar(
             select(Post).where(Post.platform == "tiktok", Post.external_id == ext_id)
@@ -170,7 +178,7 @@ async def scrape_tiktok_posts_via_provider(
 
     return {
         "identifier":    identifier,
-        "posts_scraped": len(raw_posts),
+        "posts_scraped": posts_found,
         "posts_saved":   posts_saved,
         "errors":        errors,
         "provider_used": "apify" if raw_posts or not errors else None,
