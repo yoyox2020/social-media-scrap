@@ -189,13 +189,15 @@ def _system_prompt(max_topics: int, has_web_search: bool) -> str:
 
 async def find_daily_viral_topics() -> list[dict]:
     """
-    Sapuan terbuka harian untuk topik+akun Instagram yang viral hari ini.
-    Provider dipilih dari settings.ai_discovery_provider (anthropic/openai/ollama).
-    Return list item siap dipakai `TrendRecommendationItem`
-    (topic/score/related_accounts) — HANYA yang punya minimal 1 akun Instagram.
+    Sapuan terbuka harian untuk topik+akun Instagram/Facebook/TikTok yang
+    viral hari ini. Provider dipilih dari settings.ai_discovery_provider
+    (anthropic/openai/ollama/auto). Return list item siap dipakai
+    `TrendRecommendationItem` (topic/score/related_accounts).
     """
     provider = settings.ai_discovery_provider
 
+    if provider == "auto":
+        return await _find_via_auto_switch()
     if provider == "anthropic":
         return await _find_via_anthropic()
     if provider == "openai":
@@ -205,6 +207,35 @@ async def find_daily_viral_topics() -> list[dict]:
 
     logger.warning("find_daily_viral_topics: ai_discovery_provider tidak dikenal: %s", provider)
     return []
+
+
+async def _find_via_auto_switch() -> list[dict]:
+    """
+    Auto-switch Anthropic -> Ollama, STATELESS (tidak nyimpen status "lagi
+    down" di mana pun). Tiap run SELALU coba Anthropic dulu (kalau
+    ANTHROPIC_API_KEY ada) — kalau gagal (exception apa pun, termasuk saldo
+    habis "credit balance is too low") ATAU tidak menemukan topik sama
+    sekali, fallback ke Ollama untuk run ini saja.
+
+    Kenapa stateless: run BERIKUTNYA (besok atau manual) tetap coba Anthropic
+    dari awal lagi — begitu saldo Anthropic diisi ulang, sistem otomatis
+    balik pakai Anthropic tanpa perlu ubah AI_DISCOVERY_PROVIDER di .env
+    manual sama sekali. Trade-off: tiap run yang Anthropic-nya masih down
+    "membuang" satu percobaan API call gagal (tidak ada biaya nyata, gagal di
+    validasi saldo SEBELUM model benar-benar jalan).
+    """
+    if settings.anthropic_api_key:
+        try:
+            items = await _find_via_anthropic()
+            if items:
+                return items
+            logger.warning("find_daily_viral_topics[auto]: Anthropic 0 topik, fallback ke Ollama")
+        except Exception as exc:
+            logger.warning("find_daily_viral_topics[auto]: Anthropic gagal (%s), fallback ke Ollama", exc)
+    else:
+        logger.info("find_daily_viral_topics[auto]: ANTHROPIC_API_KEY kosong, langsung pakai Ollama")
+
+    return await _find_via_ollama()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

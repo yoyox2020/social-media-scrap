@@ -382,13 +382,14 @@ async def search_facebook_posts(
             "message": "Tidak ada post Facebook di database untuk filter tanggal ini.",
         })
 
-    # ── q diisi tapi tidak ketemu -> cari topik cocok di trend_recommendations ─
+    # ── Tingkat 2: q diisi tapi tidak ketemu -> cari topik cocok di
+    # trend_recommendations, PALING BARU dulu (bukan score lagi) ───────────────
     from app.domain.trend_recommendations.models import TrendRecommendation
 
     candidate_topics = (await db.scalars(
         select(TrendRecommendation)
         .where(TrendRecommendation.topic.ilike(f"%{q_clean}%"))
-        .order_by(TrendRecommendation.score.desc())
+        .order_by(TrendRecommendation.recommendation_date.desc(), TrendRecommendation.score.desc())
     )).all()
 
     matched_topic = None
@@ -402,30 +403,54 @@ async def search_facebook_posts(
         if matched_topic:
             break
 
-    if not matched_topic:
+    if matched_topic:
+        return await _scrape_now_and_respond(
+            db, q_clean, matched_identifier, limit,
+            topic=matched_topic.topic, mark_topic=matched_topic,
+        )
+
+    # ── Tingkat 3: topik juga tidak ketemu (keyword genuinely baru) -> search
+    # LANGSUNG ke Facebook via Apify (actor sama dengan POST /discover) ────────
+    from app.services.facebook.trend_scrape_service import discover_facebook_topic_by_keyword
+
+    discover_result = await discover_facebook_topic_by_keyword(db, q_clean, max_results=5)
+    accounts_found = discover_result.get("accounts_found") or []
+
+    if not accounts_found:
         return build_success_response({
             "query": q_clean, "source": "not_found", "total": 0, "items": [],
             "message": (
-                "Tidak ditemukan post maupun topik terkait keyword ini. Apify tidak "
-                "bisa cari akun by keyword — kalau tahu akun Facebook-nya, submit "
-                "manual via POST /trend-recommendations."
+                "Tidak ditemukan post di database, topik terkait di trend_recommendations, "
+                "MAUPUN akun Facebook nyata yang bahas keyword ini via search langsung."
             ),
         })
 
-    # ── 3. Ketemu topik -> scrape sekarang via Apify ────────────────────────────
+    new_identifier = accounts_found[0]["username"]
+    return await _scrape_now_and_respond(
+        db, q_clean, new_identifier, limit,
+        topic=q_clean, mark_topic=None, source_label="scraped_now_external",
+    )
+
+
+async def _scrape_now_and_respond(
+    db: AsyncSession, q_clean: str, identifier: str, limit: int,
+    topic: str, mark_topic, source_label: str = "scraped_now",
+) -> dict:
+    """Scrape 1 identifier SEKARANG via Apify, tandai topik 'used' (kalau ada),
+    return post-post barunya. Dipakai tingkat 2 & 3 di search_facebook_posts()."""
     from app.domain.scrape_runs.models import ScrapeRun
     from app.services.facebook.pipeline_service import scrape_facebook_posts_via_provider
 
     started_at = datetime.now(timezone.utc)
     scrape_run = ScrapeRun(
-        keyword_text=f"search:{matched_identifier}", platform="facebook", api_source="apify",
+        keyword_text=f"search:{identifier}", platform="facebook", api_source="apify",
         status="running", triggered_by="manual_api", started_at=started_at,
     )
     db.add(scrape_run)
     await db.commit()  # commit status='running' segera supaya kelihatan di monitor live
 
     scrape_result = await scrape_facebook_posts_via_provider(
-        db=db, identifier=matched_identifier, max_posts=5, max_comments=5, keyword_id=None,
+        db=db, identifier=identifier, max_posts=5, max_comments=5, keyword_id=None,
     )
 
     scrape_run.status = "success" if scrape_result.get("posts_scraped", 0) > 0 else "failed"
@@ -436,24 +461,23 @@ async def search_facebook_posts(
     scrape_run.finished_at = datetime.now(timezone.utc)
     scrape_run.duration_seconds = (scrape_run.finished_at - started_at).total_seconds()
 
-    if scrape_run.status == "success":
-        matched_topic.status = "used"
+    if scrape_run.status == "success" and mark_topic is not None:
+        mark_topic.status = "used"
 
     await db.commit()
 
-    # ── Re-query post yang baru discrape untuk akun ini ────────────────────────
     fresh_rows = (await db.execute(text("""
         SELECT p.id, p.external_id, p.content, p.author, p.url, p.published_at, p.metadata
         FROM posts p
         WHERE p.platform = 'facebook' AND p.author = :identifier
         ORDER BY p.published_at DESC NULLS LAST
         LIMIT :limit
-    """), {"identifier": matched_identifier, "limit": limit})).mappings().all()
+    """), {"identifier": identifier, "limit": limit})).mappings().all()
 
     items = await _build_fb_search_items(db, fresh_rows)
     return build_success_response({
-        "query": q_clean, "source": "scraped_now", "total": len(items),
-        "topic": matched_topic.topic, "facebook_identifier": matched_identifier,
+        "query": q_clean, "source": source_label, "total": len(items),
+        "topic": topic, "facebook_identifier": identifier,
         "note": "Sentimen post baru diproses async (Celery) — mungkin belum muncul kalau baru saja discrape.",
         "items": items,
     })

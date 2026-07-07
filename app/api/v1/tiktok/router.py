@@ -294,16 +294,17 @@ async def search_tiktok_posts(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Cari post TikTok berdasarkan isi CAPTION/HASHTAG/rentang tanggal yang
-    sudah tersimpan dari scrape sebelumnya (Fase 1 — HANYA baca database
-    lokal, BELUM ada fallback cari topik+scrape otomatis seperti Facebook/
-    Instagram, karena integrasi trend_recommendations untuk TikTok belum
-    dibangun, menyusul Fase 2).
+    Cari post TikTok — 3 tingkat kalau `q` diisi (mirroring Facebook):
+    1. Database lokal (posts.content/hashtag).
+    2. Tidak ketemu → cari topik cocok di `trend_recommendations` (PALING
+       BARU dulu, bukan score), scrape akunnya SEKARANG kalau ketemu.
+    3. Topik juga tidak ketemu (keyword genuinely baru) → search LANGSUNG
+       ke TikTok via Apify (actor sama dengan POST /discover), scrape akun
+       yang ketemu SEKARANG JUGA, submit ke trend_recommendations sekalian.
 
-    - `q` DIISI: cari keyword/hashtag (opsional dipersempit `date_from`/`date_to`).
-      Tidak ketemu → `source: "not_found"`, TIDAK ada auto-scrape.
     - `q` KOSONG: tampilkan SEMUA post TikTok lokal (urut published_at
-      terbaru dulu), bisa dipersempit `date_from`/`date_to`.
+      terbaru dulu), bisa dipersempit `date_from`/`date_to`. TIDAK ada
+      fallback apa pun (tidak ada keyword untuk dicocokkan).
 
     Pagination via `limit`/`offset`, `total` = jumlah row sebenarnya (bukan
     cuma count di halaman ini).
@@ -344,11 +345,112 @@ async def search_tiktok_posts(
     """), params)).mappings().all()
 
     items = await _build_tiktok_search_items(db, post_rows)
+    if items or not q_clean:
+        return build_success_response({
+            "query": q_clean or None, "date_from": str(date_from) if date_from else None,
+            "date_to": str(date_to) if date_to else None,
+            "source": "database" if items else "not_found",
+            "total": total, "offset": offset, "limit": limit, "items": items,
+        })
+
+    # ── Tingkat 2: q diisi tapi tidak ketemu -> cari topik cocok di
+    # trend_recommendations, PALING BARU dulu ──────────────────────────────────
+    from app.domain.trend_recommendations.models import TrendRecommendation
+
+    candidate_topics = (await db.scalars(
+        select(TrendRecommendation)
+        .where(TrendRecommendation.topic.ilike(f"%{q_clean}%"))
+        .order_by(TrendRecommendation.recommendation_date.desc(), TrendRecommendation.score.desc())
+    )).all()
+
+    matched_topic = None
+    matched_identifier = None
+    for t in candidate_topics:
+        for acc in t.related_accounts or []:
+            if acc.get("platform") == "tiktok" and acc.get("username"):
+                matched_topic = t
+                matched_identifier = acc["username"]
+                break
+        if matched_topic:
+            break
+
+    if matched_topic:
+        return await _scrape_now_and_respond(
+            db, q_clean, matched_identifier, limit,
+            topic=matched_topic.topic, mark_topic=matched_topic,
+        )
+
+    # ── Tingkat 3: topik juga tidak ketemu (keyword genuinely baru) -> search
+    # LANGSUNG ke TikTok via Apify (actor sama dengan POST /discover) ──────────
+    from app.services.tiktok.trend_scrape_service import discover_tiktok_topic_by_keyword
+
+    discover_result = await discover_tiktok_topic_by_keyword(db, q_clean, max_results=5)
+    accounts_found = discover_result.get("accounts_found") or []
+
+    if not accounts_found:
+        return build_success_response({
+            "query": q_clean, "source": "not_found", "total": 0, "items": [],
+            "message": (
+                "Tidak ditemukan post di database, topik terkait di trend_recommendations, "
+                "MAUPUN akun TikTok nyata yang bahas keyword ini via search langsung."
+            ),
+        })
+
+    new_identifier = accounts_found[0]["username"]
+    return await _scrape_now_and_respond(
+        db, q_clean, new_identifier, limit,
+        topic=q_clean, mark_topic=None, source_label="scraped_now_external",
+    )
+
+
+async def _scrape_now_and_respond(
+    db: AsyncSession, q_clean: str, identifier: str, limit: int,
+    topic: str, mark_topic, source_label: str = "scraped_now",
+) -> dict:
+    """Scrape 1 identifier SEKARANG via Apify, tandai topik 'used' (kalau ada),
+    return post-post barunya. Dipakai tingkat 2 & 3 di search_tiktok_posts()."""
+    from app.domain.scrape_runs.models import ScrapeRun
+    from app.services.tiktok.pipeline_service import scrape_tiktok_posts_via_provider
+
+    started_at = datetime.now(timezone.utc)
+    scrape_run = ScrapeRun(
+        keyword_text=f"search:{identifier}", platform="tiktok", api_source="apify",
+        status="running", triggered_by="manual_api", started_at=started_at,
+    )
+    db.add(scrape_run)
+    await db.commit()  # commit status='running' segera supaya kelihatan di monitor live
+
+    scrape_result = await scrape_tiktok_posts_via_provider(
+        db=db, identifier=identifier, max_posts=5, max_comments=5, keyword_id=None,
+    )
+
+    scrape_run.status = "success" if scrape_result.get("posts_scraped", 0) > 0 else "failed"
+    scrape_run.api_source = scrape_result.get("provider_used") or "apify"
+    scrape_run.videos_fetched = scrape_result.get("posts_scraped", 0)
+    scrape_run.videos_new = scrape_result.get("posts_saved", 0)
+    scrape_run.error_message = "; ".join(scrape_result.get("errors", [])[:3]) or None
+    scrape_run.finished_at = datetime.now(timezone.utc)
+    scrape_run.duration_seconds = (scrape_run.finished_at - started_at).total_seconds()
+
+    if scrape_run.status == "success" and mark_topic is not None:
+        mark_topic.status = "used"
+
+    await db.commit()
+
+    fresh_rows = (await db.execute(text("""
+        SELECT p.id, p.external_id, p.content, p.author, p.url, p.published_at, p.metadata
+        FROM posts p
+        WHERE p.platform = 'tiktok' AND p.author = :identifier
+        ORDER BY p.published_at DESC NULLS LAST
+        LIMIT :limit
+    """), {"identifier": identifier, "limit": limit})).mappings().all()
+
+    items = await _build_tiktok_search_items(db, fresh_rows)
     return build_success_response({
-        "query": q_clean or None, "date_from": str(date_from) if date_from else None,
-        "date_to": str(date_to) if date_to else None,
-        "source": "database" if items else "not_found",
-        "total": total, "offset": offset, "limit": limit, "items": items,
+        "query": q_clean, "source": source_label, "total": len(items),
+        "topic": topic, "tiktok_identifier": identifier,
+        "note": "Sentimen post baru diproses async (Celery) — mungkin belum muncul kalau baru saja discrape.",
+        "items": items,
     })
 
 
