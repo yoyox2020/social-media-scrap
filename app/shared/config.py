@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     # AI menebak. Pay-per-result (~$0.003/hasil), pakai apify_api_token yang sama.
     facebook_search_actor_id: str = "danek/facebook-search-ppr"
 
+    # Apify — TikTok. SATU actor untuk scrape profil MAUPUN search by
+    # keyword/hashtag (beda dari Facebook yang butuh 2 actor terpisah) — lihat
+    # app/integrations/apify/tiktok.py. Pay-per-result (~$0.0037/hasil di tier
+    # free, lebih murah di tier berbayar), pakai apify_api_token yang sama.
+    tiktok_actor_id: str = "clockworks/tiktok-scraper"
+
     # Instagram search provider — cari & scrape profil by username, dengan
     # auto-fallback antar provider (lihat app/services/instagram/providers/)
     instagram_search_provider_order: str = "apify,ensembledata"  # urutan fallback, config-only

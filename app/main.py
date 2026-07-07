@@ -77,6 +77,7 @@ import app.domain.trend_recommendations.models  # noqa: F401
 from app.api.v1.youtube.router import router as youtube_router
 from app.api.v1.instagram.router import router as instagram_router
 from app.api.v1.facebook.router import router as facebook_router
+from app.api.v1.tiktok.router import router as tiktok_router
 from app.infrastructure.database.connection import engine
 from app.infrastructure.logging.logger import get_logger, setup_logging
 from app.infrastructure.middleware.request_id import RequestIDMiddleware
@@ -1232,4 +1233,5 @@ app.include_router(reports.router, prefix=API_PREFIX)
 app.include_router(youtube_router, prefix=API_PREFIX)
 app.include_router(instagram_router, prefix=API_PREFIX)
 app.include_router(facebook_router, prefix=API_PREFIX)
+app.include_router(tiktok_router, prefix=API_PREFIX)
 app.include_router(trend_recommendations.router, prefix=API_PREFIX)
