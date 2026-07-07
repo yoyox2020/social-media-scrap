@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 from app.shared.config import settings
@@ -98,8 +99,40 @@ _WEB_SEARCH_TOOL_PARAMETERS = {
 
 MAX_ITERATIONS = 8
 
+# Berapa kali model DIPAKSA coba web_search lagi kalau dia menyerah (jawab
+# teks biasa tanpa tool_call) padahal belum pernah submit topik apa pun.
+# qwen3:8b sering bilang "coba lagi dengan query lebih spesifik" tapi TIDAK
+# benar-benar melakukannya — ini nudge otomatis supaya dia beneran mencoba.
+# Naikkan angka ini kalau mau model lebih gigih (menambah waktu proses per +1).
+FORCE_RETRY_LIMIT = 1
+
 
 _SUPPORTED_PLATFORMS = {"instagram", "facebook"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ekstraksi kandidat akun dari URL literal di hasil web_search (lihat
+# _extract_account_candidates below). qwen3:8b sering gagal mengenali ID
+# numerik Facebook (mis. "100090312503944") sebagai akun yang valid kalau
+# cuma disuruh baca teks bebas — jadi kode ini yang ekstrak duluan lalu
+# sodorkan sebagai daftar pilihan eksplisit ke model.
+#
+# GAMPANG DIMODIFIKASI: kalau nanti ketemu pola URL Facebook/Instagram baru
+# yang BUKAN akun (ikut lolos filter, jadi "kandidat" palsu), tinggal tambah
+# ke set di bawah — tidak perlu ubah logic ekstraksinya.
+# ─────────────────────────────────────────────────────────────────────────────
+_FB_URL_RE = re.compile(r"facebook\.com/([A-Za-z0-9_.\-]+)", re.IGNORECASE)
+_IG_URL_RE = re.compile(r"instagram\.com/([A-Za-z0-9_.\-]+)", re.IGNORECASE)
+
+_FB_RESERVED_PATHS = {
+    "watch", "groups", "share", "reel", "reels", "photo.php", "permalink.php",
+    "story.php", "profile.php", "pages", "events", "marketplace", "gaming",
+    "help", "policies", "ads", "business", "settings", "login.php", "plugins",
+    "dialog", "hashtag", "search", "notifications", "messages", "live",
+}
+_IG_RESERVED_PATHS = {
+    "p", "reel", "reels", "explore", "stories", "accounts", "direct", "tv",
+    "about", "developer", "legal", "embed",
+}
 
 
 def _extract_items(raw_items: list[dict], max_topics: int) -> list[dict]:
@@ -283,6 +316,61 @@ def _format_search_results(results: list[dict], title_key: str, snippet_key: str
     return "\n".join(lines)
 
 
+def _extract_account_candidates(text: str, max_candidates: int = 8) -> list[dict]:
+    """
+    Ekstraksi kandidat akun Facebook/Instagram LANGSUNG dari URL literal di
+    teks hasil pencarian — dijalankan oleh kode ini, bukan ditebak model.
+    Kenapa perlu: qwen3:8b terbukti (lihat memory project_ollama_websearch_quality)
+    tidak mengenali ID numerik Facebook (mis. "100090312503944") sebagai akun
+    valid kalau cuma disuruh baca teks bebas.
+
+    Gampang dimodifikasi: filter "bukan akun" ada di _FB_RESERVED_PATHS /
+    _IG_RESERVED_PATHS di atas — tinggal tambah entri baru di situ kalau ada
+    pola URL non-akun yang lolos.
+    """
+    seen: set[tuple[str, str]] = set()
+    candidates: list[dict] = []
+
+    for platform, pattern, reserved in (
+        ("facebook", _FB_URL_RE, _FB_RESERVED_PATHS),
+        ("instagram", _IG_URL_RE, _IG_RESERVED_PATHS),
+    ):
+        for match in pattern.finditer(text):
+            slug = match.group(1)
+            if len(slug) < 3 or slug.lower() in reserved:
+                continue
+            key = (platform, slug)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({"platform": platform, "username": slug})
+            if len(candidates) >= max_candidates:
+                return candidates
+
+    return candidates
+
+
+def _append_account_candidates(search_text: str) -> str:
+    """Tempel daftar kandidat akun (hasil _extract_account_candidates) ke
+    akhir teks hasil pencarian, supaya model punya pilihan eksplisit alih-alih
+    menebak dari teks bebas. Tidak mengubah apa pun kalau tidak ada kandidat."""
+    candidates = _extract_account_candidates(search_text)
+    if not candidates:
+        return search_text
+
+    candidate_lines = "\n".join(
+        f"  - platform={c['platform']} username={c['username']}" for c in candidates
+    )
+    return (
+        f"{search_text}\n\n"
+        "[KANDIDAT AKUN TERDETEKSI OTOMATIS DARI URL DI ATAS — kalau salah satu "
+        "relevan dengan topik yang kamu temukan, WAJIB pakai username PERSIS "
+        "seperti ini (termasuk kalau berupa angka). JANGAN membuat username "
+        "baru selain yang ada di daftar ini selama daftar ini tidak kosong]\n"
+        f"{candidate_lines}"
+    )
+
+
 async def _firecrawl_search(query: str, max_results: int = 5) -> str:
     """
     Eksekusi pencarian NYATA ke Firecrawl — dipanggil oleh kode ini sendiri
@@ -333,18 +421,23 @@ async def _web_search(query: str, max_results: int = 5) -> str:
     key kosong. Kalau keduanya gagal/kosong, kasih tahu model apa adanya
     (BUKAN pura-pura ada hasil) supaya model tidak mengarang seolah-olah punya
     data pencarian nyata.
+
+    Hasil akhir (kalau ada) DITEMPEL kandidat akun via _append_account_candidates()
+    sebelum dikirim ke model — lihat komentar di fungsi itu untuk alasannya.
     """
     import httpx
 
     if settings.firecrawl_api_key:
         try:
-            return await _firecrawl_search(query, max_results)
+            text = await _firecrawl_search(query, max_results)
+            return _append_account_candidates(text)
         except httpx.HTTPError as exc:
             logger.warning("_web_search: Firecrawl gagal (%s), fallback ke Tavily", exc)
 
     if settings.tavily_api_key:
         try:
-            return await _tavily_search(query, max_results)
+            text = await _tavily_search(query, max_results)
+            return _append_account_candidates(text)
         except httpx.HTTPError as exc:
             logger.warning("_web_search: Tavily juga gagal: %s", exc)
             return f"Pencarian gagal (Firecrawl & Tavily error): {exc}"
@@ -385,6 +478,7 @@ async def _find_via_ollama() -> list[dict]:
     ]
 
     found_items: list[dict] = []
+    forced_retries_used = 0  # lihat FORCE_RETRY_LIMIT di atas
 
     for _ in range(MAX_ITERATIONS):
         response = client.chat.completions.create(model=settings.ollama_model_name, messages=messages, tools=tools)
@@ -404,6 +498,23 @@ async def _find_via_ollama() -> list[dict]:
         messages.append(assistant_msg)
 
         if not tool_calls:
+            # Model menyerah (jawab teks biasa) tanpa pernah submit apa pun.
+            # Paksa coba lagi maksimal FORCE_RETRY_LIMIT kali sebelum benar-benar
+            # berhenti — qwen3:8b sering BILANG mau cari lagi tapi tidak
+            # benar-benar melakukannya (lihat memory project_ollama_websearch_quality).
+            if not found_items and has_web_search and forced_retries_used < FORCE_RETRY_LIMIT:
+                forced_retries_used += 1
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Kamu belum memanggil tool apa pun dan belum submit topik. "
+                        "WAJIB coba web_search LAGI dengan query LEBIH SPESIFIK — "
+                        "sertakan nama topik yang sudah kamu temukan + kata "
+                        '"facebook"/"instagram" — sebelum benar-benar menyerah. Kalau '
+                        "hasil kali ini masih tidak ada akun, baru boleh berhenti."
+                    ),
+                })
+                continue
             break
 
         submit_calls = [c for c in tool_calls if c.function.name == _TOOL_NAME]
