@@ -11,11 +11,13 @@ Provider AI bisa diganti via .env TANPA ubah kode:
 CATATAN PENTING soal browsing per provider:
 - "anthropic" (Claude): web_search BAWAAN, dieksekusi server-side oleh
   infrastruktur Anthropic sendiri (model "browsing sendiri").
-- "ollama": browsing lewat tool `web_search` CUSTOM (Tavily API, butuh
-  TAVILY_API_KEY di .env) — model TIDAK bisa akses internet sendiri, jadi
-  kode di sini yang benar-benar eksekusi pencarian lalu kirim hasilnya balik
-  ke model (pola function-calling standar). Kalau TAVILY_API_KEY kosong,
-  fallback ke pengetahuan training model (bisa basi/salah, skor rendah).
+- "ollama": browsing lewat tool `web_search` CUSTOM — auto-switch: Firecrawl
+  dicoba dulu (FIRECRAWL_API_KEY), fallback ke Tavily (TAVILY_API_KEY) kalau
+  Firecrawl gagal/limit/key kosong (lihat _web_search()). Model TIDAK bisa
+  akses internet sendiri — kode di sini yang benar-benar eksekusi pencarian
+  lalu kirim hasilnya balik ke model (pola function-calling standar). Kalau
+  KEDUANYA kosong, fallback ke pengetahuan training model (bisa basi/salah,
+  skor rendah).
 - "openai": function calling saja, BELUM diberi tool web_search (belum
   diminta) — hasilnya dari pengetahuan training model.
 
@@ -267,44 +269,87 @@ async def _find_via_openai() -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Provider: Ollama (lokal) — endpoint kompatibel OpenAI, browsing via Tavily
+# Provider: Ollama (lokal) — endpoint kompatibel OpenAI, browsing via
+# Firecrawl (primary) dengan auto-switch fallback ke Tavily
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _tavily_search(query: str, max_results: int = 5) -> str:
-    """
-    Eksekusi pencarian NYATA ke Tavily — dipanggil oleh kode ini sendiri
-    (BUKAN oleh Ollama, model tidak punya akses jaringan), sebagai respons
-    atas tool_call `web_search` yang diminta model. Hasilnya dikirim balik
-    ke model sebagai pesan role="tool".
-    """
-    import httpx
-
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                "https://api.tavily.com/search",
-                json={
-                    "api_key": settings.tavily_api_key,
-                    "query": query,
-                    "search_depth": "basic",
-                    "max_results": max_results,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPError as exc:
-        logger.warning("_tavily_search error untuk query=%r: %s", query, exc)
-        return f"Pencarian gagal: {exc}"
-
-    results = data.get("results", [])
+def _format_search_results(results: list[dict], title_key: str, snippet_key: str, url_key: str) -> str:
     if not results:
         return "Tidak ada hasil untuk pencarian ini."
-
     lines = [
-        f"- {r.get('title', '')}: {(r.get('content') or '')[:300]} (sumber: {r.get('url', '')})"
+        f"- {r.get(title_key, '')}: {(r.get(snippet_key) or '')[:300]} (sumber: {r.get(url_key, '')})"
         for r in results
     ]
     return "\n".join(lines)
+
+
+async def _firecrawl_search(query: str, max_results: int = 5) -> str:
+    """
+    Eksekusi pencarian NYATA ke Firecrawl — dipanggil oleh kode ini sendiri
+    (BUKAN oleh Ollama, model tidak punya akses jaringan). Raise httpx.HTTPError
+    kalau gagal supaya _web_search() bisa fallback ke Tavily.
+    """
+    import httpx
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            "https://api.firecrawl.dev/v1/search",
+            headers={"Authorization": f"Bearer {settings.firecrawl_api_key}"},
+            json={"query": query, "limit": max_results},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    return _format_search_results(data.get("data", []), "title", "description", "url")
+
+
+async def _tavily_search(query: str, max_results: int = 5) -> str:
+    """
+    Eksekusi pencarian NYATA ke Tavily — fallback kalau Firecrawl gagal/tidak
+    dikonfigurasi. Raise httpx.HTTPError kalau gagal (ditangkap _web_search()).
+    """
+    import httpx
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": settings.tavily_api_key,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": max_results,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    return _format_search_results(data.get("results", []), "title", "content", "url")
+
+
+async def _web_search(query: str, max_results: int = 5) -> str:
+    """
+    Dispatcher auto-switch: coba Firecrawl dulu (hasil lebih relevan/spesifik
+    per perbandingan langsung), fallback ke Tavily kalau Firecrawl gagal/limit/
+    key kosong. Kalau keduanya gagal/kosong, kasih tahu model apa adanya
+    (BUKAN pura-pura ada hasil) supaya model tidak mengarang seolah-olah punya
+    data pencarian nyata.
+    """
+    import httpx
+
+    if settings.firecrawl_api_key:
+        try:
+            return await _firecrawl_search(query, max_results)
+        except httpx.HTTPError as exc:
+            logger.warning("_web_search: Firecrawl gagal (%s), fallback ke Tavily", exc)
+
+    if settings.tavily_api_key:
+        try:
+            return await _tavily_search(query, max_results)
+        except httpx.HTTPError as exc:
+            logger.warning("_web_search: Tavily juga gagal: %s", exc)
+            return f"Pencarian gagal (Firecrawl & Tavily error): {exc}"
+
+    return "Web search tidak tersedia (FIRECRAWL_API_KEY/TAVILY_API_KEY belum di-set)."
 
 
 async def _find_via_ollama() -> list[dict]:
@@ -313,10 +358,12 @@ async def _find_via_ollama() -> list[dict]:
     base_url = f"{settings.ollama_base_url}/v1"
     client = OpenAI(base_url=base_url, api_key="ollama")  # api_key diabaikan Ollama, tapi wajib diisi
     max_topics = settings.viral_discovery_max_topics
-    has_web_search = bool(settings.tavily_api_key)
+    has_web_search = bool(settings.firecrawl_api_key or settings.tavily_api_key)
 
     if not has_web_search:
-        logger.warning("find_daily_viral_topics[ollama]: TAVILY_API_KEY belum di-set, jalan TANPA browsing")
+        logger.warning(
+            "find_daily_viral_topics[ollama]: FIRECRAWL_API_KEY/TAVILY_API_KEY belum di-set, jalan TANPA browsing"
+        )
 
     tools = [{
         "type": "function",
@@ -373,7 +420,7 @@ async def _find_via_ollama() -> list[dict]:
 
         for call in search_calls:
             args = json.loads(call.function.arguments)
-            result_text = await _tavily_search(args.get("query", ""))
+            result_text = await _web_search(args.get("query", ""))
             messages.append({"role": "tool", "tool_call_id": call.id, "content": result_text})
 
         if submit_calls:

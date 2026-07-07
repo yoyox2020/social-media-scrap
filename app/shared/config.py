@@ -64,9 +64,12 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o"
 
-    # Tavily — web search untuk provider Ollama (model lokal tidak punya
-    # browsing bawaan, jadi butuh tool search eksternal). Daftar di tavily.com.
-    tavily_api_key: str = ""
+    # Web search untuk provider Ollama (model lokal tidak punya browsing
+    # bawaan, jadi butuh tool search eksternal) — auto-switch: Firecrawl
+    # dicoba dulu (hasil lebih relevan/spesifik per tes), fallback ke Tavily
+    # kalau Firecrawl gagal/limit/key kosong. Isi minimal salah satu.
+    firecrawl_api_key: str = ""   # daftar di firecrawl.dev
+    tavily_api_key: str = ""      # daftar di tavily.com
 
     viral_discovery_max_topics: int = 5   # maks topik/hari dari AI discovery, ubah via .env
 
