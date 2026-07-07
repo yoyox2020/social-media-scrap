@@ -107,7 +107,7 @@ MAX_ITERATIONS = 8
 FORCE_RETRY_LIMIT = 1
 
 
-_SUPPORTED_PLATFORMS = {"instagram", "facebook"}
+_SUPPORTED_PLATFORMS = {"instagram", "facebook", "tiktok"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Ekstraksi kandidat akun dari URL literal di hasil web_search (lihat
@@ -122,6 +122,7 @@ _SUPPORTED_PLATFORMS = {"instagram", "facebook"}
 # ─────────────────────────────────────────────────────────────────────────────
 _FB_URL_RE = re.compile(r"facebook\.com/([A-Za-z0-9_.\-]+)", re.IGNORECASE)
 _IG_URL_RE = re.compile(r"instagram\.com/([A-Za-z0-9_.\-]+)", re.IGNORECASE)
+_TT_URL_RE = re.compile(r"tiktok\.com/@([A-Za-z0-9_.\-]+)", re.IGNORECASE)
 
 _FB_RESERVED_PATHS = {
     "watch", "groups", "share", "reel", "reels", "photo.php", "permalink.php",
@@ -132,6 +133,10 @@ _FB_RESERVED_PATHS = {
 _IG_RESERVED_PATHS = {
     "p", "reel", "reels", "explore", "stories", "accounts", "direct", "tv",
     "about", "developer", "legal", "embed",
+}
+_TT_RESERVED_PATHS = {
+    "video", "tag", "music", "discover", "live", "search", "explore",
+    "upload", "following", "foryou", "trending",
 }
 
 
@@ -155,29 +160,30 @@ def _system_prompt(max_topics: int, has_web_search: bool) -> str:
              "jadi ini mungkin bukan data hari ini yang sebenarnya, beri tahu itu di skor rendah)"
     )
     account_rule = (
-        "WAJIB sertakan minimal SATU akun nyata — Instagram (platform='instagram') "
-        "DAN/ATAU Facebook (platform='facebook') — yang mendorong viralitasnya untuk "
-        "tiap topik. Akun itu HARUS benar-benar disebutkan namanya di hasil web_search "
-        "(judul/isi/URL) — JANGAN PERNAH mengarang atau menebak username yang tidak "
-        "muncul eksplisit di hasil pencarian. Kalau hasil pencarian cuma bahas topik "
-        "tanpa menyebut akun spesifik, cari lagi dengan query lain (query berbeda) "
-        "sebelum menyerah pada topik itu."
+        "WAJIB sertakan minimal SATU akun nyata — Instagram (platform='instagram'), "
+        "Facebook (platform='facebook'), DAN/ATAU TikTok (platform='tiktok') — yang "
+        "mendorong viralitasnya untuk tiap topik. Akun itu HARUS benar-benar "
+        "disebutkan namanya di hasil web_search (judul/isi/URL) — JANGAN PERNAH "
+        "mengarang atau menebak username yang tidak muncul eksplisit di hasil "
+        "pencarian. Kalau hasil pencarian cuma bahas topik tanpa menyebut akun "
+        "spesifik, cari lagi dengan query lain (query berbeda) sebelum menyerah "
+        "pada topik itu."
         if has_web_search
         else
-        "WAJIB sertakan minimal SATU akun nyata — Instagram (platform='instagram') "
-        "DAN/ATAU Facebook (platform='facebook') — yang mendorong viralitasnya untuk "
-        "tiap topik."
+        "WAJIB sertakan minimal SATU akun nyata — Instagram (platform='instagram'), "
+        "Facebook (platform='facebook'), DAN/ATAU TikTok (platform='tiktok') — yang "
+        "mendorong viralitasnya untuk tiap topik."
     )
     return (
         f"Kamu adalah AI trend-analyst. Hari ini tanggal {today}. Tugasmu HARI INI: "
         f"{browsing_note} topik/isu yang BENAR-BENAR sedang viral di berita Indonesia "
-        "dan media sosial publik (Instagram dan/atau Facebook) — bukan satu keyword "
-        "tertentu, tapi sapuan terbuka (bisa politik, hiburan, olahraga, produk "
-        f"viral, dll). {account_rule} Kalau tidak menemukan akun Instagram MAUPUN "
-        f"Facebook sama sekali untuk suatu topik, jangan sertakan topik itu. Maksimal "
-        f"{max_topics} topik, jangan mengarang untuk mencapai jumlah itu — kalau cuma "
-        "menemukan lebih sedikit, submit yang nyata saja. Setelah menemukan data "
-        f"nyata, panggil tool {_TOOL_NAME}."
+        "dan media sosial publik (Instagram, Facebook, dan/atau TikTok) — bukan satu "
+        "keyword tertentu, tapi sapuan terbuka (bisa politik, hiburan, olahraga, "
+        f"produk viral, dll). {account_rule} Kalau tidak menemukan akun Instagram, "
+        f"Facebook, MAUPUN TikTok sama sekali untuk suatu topik, jangan sertakan "
+        f"topik itu. Maksimal {max_topics} topik, jangan mengarang untuk mencapai "
+        "jumlah itu — kalau cuma menemukan lebih sedikit, submit yang nyata saja. "
+        f"Setelah menemukan data nyata, panggil tool {_TOOL_NAME}."
     )
 
 
@@ -221,7 +227,7 @@ async def _find_via_anthropic() -> list[dict]:
     ]
 
     messages: list[dict] = [
-        {"role": "user", "content": "Cari topik/akun yang sedang viral hari ini (berita + Instagram publik Indonesia)."}
+        {"role": "user", "content": "Cari topik/akun yang sedang viral hari ini (berita + Instagram/Facebook/TikTok publik Indonesia)."}
     ]
     found_items: list[dict] = []
 
@@ -284,7 +290,7 @@ async def _find_via_openai() -> list[dict]:
     }]
     messages: list[dict] = [
         {"role": "system", "content": _system_prompt(max_topics, has_web_search=False)},
-        {"role": "user", "content": "Cari topik/akun yang sedang viral hari ini (berita + Instagram publik Indonesia)."},
+        {"role": "user", "content": "Cari topik/akun yang sedang viral hari ini (berita + Instagram/Facebook/TikTok publik Indonesia)."},
     ]
 
     found_items: list[dict] = []
@@ -334,6 +340,7 @@ def _extract_account_candidates(text: str, max_candidates: int = 8) -> list[dict
     for platform, pattern, reserved in (
         ("facebook", _FB_URL_RE, _FB_RESERVED_PATHS),
         ("instagram", _IG_URL_RE, _IG_RESERVED_PATHS),
+        ("tiktok", _TT_URL_RE, _TT_RESERVED_PATHS),
     ):
         for match in pattern.finditer(text):
             slug = match.group(1)
@@ -474,7 +481,7 @@ async def _find_via_ollama() -> list[dict]:
 
     messages: list[dict] = [
         {"role": "system", "content": _system_prompt(max_topics, has_web_search=has_web_search)},
-        {"role": "user", "content": "Cari topik/akun yang sedang viral hari ini (berita + Instagram/Facebook publik Indonesia)."},
+        {"role": "user", "content": "Cari topik/akun yang sedang viral hari ini (berita + Instagram/Facebook/TikTok publik Indonesia)."},
     ]
 
     found_items: list[dict] = []
