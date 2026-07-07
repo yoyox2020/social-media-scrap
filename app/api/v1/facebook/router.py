@@ -3,7 +3,7 @@ Facebook API endpoints.
 
 GET  /facebook/profile              — profil ringkas (followers/nama) dari page/profile manapun (Apify, live)
 GET  /facebook/posts?username=X     — scrape (via Apify) + ambil post dari page/profil manapun (maks 10)
-GET  /facebook/posts/search?q=...   — cari post yang SUDAH discrape berdasarkan keyword (bukan username)
+GET  /facebook/posts/search?q=...   — cari post yang SUDAH discrape berdasarkan keyword/rentang tanggal, atau q kosong = tampilkan SEMUA post lokal
 GET  /facebook/trending              — topik trending Facebook dari trend_recommendations
 GET  /facebook/analysis/summary      — ringkasan menyeluruh hasil analisis sentimen Facebook
 GET  /facebook/comments              — list komentar Facebook dengan filter
@@ -301,48 +301,88 @@ async def _build_fb_search_items(db: AsyncSession, post_rows) -> list[dict]:
 
 
 @router.get("/posts/search", response_model=dict,
-            summary="Cari post Facebook yang sudah di-scrape berdasarkan keyword/hashtag")
+            summary="Cari post Facebook (keyword/hashtag/rentang tanggal) atau tampilkan SEMUA data lokal")
 async def search_facebook_posts(
-    q: str = Query(..., min_length=1, max_length=200, description="Keyword atau hashtag (boleh pakai # atau tidak)"),
+    q: str | None = Query(default=None, min_length=1, max_length=200, description="Keyword atau hashtag (boleh pakai # atau tidak). KOSONGKAN untuk tampilkan semua post Facebook lokal."),
+    date_from: date | None = Query(default=None, description="Filter dari tanggal (published_at)"),
+    date_to: date | None = Query(default=None, description="Filter sampai tanggal (published_at)"),
     limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Cari post Facebook berdasarkan isi CAPTION atau HASHTAG yang sudah
-    tersimpan dari scrape sebelumnya — BUKAN cari page baru (itu
+    Cari post Facebook berdasarkan isi CAPTION/HASHTAG/rentang tanggal yang
+    sudah tersimpan dari scrape sebelumnya — BUKAN cari page baru (itu
     `GET /facebook/search`, dan itu sudah mati sejak Meta hapus endpoint-nya).
 
-    **Alur:**
-    1. Cari di `posts.content` dan tabel `entities` (hashtag).
-    2. Kalau tidak ketemu: cari topik yang cocok di `trend_recommendations`
-       (dibaca saja, tidak mengubah logikanya). Kalau ketemu topik dengan
-       akun Facebook → scrape SEKARANG via Apify, langsung return hasilnya.
-    3. Kalau tidak ketemu post maupun topik sama sekali → Apify tidak bisa
-       cari-by-keyword sendiri, jadi tidak ada akun yang bisa discrape;
-       submit manual kalau tahu akunnya via `POST /trend-recommendations`.
-    """
-    q_clean = q.strip().lstrip("#")
-    if not q_clean:
-        raise HTTPException(status_code=422, detail="Keyword tidak boleh kosong")
+    **Dua mode:**
+    - `q` DIISI: cari keyword/hashtag (opsional dipersempit `date_from`/`date_to`).
+      Kalau tidak ketemu di database, fallback cari topik cocok di
+      `trend_recommendations` lalu scrape SEKARANG via Apify (perilaku lama,
+      tidak berubah).
+    - `q` KOSONG: **tampilkan SEMUA post Facebook yang ada di database lokal**
+      (urut published_at terbaru dulu), bisa dipersempit `date_from`/`date_to`.
+      TIDAK ada fallback scrape (tidak ada keyword untuk dicocokkan ke topik).
 
-    # ── 1. Cari di posts.content atau hashtag (entities) ───────────────────────
-    post_rows = (await db.execute(text("""
+    Pagination via `limit`/`offset`, total row sebenarnya ada di field `total`
+    (bukan cuma jumlah item di halaman ini).
+    """
+    q_clean = (q or "").strip().lstrip("#")
+
+    # ── Bangun WHERE clause dinamis (dipakai query total + query data) ─────────
+    filters = ["p.platform = 'facebook'"]
+    params: dict = {"limit": limit, "offset": offset}
+
+    if q_clean:
+        filters.append("(p.content ILIKE :kw OR e.text ILIKE :kw_exact)")
+        params["kw"] = f"%{q_clean}%"
+        params["kw_exact"] = q_clean
+    if date_from:
+        filters.append("p.published_at >= :date_from")
+        params["date_from"] = datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc)
+    if date_to:
+        filters.append("p.published_at <= :date_to")
+        params["date_to"] = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59, tzinfo=timezone.utc)
+
+    where_clause = " AND ".join(filters)
+    count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
+
+    total: int = (await db.scalar(text(f"""
+        SELECT COUNT(DISTINCT p.id) FROM posts p
+        LEFT JOIN entities e ON e.post_id = p.id AND e.entity_type = 'HASHTAG'
+        WHERE {where_clause}
+    """), count_params)) or 0
+
+    post_rows = (await db.execute(text(f"""
         SELECT DISTINCT p.id, p.external_id, p.content, p.author, p.url,
                p.published_at, p.metadata
         FROM posts p
         LEFT JOIN entities e ON e.post_id = p.id AND e.entity_type = 'HASHTAG'
-        WHERE p.platform = 'facebook'
-          AND (p.content ILIKE :kw OR e.text ILIKE :kw_exact)
+        WHERE {where_clause}
         ORDER BY p.published_at DESC NULLS LAST
-        LIMIT :limit
-    """), {"kw": f"%{q_clean}%", "kw_exact": q_clean, "limit": limit})).mappings().all()
+        OFFSET :offset LIMIT :limit
+    """), params)).mappings().all()
 
     if post_rows:
         items = await _build_fb_search_items(db, post_rows)
-        return build_success_response({"query": q_clean, "source": "database", "total": len(items), "items": items})
+        return build_success_response({
+            "query": q_clean or None, "date_from": str(date_from) if date_from else None,
+            "date_to": str(date_to) if date_to else None, "source": "database",
+            "total": total, "offset": offset, "limit": limit, "items": items,
+        })
 
-    # ── 2. Tidak ketemu -> cari topik cocok di trend_recommendations ───────────
+    # ── q kosong & tidak ketemu apa-apa -> tidak ada yang bisa di-fallback,
+    # cukup kembalikan kosong (jangan trigger AI-scrape tanpa keyword) ─────────
+    if not q_clean:
+        return build_success_response({
+            "query": None, "date_from": str(date_from) if date_from else None,
+            "date_to": str(date_to) if date_to else None, "source": "database",
+            "total": 0, "offset": offset, "limit": limit, "items": [],
+            "message": "Tidak ada post Facebook di database untuk filter tanggal ini.",
+        })
+
+    # ── q diisi tapi tidak ketemu -> cari topik cocok di trend_recommendations ─
     from app.domain.trend_recommendations.models import TrendRecommendation
 
     candidate_topics = (await db.scalars(
