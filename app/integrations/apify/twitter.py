@@ -113,12 +113,12 @@ async def scrape_twitter_via_apify(
     return await asyncio.to_thread(_run_profile_sync, identifier, max_posts, max_comments)
 
 
-def _run_search_sync(query: str, max_results: int) -> list[dict[str, Any]]:
+def _run_search_sync(query: str, max_results: int, search_type: str) -> list[dict[str, Any]]:
     if not settings.apify_api_token:
         raise ExternalAPIError(service="Apify", message="APIFY_API_TOKEN belum di-set di .env")
 
     client = ApifyClient(settings.apify_api_token)
-    run_input: dict[str, Any] = {"query": query, "search_type": "Top", "max_posts": max_results}
+    run_input: dict[str, Any] = {"query": query, "search_type": search_type, "max_posts": max_results}
 
     logger.info("[Apify] twitter-scraper (search) query=%r input=%s", query, run_input)
     run = client.actor(settings.twitter_actor_id).call(run_input=run_input)
@@ -129,13 +129,25 @@ def _run_search_sync(query: str, max_results: int) -> list[dict[str, Any]]:
     return list(client.dataset(run.default_dataset_id).iterate_items())
 
 
-async def search_twitter_by_keyword(query: str, max_results: int = 10) -> list[dict[str, Any]]:
+async def search_twitter_by_keyword(query: str, max_results: int = 10, search_type: str = "Latest") -> list[dict[str, Any]]:
     """
     Search Twitter/X LANGSUNG by keyword (BUKAN scrape profil yang sudah
     diketahui) — actor yang SAMA dengan scrape_twitter_via_apify, input beda
     (`query`+`search_type` alih-alih `username`). Hasilnya tweet yang cocok
     dengan keyword, masing-masing punya `author.screen_name` — akun ASLI
-    yang genuinely membahas topik itu, bukan tebakan AI. Tidak fetch balasan
-    (discover cuma butuh akun, hemat biaya — sama pola dengan TikTok).
+
+    CATATAN PENTING (diverifikasi live 08 Juli 2026): default `search_type`
+    SENGAJA "Latest", BUKAN "Top" — dibandingkan langsung untuk query yang
+    SAMA, "Top" mengembalikan tweet berumur sampai 5 hari (algoritma Twitter
+    bias ke tweet yang SUDAH sempat mengumpulkan engagement), sedangkan
+    "Latest" mengembalikan tweet dari hari yang sama saat query dijalankan.
+    Karena tujuan discover di sini adalah topik viral HARI INI, "Latest"
+    lebih sesuai — trade-off: tweet yang sangat baru wajar punya engagement
+    rendah (belum sempat viral), jadi caller (discover_twitter_topic_by_keyword)
+    mengurutkan hasil berdasarkan engagement SETELAH fetch untuk tetap
+    memprioritaskan yang relatif lebih ramai di antara tweet hari ini.
+
+    Tidak fetch balasan (discover cuma butuh akun, hemat biaya — sama pola
+    dengan TikTok).
     """
-    return await asyncio.to_thread(_run_search_sync, query, max_results)
+    return await asyncio.to_thread(_run_search_sync, query, max_results, search_type)

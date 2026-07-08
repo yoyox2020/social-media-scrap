@@ -232,6 +232,18 @@ async def discover_twitter_topic_by_keyword(db: AsyncSession, keyword: str, max_
         logger.error("discover_twitter_topic_by_keyword: search gagal untuk keyword=%r: %s", keyword, exc)
         return {"keyword": keyword, "posts_found": 0, "accounts_found": [], "submitted": None, "error": str(exc)}
 
+    # search_twitter_by_keyword() pakai search_type="Latest" (bukan "Top") supaya
+    # tweet yang ketemu genuinely dari HARI INI (lihat catatan di twitter.py) —
+    # tapi "Latest" tidak mengurutkan berdasar engagement sama sekali (murni
+    # kronologis), jadi diurutkan manual di sini (favorites+retweets tertinggi
+    # dulu) supaya akun yang disubmit tetap yang relatif paling "viral" di
+    # antara tweet hari ini, bukan sekadar yang paling baru diposting.
+    raw_posts = sorted(
+        raw_posts,
+        key=lambda p: (p.get("favorites") or 0) + (p.get("retweets") or 0),
+        reverse=True,
+    )
+
     seen: set[str] = set()
     accounts: list[dict] = []
     sample_posts: list[dict] = []
