@@ -126,9 +126,20 @@ class Settings(BaseSettings):
 
     # Apify — Twitter/X. SATU actor untuk scrape profil, search by keyword,
     # DAN reply/comment (mode "responses" via post_id) — lihat
-    # app/integrations/apify/twitter.py. Fase 1 (basic scraping): belum ada
-    # entri trend_recommendations budget/schedule, menyusul di Fase 2.
+    # app/integrations/apify/twitter.py.
     twitter_actor_id: str = "danek/twitter-scraper"
+
+    # Twitter — provider abstraction untuk pipeline trend_recommendations
+    # (Subsistem B khusus Twitter, terpisah dari Facebook/TikTok/Instagram),
+    # jadwal 12:00 WIB (1 jam setelah TikTok) supaya tidak rebutan resource.
+    # max_comments per topic dibatasi lebih rendah dari platform lain karena
+    # tiap balasan butuh actor call TERPISAH per tweet (lihat
+    # app/integrations/apify/twitter.py) — lebih mahal per unit.
+    twitter_trend_daily_budget: int = 5
+    twitter_trend_posts_per_topic: int = 3
+    twitter_trend_comments_per_post: int = 5
+    twitter_trend_scrape_schedule_hour: int = 12
+    twitter_trend_scrape_schedule_minute: int = 0
 
     # Instagram session (dari browser cookies — untuk scraping tanpa EnsembleData)
     instagram_session_id: str = ""

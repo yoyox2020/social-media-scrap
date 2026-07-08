@@ -107,7 +107,7 @@ MAX_ITERATIONS = 8
 FORCE_RETRY_LIMIT = 1
 
 
-_SUPPORTED_PLATFORMS = {"instagram", "facebook", "tiktok"}
+_SUPPORTED_PLATFORMS = {"instagram", "facebook", "tiktok", "twitter"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Ekstraksi kandidat akun dari URL literal di hasil web_search (lihat
@@ -123,6 +123,10 @@ _SUPPORTED_PLATFORMS = {"instagram", "facebook", "tiktok"}
 _FB_URL_RE = re.compile(r"facebook\.com/([A-Za-z0-9_.\-]+)", re.IGNORECASE)
 _IG_URL_RE = re.compile(r"instagram\.com/([A-Za-z0-9_.\-]+)", re.IGNORECASE)
 _TT_URL_RE = re.compile(r"tiktok\.com/@([A-Za-z0-9_.\-]+)", re.IGNORECASE)
+# Twitter/X: domain lama (twitter.com) dan baru (x.com) dua-duanya masih
+# dipakai di hasil web_search — username Twitter cuma huruf/angka/underscore
+# (tidak ada titik/strip, beda dengan FB/IG/TikTok), maks 15 karakter.
+_TW_URL_RE = re.compile(r"(?:twitter|x)\.com/([A-Za-z0-9_]{1,15})", re.IGNORECASE)
 
 _FB_RESERVED_PATHS = {
     "watch", "groups", "share", "reel", "reels", "photo.php", "permalink.php",
@@ -137,6 +141,11 @@ _IG_RESERVED_PATHS = {
 _TT_RESERVED_PATHS = {
     "video", "tag", "music", "discover", "live", "search", "explore",
     "upload", "following", "foryou", "trending",
+}
+_TW_RESERVED_PATHS = {
+    "home", "search", "explore", "notifications", "messages", "i", "intent",
+    "hashtag", "settings", "compose", "login", "signup", "about", "tos",
+    "privacy", "help", "share", "download",
 }
 
 
@@ -161,29 +170,29 @@ def _system_prompt(max_topics: int, has_web_search: bool) -> str:
     )
     account_rule = (
         "WAJIB sertakan minimal SATU akun nyata — Instagram (platform='instagram'), "
-        "Facebook (platform='facebook'), DAN/ATAU TikTok (platform='tiktok') — yang "
-        "mendorong viralitasnya untuk tiap topik. Akun itu HARUS benar-benar "
-        "disebutkan namanya di hasil web_search (judul/isi/URL) — JANGAN PERNAH "
-        "mengarang atau menebak username yang tidak muncul eksplisit di hasil "
-        "pencarian. Kalau hasil pencarian cuma bahas topik tanpa menyebut akun "
-        "spesifik, cari lagi dengan query lain (query berbeda) sebelum menyerah "
-        "pada topik itu."
+        "Facebook (platform='facebook'), TikTok (platform='tiktok'), DAN/ATAU "
+        "Twitter/X (platform='twitter') — yang mendorong viralitasnya untuk tiap "
+        "topik. Akun itu HARUS benar-benar disebutkan namanya di hasil web_search "
+        "(judul/isi/URL) — JANGAN PERNAH mengarang atau menebak username yang "
+        "tidak muncul eksplisit di hasil pencarian. Kalau hasil pencarian cuma "
+        "bahas topik tanpa menyebut akun spesifik, cari lagi dengan query lain "
+        "(query berbeda) sebelum menyerah pada topik itu."
         if has_web_search
         else
         "WAJIB sertakan minimal SATU akun nyata — Instagram (platform='instagram'), "
-        "Facebook (platform='facebook'), DAN/ATAU TikTok (platform='tiktok') — yang "
-        "mendorong viralitasnya untuk tiap topik."
+        "Facebook (platform='facebook'), TikTok (platform='tiktok'), DAN/ATAU "
+        "Twitter/X (platform='twitter') — yang mendorong viralitasnya untuk tiap topik."
     )
     return (
         f"Kamu adalah AI trend-analyst. Hari ini tanggal {today}. Tugasmu HARI INI: "
         f"{browsing_note} topik/isu yang BENAR-BENAR sedang viral di berita Indonesia "
-        "dan media sosial publik (Instagram, Facebook, dan/atau TikTok) — bukan satu "
-        "keyword tertentu, tapi sapuan terbuka (bisa politik, hiburan, olahraga, "
-        f"produk viral, dll). {account_rule} Kalau tidak menemukan akun Instagram, "
-        f"Facebook, MAUPUN TikTok sama sekali untuk suatu topik, jangan sertakan "
-        f"topik itu. Maksimal {max_topics} topik, jangan mengarang untuk mencapai "
-        "jumlah itu — kalau cuma menemukan lebih sedikit, submit yang nyata saja. "
-        f"Setelah menemukan data nyata, panggil tool {_TOOL_NAME}."
+        "dan media sosial publik (Instagram, Facebook, TikTok, dan/atau Twitter/X) — "
+        "bukan satu keyword tertentu, tapi sapuan terbuka (bisa politik, hiburan, "
+        f"olahraga, produk viral, dll). {account_rule} Kalau tidak menemukan akun "
+        f"Instagram, Facebook, TikTok, MAUPUN Twitter/X sama sekali untuk suatu "
+        f"topik, jangan sertakan topik itu. Maksimal {max_topics} topik, jangan "
+        "mengarang untuk mencapai jumlah itu — kalau cuma menemukan lebih sedikit, "
+        f"submit yang nyata saja. Setelah menemukan data nyata, panggil tool {_TOOL_NAME}."
     )
 
 
@@ -372,6 +381,7 @@ def _extract_account_candidates(text: str, max_candidates: int = 8) -> list[dict
         ("facebook", _FB_URL_RE, _FB_RESERVED_PATHS),
         ("instagram", _IG_URL_RE, _IG_RESERVED_PATHS),
         ("tiktok", _TT_URL_RE, _TT_RESERVED_PATHS),
+        ("twitter", _TW_URL_RE, _TW_RESERVED_PATHS),
     ):
         for match in pattern.finditer(text):
             slug = match.group(1)

@@ -39,6 +39,7 @@ celery_app = Celery(
         "app.workers.viral_discovery_worker",
         "app.workers.facebook_trending_worker",
         "app.workers.tiktok_trending_worker",
+        "app.workers.twitter_trending_worker",
     ],
 )
 
@@ -113,6 +114,15 @@ celery_app.conf.update(
             "schedule": crontab(
                 hour=settings.tiktok_trend_scrape_schedule_hour,
                 minute=settings.tiktok_trend_scrape_schedule_minute,
+            ),
+        },
+        # Twitter/X: scrape topik trend_recommendations (via Apify), jadwal via .env
+        # Subsistem B terpisah dari Instagram/Facebook/TikTok, 1 jam setelah TikTok
+        "twitter-trend-recommendation-daily": {
+            "task": "workers.twitter_trend_recommendation.daily",
+            "schedule": crontab(
+                hour=settings.twitter_trend_scrape_schedule_hour,
+                minute=settings.twitter_trend_scrape_schedule_minute,
             ),
         },
         # YouTube: fetch trending Indonesia setiap hari jam 12.00 WIB

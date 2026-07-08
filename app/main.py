@@ -636,6 +636,43 @@ async def scraping_status_page():
   <tbody id="tts-runs-table"></tbody>
 </table>
 
+<div class="section-title" style="margin-top:24px">Twitter/X Trend-Scrape (trend_recommendations)</div>
+<div class="ig-grid">
+  <div class="ig-card"><div class="label">Pending</div><div class="value" id="twts-pending">-</div><div class="sub">nunggu giliran scrape</div></div>
+  <div class="ig-card"><div class="label">Sudah Discrape</div><div class="value" id="twts-used">-</div><div class="sub">status=used</div></div>
+  <div class="ig-card"><div class="label">Gagal Permanen</div><div class="value" id="twts-failed-permanent">-</div><div class="sub">menyerah setelah 3x gagal</div></div>
+  <div class="ig-card"><div class="label">Budget Harian</div><div class="value" id="twts-budget">-</div><div class="sub">topik/hari (Apify)</div></div>
+  <div class="ig-card"><div class="label">Jadwal</div><div class="value" id="twts-schedule" style="font-size:1rem">-</div><div class="sub">Celery Beat</div></div>
+</div>
+<table>
+  <thead>
+    <tr>
+      <th>Topik</th>
+      <th>Score</th>
+      <th>Akun Twitter</th>
+      <th>Sumber</th>
+      <th>Dibuat</th>
+    </tr>
+  </thead>
+  <tbody id="twts-pending-table"></tbody>
+</table>
+
+<div class="section-title" style="margin-top:24px">Riwayat Scrape Twitter/X (trend_recommendations)</div>
+<table>
+  <thead>
+    <tr>
+      <th>Topik</th>
+      <th>Status</th>
+      <th>Sumber</th>
+      <th>Post Baru</th>
+      <th>Durasi</th>
+      <th>Waktu Mulai</th>
+      <th>Error</th>
+    </tr>
+  </thead>
+  <tbody id="twts-runs-table"></tbody>
+</table>
+
 <div class="section-title" style="margin-top:24px">Riwayat Scraping Keyword</div>
 <table>
   <thead>
@@ -1231,15 +1268,58 @@ async function load() {
       }).join('');
     }
 
-    // ── Sedang Berjalan Sekarang — gabungan Instagram + Facebook + TikTok ────
+    // ── Twitter/X trend-scrape (trend_recommendations) ───────────────────────
+    const twts = d.twitter_trend_scrape || {};
+    const twtsSummary = twts.summary || {};
+    document.getElementById('twts-pending').textContent  = twtsSummary.pending_with_twitter_account || 0;
+    document.getElementById('twts-used').textContent     = twtsSummary.used_with_twitter_account || 0;
+    document.getElementById('twts-failed-permanent').textContent = twtsSummary.failed_permanent_with_twitter_account || 0;
+    document.getElementById('twts-budget').textContent   = twts.daily_budget ?? '-';
+    document.getElementById('twts-schedule').textContent = twts.schedule ?? '-';
+
+    const twtsPendingTbody = document.getElementById('twts-pending-table');
+    const twtsPending = twts.pending_topics || [];
+    if (twtsPending.length === 0) {
+      twtsPendingTbody.innerHTML = '<tr><td colspan="5" style="color:#475569;font-style:italic;padding:12px">Tidak ada topik pending</td></tr>';
+    } else {
+      twtsPendingTbody.innerHTML = twtsPending.map(t => `<tr>
+        <td>${t.topic}</td>
+        <td>${(t.score||0).toFixed(2)}</td>
+        <td>@${t.twitter_identifier || '-'}</td>
+        <td style="color:#64748b;font-size:.72rem">${t.source || '-'}</td>
+        <td style="color:#94a3b8;font-size:.75rem">${fmt(t.created_at)}</td>
+      </tr>`).join('');
+    }
+
+    const twtsRunsTbody = document.getElementById('twts-runs-table');
+    const twtsRuns = twts.recent_runs || [];
+    if (twtsRuns.length === 0) {
+      twtsRunsTbody.innerHTML = '<tr><td colspan="7" style="color:#475569;font-style:italic;padding:12px">Belum ada riwayat scrape</td></tr>';
+    } else {
+      twtsRunsTbody.innerHTML = twtsRuns.map(r => {
+        const pillClass = r.status === 'success' ? 'pill-success' : (r.status === 'failed' ? 'pill-failed' : 'pill-running');
+        return `<tr>
+          <td>${r.topic}</td>
+          <td><span class="pill ${pillClass}">${r.status}</span></td>
+          <td style="color:#64748b;font-size:.72rem">${r.api_source || '-'}</td>
+          <td class="${(r.videos_new||0)>0?'green':''}">${r.videos_new ?? 0}</td>
+          <td style="color:#94a3b8">${r.duration_seconds ?? '-'}s</td>
+          <td style="color:#94a3b8;font-size:.75rem">${fmt(r.started_at)}</td>
+          <td class="error-text" title="${r.error_message||''}">${r.error_message || '-'}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    // ── Sedang Berjalan Sekarang — gabungan Instagram + Facebook + TikTok + Twitter ──
     const itsRunningTbody = document.getElementById('its-running-table');
     const triggerLabel = { manual_api: 'Manual (Frontend/API)', manual_cli: 'Manual (CLI)', celery_beat: 'Otomatis (Jadwal)' };
     const allRunning = [
       ...(its.running_now || []).map(r => ({ ...r, platform: 'Instagram' })),
       ...(fts.running_now || []).map(r => ({ ...r, platform: 'Facebook' })),
       ...(tts.running_now || []).map(r => ({ ...r, platform: 'TikTok' })),
+      ...(twts.running_now || []).map(r => ({ ...r, platform: 'Twitter' })),
     ];
-    const platformPill = { Facebook: 'pill-waiting', TikTok: 'pill-fallback', Instagram: 'pill-success' };
+    const platformPill = { Facebook: 'pill-waiting', TikTok: 'pill-fallback', Instagram: 'pill-success', Twitter: 'pill-running' };
     if (allRunning.length === 0) {
       itsRunningTbody.innerHTML = '<tr><td colspan="5" style="color:#475569;font-style:italic;padding:12px">Tidak ada scraping yang sedang berjalan</td></tr>';
     } else {
