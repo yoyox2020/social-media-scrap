@@ -124,6 +124,12 @@ class Settings(BaseSettings):
     tiktok_trend_scrape_schedule_hour: int = 11
     tiktok_trend_scrape_schedule_minute: int = 0
 
+    # Apify — Twitter/X. SATU actor untuk scrape profil, search by keyword,
+    # DAN reply/comment (mode "responses" via post_id) — lihat
+    # app/integrations/apify/twitter.py. Fase 1 (basic scraping): belum ada
+    # entri trend_recommendations budget/schedule, menyusul di Fase 2.
+    twitter_actor_id: str = "danek/twitter-scraper"
+
     # Instagram session (dari browser cookies — untuk scraping tanpa EnsembleData)
     instagram_session_id: str = ""
     instagram_csrf_token: str = ""
