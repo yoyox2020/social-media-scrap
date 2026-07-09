@@ -1,11 +1,14 @@
 """
-News API endpoints — Fase 1 (search + sentimen dasar).
+News API endpoints — Fase 1 (search + sentimen dasar) + Fase 2 (trending).
 
 GET /news/search?q=...        — cari artikel berita by keyword (2 tingkat:
                                  DB lokal -> search langsung Firecrawl kalau
                                  tidak ketemu), simpan + return isi lengkap.
 GET /news/analysis/summary    — ringkasan sentimen SEMUA artikel berita
                                  tersimpan.
+GET /news/trending             — artikel berita yang ditemukan pada tanggal
+                                 tertentu (default hari ini) lewat AI viral
+                                 discovery harian (Fase 2, provider Ollama).
 
 Beda dari platform medsos (Instagram/Facebook/TikTok/Twitter): berita tidak
 punya konsep "akun" atau "komentar publik" — jadi tidak ada
@@ -14,10 +17,16 @@ dihitung dari ISI ARTIKEL langsung (tabel `sentiments`, IndoBERT level-post,
 label Inggris "positive"/"negative"/"neutral" -- BEDA dari `lexicon_analyses`
 level-komentar yang labelnya Indonesia -- dipetakan ke Indonesia di respons
 API ini demi konsistensi dengan endpoint lain).
+
+`GET /news/trending` SENGAJA tidak dikaitkan ke topik trend_recommendations
+tertentu (beda dari Instagram/Facebook/dst) -- artikel Fase 2 ditemukan
+selama satu run AI discovery yang menyapu BANYAK query sekaligus, tidak ada
+pencatatan query-mana-menghasilkan-artikel-mana. "Trending" di sini artinya
+"artikel yang ditemukan hari ini", dikelompokkan per tanggal koleksi.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
@@ -221,4 +230,47 @@ async def get_news_analysis_summary(
             "negatif": {"count": row["negatif"], "percentage": _pct(row["negatif"], analyzed)},
             "netral":  {"count": row["netral"],  "percentage": _pct(row["netral"], analyzed)},
         },
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /news/trending
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/trending", response_model=dict, summary="Artikel berita yang ditemukan pada tanggal tertentu")
+async def get_news_trending(
+    collection_date: date | None = Query(default=None, description="Default: hari ini"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Artikel berita yang ditemukan pada tanggal tertentu lewat AI viral
+    discovery harian (Fase 2) — CUMA terisi kalau provider AI discovery yang
+    jalan hari itu adalah Ollama (satu-satunya yang search-nya dieksekusi
+    kode kita sendiri sehingga URL-nya bisa ditangkap, lihat
+    app/services/trend_recommendations/viral_discovery_scrape_service.py
+    `_save_discovered_news_articles()`). Kalau provider Anthropic yang jalan
+    hari itu, tidak ada artikel baru dari jalur ini (topik+akun medsos tetap
+    ditemukan seperti biasa, cuma bagian "simpan artikel"-nya yang tidak
+    aktif untuk Claude).
+
+    Beda dari `GET /instagram/trending` dkk: TIDAK dikaitkan ke topik
+    trend_recommendations tertentu — lihat catatan di docstring modul ini.
+    """
+    target_date = collection_date or datetime.now(timezone.utc).date()
+
+    post_rows = (await db.execute(text("""
+        SELECT id, external_id, content, author, url, published_at, collected_at, metadata
+        FROM posts
+        WHERE platform = 'news' AND collected_at::date = :target_date
+        ORDER BY collected_at DESC
+    """), {"target_date": target_date})).mappings().all()
+
+    items = await _build_news_items(db, post_rows)
+
+    return build_success_response({
+        "date": target_date.isoformat(),
+        "total_articles": len(items),
+        "source": "ai_viral_discovery (Ollama only, lihat docstring endpoint)",
+        "items": items,
     })

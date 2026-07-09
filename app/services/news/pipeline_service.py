@@ -28,7 +28,9 @@ from app.domain.posts.models import Post
 MAX_CONTENT_CHARS = 20000
 
 
-def _external_id(url: str) -> str:
+def compute_external_id(url: str) -> str:
+    """Publik (dipakai juga oleh viral_discovery_scrape_service.py Fase 2
+    untuk cek dedup SEBELUM scrape, hemat kuota Firecrawl)."""
     return hashlib.sha1(url.encode("utf-8")).hexdigest()[:24]
 
 
@@ -46,7 +48,7 @@ async def save_news_articles(
         return {"articles_scraped": 0, "articles_saved": 0}
 
     valid_articles = [a for a in articles if a.get("url") and a.get("content")]
-    ext_ids = [_external_id(a["url"]) for a in valid_articles]
+    ext_ids = [compute_external_id(a["url"]) for a in valid_articles]
     existing_ext_ids: set[str] = set()
     if ext_ids:
         existing_ext_ids = set((await db.scalars(
@@ -56,7 +58,7 @@ async def save_news_articles(
     saved_count = 0
     for article in valid_articles:
         url = article["url"]
-        ext_id = _external_id(url)
+        ext_id = compute_external_id(url)
         if ext_id in existing_ext_ids:
             continue
 

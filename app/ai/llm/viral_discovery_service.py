@@ -225,29 +225,36 @@ def _system_prompt(max_topics: int, has_web_search: bool) -> str:
     )
 
 
-async def find_daily_viral_topics() -> list[dict]:
+async def find_daily_viral_topics(collected_urls: list[dict] | None = None) -> list[dict]:
     """
     Sapuan terbuka harian untuk topik+akun Instagram/Facebook/TikTok yang
     viral hari ini. Provider dipilih dari settings.ai_discovery_provider
     (anthropic/openai/ollama/auto). Return list item siap dipakai
     `TrendRecommendationItem` (topic/score/related_accounts).
+
+    `collected_urls` (opsional, dipakai fitur News Fase 2 — lihat
+    app/services/trend_recommendations/viral_discovery_scrape_service.py):
+    kalau diisi list, URL berita yang genuinely ditemukan selama proses
+    (CUMA lewat provider Ollama, satu-satunya yang search-nya dieksekusi
+    kode kita sendiri) ditambahkan ke situ sebagai side-effect. `None`
+    (default) = perilaku lama persis, tidak ada side-effect apapun.
     """
     provider = settings.ai_discovery_provider
 
     if provider == "auto":
-        return await _find_via_auto_switch()
+        return await _find_via_auto_switch(collected_urls=collected_urls)
     if provider == "anthropic":
         return await _find_via_anthropic()
     if provider == "openai":
         return await _find_via_openai()
     if provider == "ollama":
-        return await _find_via_ollama()
+        return await _find_via_ollama(collected_urls=collected_urls)
 
     logger.warning("find_daily_viral_topics: ai_discovery_provider tidak dikenal: %s", provider)
     return []
 
 
-async def _find_via_auto_switch() -> list[dict]:
+async def _find_via_auto_switch(collected_urls: list[dict] | None = None) -> list[dict]:
     """
     Auto-switch Anthropic -> Ollama, STATELESS (tidak nyimpen status "lagi
     down" di mana pun). Tiap run SELALU coba Anthropic dulu (kalau
@@ -273,7 +280,7 @@ async def _find_via_auto_switch() -> list[dict]:
     else:
         logger.info("find_daily_viral_topics[auto]: ANTHROPIC_API_KEY kosong, langsung pakai Ollama")
 
-    return await _find_via_ollama()
+    return await _find_via_ollama(collected_urls=collected_urls)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -448,11 +455,22 @@ def _append_account_candidates(search_text: str) -> str:
     )
 
 
-async def _firecrawl_search(query: str, max_results: int = 5) -> str:
+async def _firecrawl_search(
+    query: str, max_results: int = 5, collected_urls: list[dict] | None = None,
+) -> str:
     """
     Eksekusi pencarian NYATA ke Firecrawl — dipanggil oleh kode ini sendiri
     (BUKAN oleh Ollama, model tidak punya akses jaringan). Raise httpx.HTTPError
     kalau gagal supaya _web_search() bisa fallback ke Tavily.
+
+    `collected_urls` (opsional, dipakai fitur News Fase 2, lihat
+    app/services/trend_recommendations/viral_discovery_scrape_service.py):
+    kalau diisi list, hasil pencarian mentah (title/url) DITAMBAHKAN ke situ
+    (side-effect, TIDAK mengubah return value/perilaku lama sama sekali) —
+    dipakai buat nangkap URL berita yang genuinely ditemukan selama proses
+    ini, supaya bisa disimpan sebagai artikel (platform='news') tanpa
+    search terpisah. `None` (default) = perilaku lama persis, tidak ada
+    side-effect apapun.
     """
     import httpx
 
@@ -465,7 +483,13 @@ async def _firecrawl_search(query: str, max_results: int = 5) -> str:
         resp.raise_for_status()
         data = resp.json()
 
-    return _format_search_results(data.get("data", []), "title", "description", "url")
+    raw_results = data.get("data", [])
+    if collected_urls is not None:
+        for r in raw_results:
+            if r.get("url"):
+                collected_urls.append({"title": r.get("title"), "url": r["url"]})
+
+    return _format_search_results(raw_results, "title", "description", "url")
 
 
 async def _tavily_search(query: str, max_results: int = 5) -> str:
@@ -491,7 +515,9 @@ async def _tavily_search(query: str, max_results: int = 5) -> str:
     return _format_search_results(data.get("results", []), "title", "content", "url")
 
 
-async def _web_search(query: str, max_results: int = 5) -> str:
+async def _web_search(
+    query: str, max_results: int = 5, collected_urls: list[dict] | None = None,
+) -> str:
     """
     Dispatcher auto-switch: coba Firecrawl dulu (hasil lebih relevan/spesifik
     per perbandingan langsung), fallback ke Tavily kalau Firecrawl gagal/limit/
@@ -501,12 +527,16 @@ async def _web_search(query: str, max_results: int = 5) -> str:
 
     Hasil akhir (kalau ada) DITEMPEL kandidat akun via _append_account_candidates()
     sebelum dikirim ke model — lihat komentar di fungsi itu untuk alasannya.
+
+    `collected_urls` diteruskan ke `_firecrawl_search()` saja (Tavily TIDAK
+    ikut ditangkap sebagai kandidat artikel news — kualitas hasilnya generik/
+    direktori, bukan berita, lihat memory project_ollama_websearch_quality).
     """
     import httpx
 
     if settings.firecrawl_api_key:
         try:
-            text = await _firecrawl_search(query, max_results)
+            text = await _firecrawl_search(query, max_results, collected_urls=collected_urls)
             return _append_account_candidates(text)
         except httpx.HTTPError as exc:
             logger.warning("_web_search: Firecrawl gagal (%s), fallback ke Tavily", exc)
@@ -522,7 +552,7 @@ async def _web_search(query: str, max_results: int = 5) -> str:
     return "Web search tidak tersedia (FIRECRAWL_API_KEY/TAVILY_API_KEY belum di-set)."
 
 
-async def _find_via_ollama() -> list[dict]:
+async def _find_via_ollama(collected_urls: list[dict] | None = None) -> list[dict]:
     from openai import OpenAI
 
     base_url = f"{settings.ollama_base_url}/v1"
@@ -614,7 +644,7 @@ async def _find_via_ollama() -> list[dict]:
 
         for call in search_calls:
             args = json.loads(call.function.arguments)
-            result_text = await _web_search(args.get("query", ""))
+            result_text = await _web_search(args.get("query", ""), collected_urls=collected_urls)
             accumulated_search_text.append(result_text)
             messages.append({"role": "tool", "tool_call_id": call.id, "content": result_text})
 

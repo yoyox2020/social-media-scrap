@@ -96,6 +96,12 @@ class Settings(BaseSettings):
 
     viral_discovery_max_topics: int = 5   # maks topik/hari dari AI discovery, ubah via .env
 
+    # News Fase 2 — maks artikel BARU (belum ada di DB) yang di-scrape penuh
+    # (Firecrawl /v1/scrape, berbayar) per run viral discovery harian. Cuma
+    # jalan saat provider Ollama (satu-satunya yang search-nya dieksekusi
+    # kode kita sendiri, lihat app/ai/llm/viral_discovery_service.py).
+    news_discovery_daily_budget: int = 10
+
     # Jadwal Celery Beat (WIB) — bisa diganti via .env tanpa ubah kode.
     # Default: viral discovery jalan 2 jam sebelum scrape supaya topik yang
     # ditemukan punya kesempatan discrape di hari yang sama.
