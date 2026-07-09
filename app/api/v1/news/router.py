@@ -197,17 +197,41 @@ async def search_news(
 # GET /news/analysis/summary
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/analysis/summary", response_model=dict, summary="Ringkasan sentimen artikel berita")
+@router.get("/analysis/summary", response_model=dict,
+            summary="Ringkasan sentimen + entitas trending artikel berita")
 async def get_news_analysis_summary(
+    top_n: int = Query(default=15, ge=1, le=50, description="Jumlah entitas trending ditampilkan"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Ringkasan sentimen SEMUA artikel berita yang tersimpan (platform='news').
+    Ringkasan SEMUA artikel berita yang tersimpan (platform='news') — 2 lapis
+    analisis, bukan cuma sentimen:
+
+    1. **Sentimen level-artikel** (tabel `sentiments`, IndoBERT) — **PERHATIKAN
+       KETERBATASANNYA**: berita mengikuti konvensi objektif (piramida
+       terbalik), jadi sentimen TEKS sering cuma mencerminkan valensi
+       PERISTIWA yang diliput (bencana/kriminal = skor negatif walau
+       laporannya netral), BUKAN sikap/bias media itu sendiri. Media secara
+       sistematis lebih banyak meliput peristiwa negatif ("negativity bias"
+       dalam jurnalisme, lihat riset Soroka & McAdams 2015) — jadi persentase
+       negatif yang tinggi TIDAK BOLEH ditafsirkan sebagai "media bersikap
+       negatif", lebih tepat dibaca sebagai "peristiwa yang diliput hari ini
+       banyak yang negatif". Interpretasikan dengan hati-hati, JANGAN
+       dijadikan satu-satunya sinyal.
+    2. **Entitas trending** (tabel `entities`, NER/GLiNER — PERSON/ORGANIZATION/
+       LOCATION/DATE/EVENT) — "siapa/apa yang sedang dibicarakan" lintas
+       artikel, sinyal yang lebih langsung actionable untuk media-monitoring
+       dibanding sentimen level-dokumen (pendekatan entity-level/aspect-based
+       lebih disarankan literatur sentiment analysis dibanding document-level
+       untuk teks berita, lihat Liu 2012 "Sentiment Analysis and Opinion
+       Mining"). **Catatan kualitas data**: NER kadang menangkap noise dari
+       teks navigasi situs (menu/link), bukan cuma isi artikel murni — cek
+       manual kalau ada entitas yang terlihat ganjil (misal fragmen URL).
 
     Beda dari platform medsos lain: sentimen di sini dihitung dari ISI
-    ARTIKEL langsung (tabel `sentiments`, IndoBERT level-post) — berita tidak
-    punya komentar publik terbuka seperti IG/FB/TikTok.
+    ARTIKEL langsung — berita tidak punya komentar publik terbuka seperti
+    IG/FB/TikTok.
     """
     row = (await db.execute(text("""
         SELECT
@@ -227,6 +251,35 @@ async def get_news_analysis_summary(
     def _pct(count: int, base: int) -> float:
         return round(count / base * 100, 1) if base else 0.0
 
+    # ── Entitas trending (NER) — "siapa/apa yang dibicarakan", lintas artikel ──
+    entity_rows = (await db.execute(text("""
+        SELECT e.text, e.entity_type, count(DISTINCT e.post_id) AS mentions
+        FROM entities e
+        JOIN posts p ON p.id = e.post_id
+        WHERE p.platform = 'news'
+        GROUP BY e.text, e.entity_type
+        ORDER BY mentions DESC, e.text ASC
+        LIMIT :top_n
+    """), {"top_n": top_n})).mappings().all()
+
+    entity_type_rows = (await db.execute(text("""
+        SELECT e.entity_type, count(*) AS total
+        FROM entities e
+        JOIN posts p ON p.id = e.post_id
+        WHERE p.platform = 'news'
+        GROUP BY e.entity_type
+        ORDER BY total DESC
+    """))).mappings().all()
+
+    # ── Sumber (outlet) — keragaman liputan, dari domain URL ────────────────────
+    source_rows = (await db.execute(text("""
+        SELECT regexp_replace(url, '^https?://(www\\.)?([^/]+).*$', '\\2') AS domain, count(*) AS total
+        FROM posts
+        WHERE platform = 'news' AND url IS NOT NULL
+        GROUP BY domain
+        ORDER BY total DESC
+    """))).mappings().all()
+
     return build_success_response({
         "total_articles": total,
         "total_analyzed": analyzed,
@@ -235,7 +288,23 @@ async def get_news_analysis_summary(
             "positif": {"count": row["positif"], "percentage": _pct(row["positif"], analyzed)},
             "negatif": {"count": row["negatif"], "percentage": _pct(row["negatif"], analyzed)},
             "netral":  {"count": row["netral"],  "percentage": _pct(row["netral"], analyzed)},
+            "caveat": (
+                "Sentimen berita mencerminkan valensi PERISTIWA yang diliput, "
+                "bukan sikap media -- jangan tafsirkan persentase negatif "
+                "tinggi sebagai bias media. Lihat docstring endpoint."
+            ),
         },
+        "trending_entities": {
+            "by_type": {r["entity_type"]: r["total"] for r in entity_type_rows},
+            "top": [
+                {"text": r["text"], "type": r["entity_type"], "mentions": r["mentions"]}
+                for r in entity_rows
+            ],
+        },
+        "sources": [
+            {"domain": r["domain"], "articles": r["total"]}
+            for r in source_rows
+        ],
     })
 
 
