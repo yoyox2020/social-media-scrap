@@ -2267,42 +2267,6 @@ async def scrape_monitor_public(
         """)
     ) or 0
 
-    ig_trending_rows = (await db.execute(text("""
-        SELECT username, rank, trending_score, engagement_rate, virality_score,
-               followers, posts_collected, status, last_scraped_date,
-               discovered_via, source,
-               (scrape_logs->-1) AS last_log
-        FROM instagram_trending_accounts
-        WHERE status = 'active'
-        ORDER BY rank ASC NULLS LAST
-        LIMIT 10
-    """))).mappings().all()
-
-    ig_last_discovery = (await db.scalar(
-        text("""
-            SELECT MAX(((scrape_logs->-1)->>'date')::date)
-            FROM instagram_trending_accounts
-            WHERE scrape_logs != '[]'::jsonb
-        """)
-    ))
-
-    ig_trending_accounts = []
-    for row in ig_trending_rows:
-        last_log = row["last_log"] or {}
-        ig_trending_accounts.append({
-            "rank":           row["rank"],
-            "username":       row["username"],
-            "followers":      row["followers"],
-            "trending_score": float(row["trending_score"] or 0),
-            "engagement_rate": float(row["engagement_rate"] or 0),
-            "virality_score": float(row["virality_score"] or 0),
-            "posts_collected": row["posts_collected"],
-            "last_scraped":   row["last_scraped_date"].isoformat() if row["last_scraped_date"] else None,
-            "discovered_via": row["discovered_via"],
-            "source":         row["source"],
-            "last_scrape_log": last_log,
-        })
-
     # ── EnsembleData status (dari error log di DB, tanpa hit API) ────────────
     ed_last_error_row = (await db.execute(text("""
         SELECT error_message, started_at
@@ -2320,16 +2284,8 @@ async def scrape_monitor_public(
         ORDER BY finished_at DESC LIMIT 1
     """))).mappings().first()
 
-    ig_last_err_row = (await db.execute(text("""
-        SELECT updated_at FROM instagram_trending_accounts
-        WHERE scrape_logs::text ILIKE '%493%'
-          AND updated_at > NOW() - INTERVAL '48 hours'
-        ORDER BY updated_at DESC LIMIT 1
-    """))).mappings().first()
-
     ed_err_at   = ed_last_error_row["started_at"] if ed_last_error_row else None
-    ig_err_at   = ig_last_err_row["updated_at"]   if ig_last_err_row   else None
-    last_err_at = max(filter(None, [ed_err_at, ig_err_at]), default=None)
+    last_err_at = ed_err_at
     ed_success_at = ed_last_success_row["finished_at"] if ed_last_success_row else None
 
     if last_err_at:
@@ -2431,15 +2387,6 @@ async def scrape_monitor_public(
             "total_posts":     ig_posts_total,
             "total_comments":  ig_comments_total,
             "accounts_scraped_today": ig_scraped_today,
-            "trending": {
-                "total_accounts":  len(ig_trending_accounts),
-                "last_discovery":  ig_last_discovery.isoformat() if ig_last_discovery else None,
-                "schedule":        "09:00 WIB (daily, Celery Beat)",
-                "provider":        "ensembledata",
-                "max_posts_per_account": 2,
-                "max_comments_per_post": 5,
-                "accounts": ig_trending_accounts,
-            },
         },
         "instagram_trend_scrape": await get_trend_scrape_summary(db, recent_limit=15),
         "facebook_trend_scrape": await get_facebook_trend_scrape_summary(db, recent_limit=15),

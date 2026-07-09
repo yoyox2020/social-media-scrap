@@ -275,3 +275,101 @@ async def _analyze_comments_lexicon(
         ))
         count += 1
     return count
+
+
+async def save_instagram_keyword_search_results(
+    db: AsyncSession,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Simpan hasil search-by-keyword (app/integrations/apify/instagram_search.py,
+    actor `apify/instagram-hashtag-scraper`) ke posts/comments/entities.
+
+    BEDA dari scrape_instagram_posts() di atas: item di sini bisa berasal
+    dari BANYAK akun berbeda sekaligus (hasil search keyword lintas akun,
+    bukan search-by-satu-username). Dedup pakai `external_id = shortCode`,
+    SKEMA SAMA dengan scrape_instagram_posts() — post yang sama otomatis
+    tidak tersimpan dobel walau ditemukan lewat jalur manapun (username scan
+    ATAU keyword search).
+    """
+    from app.integrations.apify.instagram_search import extract_comments
+
+    if not items:
+        return {"posts_scraped": 0, "posts_saved": 0, "errors": []}
+
+    shortcodes = [it.get("shortCode") for it in items if it.get("shortCode")]
+    existing_ext_ids: set[str] = set()
+    if shortcodes:
+        existing_ext_ids = set((await db.scalars(
+            select(Post.external_id).where(Post.platform == "instagram", Post.external_id.in_(shortcodes))
+        )).all())
+
+    posts_saved_count = 0
+    for item in items:
+        shortcode = item.get("shortCode")
+        if not shortcode or shortcode in existing_ext_ids:
+            continue
+
+        caption = item.get("caption") or ""
+        published_at = None
+        if item.get("timestamp"):
+            try:
+                published_at = datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00"))
+            except ValueError:
+                published_at = None
+
+        post_obj = Post(
+            id=uuid.uuid4(),
+            external_id=shortcode,
+            platform="instagram",
+            content=caption,
+            author=item.get("ownerUsername") or "",
+            url=item.get("url") or f"https://www.instagram.com/p/{shortcode}/",
+            published_at=published_at,
+            collected_at=datetime.now(timezone.utc),
+            metadata_={
+                "likes":     item.get("likesCount", 0),
+                "comments":  item.get("commentsCount", 0),
+                "shortcode": shortcode,
+                "photo_url": item.get("displayUrl"),
+                "source":    "apify_keyword_search",
+            },
+        )
+        db.add(post_obj)
+        await db.flush()
+        posts_saved_count += 1
+        existing_ext_ids.add(shortcode)
+
+        hashtags = item.get("hashtags") or _extract_hashtags(caption)
+        for tag in hashtags:
+            db.add(Entity(post_id=post_obj.id, text=tag, entity_type="HASHTAG"))
+
+        from app.workers.ai_worker import analyze_post_task
+        analyze_post_task.delay(str(post_obj.id), run_sentiment=True, run_ner=False, run_embedding=False)
+
+        raw_comments = extract_comments(item)
+        if raw_comments:
+            new_comments: list[Comment] = []
+            for cmt in raw_comments:
+                ext_cmt_id = _comment_external_id(shortcode, cmt["author"], cmt["text"], "")
+                comment = Comment(
+                    post_id=post_obj.id,
+                    external_id=ext_cmt_id,
+                    content=cmt["text"],
+                    author=cmt["author"],
+                    published_at=None,
+                    metadata_={},
+                )
+                db.add(comment)
+                new_comments.append(comment)
+            if new_comments:
+                await db.flush()
+                await _analyze_comments_lexicon(db, new_comments, None)
+
+    await db.commit()
+
+    return {
+        "posts_scraped": len(items),
+        "posts_saved":   posts_saved_count,
+        "errors":        [],
+    }

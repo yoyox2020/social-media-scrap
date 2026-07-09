@@ -10,7 +10,11 @@ Alur harian (lihat docs/trend-recommendations.md):
      urut score tertinggi, maks `settings.instagram_trend_daily_budget` topik.
   2. Per topik: scrape 1 post + komentar + sentimen via Apify (satu akun/topik).
   3. Verifikasi: berhasil kalau Apify mengembalikan >=1 post. Kalau gagal,
-     topik TETAP 'pending' (dicoba lagi besok, budget hari ini hangus untuk topik itu).
+     topik TETAP 'pending' (dicoba lagi besok, budget hari ini hangus untuk topik itu)
+     -- KECUALI sudah gagal >= FAILED_PERMANENT_THRESHOLD (3x, lintas platform,
+     lihat app/services/trend_recommendations/service.py), lalu status ->
+     'failed_permanent' supaya berhenti menghabiskan budget harian (ditambahkan
+     2026-07-09, sebelumnya Instagram tidak punya proteksi ini).
   4. Kalau berhasil: status -> 'used'. Dicatat juga ke `scrape_runs` untuk monitoring.
 """
 from __future__ import annotations
@@ -45,6 +49,7 @@ async def get_trend_scrape_summary(db: AsyncSession, recent_limit: int = 10) -> 
     ig_topics = [(t, _instagram_username(t)) for t in all_topics if _instagram_username(t)]
     pending = [(t, u) for t, u in ig_topics if t.status == "pending"]
     used = [(t, u) for t, u in ig_topics if t.status == "used"]
+    failed_permanent = [(t, u) for t, u in ig_topics if t.status == "failed_permanent"]
     pending_sorted = sorted(pending, key=lambda tu: tu[0].score, reverse=True)
 
     runs = (await db.scalars(
@@ -68,9 +73,10 @@ async def get_trend_scrape_summary(db: AsyncSession, recent_limit: int = 10) -> 
         "daily_budget": settings.instagram_trend_daily_budget,
         "schedule": "09:00 WIB otomatis (Celery Beat) — trigger manual: POST /instagram/trend-scrape/run",
         "summary": {
-            "pending_with_instagram_account": len(pending),
-            "used_with_instagram_account":    len(used),
-            "total_with_instagram_account":   len(ig_topics),
+            "pending_with_instagram_account":          len(pending),
+            "used_with_instagram_account":             len(used),
+            "failed_permanent_with_instagram_account": len(failed_permanent),
+            "total_with_instagram_account":            len(ig_topics),
             "ai_keyword_search_pending":      sum(1 for t, _ in pending if t.source == "ai_keyword_search"),
             "ai_viral_discovery_pending":     sum(1 for t, _ in pending if t.source == "ai_viral_discovery"),
         },
@@ -85,6 +91,13 @@ async def get_trend_scrape_summary(db: AsyncSession, recent_limit: int = 10) -> 
                 "created_at":          t.created_at.isoformat(),
             }
             for t, u in pending_sorted
+        ],
+        "failed_permanent_topics": [
+            {
+                "topic": t.topic, "instagram_username": u, "source": t.source,
+                "recommendation_date": t.recommendation_date.isoformat(),
+            }
+            for t, u in failed_permanent
         ],
         "recent_runs": [
             {
@@ -205,6 +218,25 @@ async def run_daily_trend_scrape(db: AsyncSession) -> dict:
             })
 
         await db.commit()
+
+        # Topik masih 'pending' (belum 'used') -> cek apakah sudah kehabisan
+        # jatah percobaan, tandai 'failed_permanent' kalau sudah -- sama pola
+        # dengan Facebook/TikTok (app/services/trend_recommendations/service.py),
+        # dipasang di sini 2026-07-09 (dikonfirmasi eksplisit user, lihat
+        # docs/analisa-gap-instagram.md gap B) supaya topik yang akunnya
+        # genuinely tidak bisa discrape (contoh nyata: 'coldplay_jakarta',
+        # gagal 3+ hari berturut-turut) berhenti menghabiskan budget harian
+        # selamanya.
+        if topic.status == "pending":
+            from app.services.trend_recommendations.service import mark_failed_permanent_if_exhausted
+
+            became_permanent = await mark_failed_permanent_if_exhausted(db, topic)
+            if became_permanent:
+                await db.commit()
+                logger.warning(
+                    "run_daily_trend_scrape: topik '%s' ditandai failed_permanent (gagal berulang, username=%s)",
+                    topic.topic, username,
+                )
 
     logger.info("run_daily_trend_scrape: %d topik diproses", len(results))
     return {"processed": len(results), "results": results}

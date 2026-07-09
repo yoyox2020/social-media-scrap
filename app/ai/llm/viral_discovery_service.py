@@ -149,10 +149,39 @@ _TW_RESERVED_PATHS = {
 }
 
 
-def _extract_items(raw_items: list[dict], max_topics: int) -> list[dict]:
+def _extract_items(raw_items: list[dict], max_topics: int, search_text: str | None = None) -> list[dict]:
+    """
+    Filter+validasi item mentah dari tool call model jadi item siap submit.
+
+    Dua lapis validasi (di luar filter platform yang sudah ada):
+      1. Sanity check username: TIDAK BOLEH mengandung spasi -- slug akun di
+         platform manapun (FB/IG/TikTok/Twitter) tidak pernah punya spasi.
+         Menangkap bug nyata yang sudah ketemu di produksi: model submit
+         username "TRUTH PrevaiL" (jelas display name, bukan slug) untuk akun
+         Facebook (lihat memory project_ollama_websearch_quality).
+      2. Grounding check (CUMA kalau `search_text` diisi): username HARUS
+         literal muncul di teks hasil pencarian nyata -- kalau tidak, account
+         itu kemungkinan besar halusinasi model (contoh nyata: topik politik
+         dikaitkan ke akun brand fashion yang sama sekali tidak disebut di
+         hasil pencarian). `search_text=None` (dipakai anthropic/openai, atau
+         ollama TANPA web search aktif) berarti lapis ini di-skip -- tidak ada
+         teks pencarian nyata untuk dicocokkan, memaksa grounding di sini
+         cuma akan membuang SEMUA hasil termasuk yang genuinely benar.
+    """
+    search_text_lower = search_text.lower() if search_text else None
     found = []
     for item in raw_items[:max_topics]:
-        accounts = [a for a in item.get("related_accounts", []) if a.get("platform") in _SUPPORTED_PLATFORMS]
+        accounts = []
+        for a in item.get("related_accounts", []):
+            platform = a.get("platform")
+            username = (a.get("username") or "").strip()
+            if platform not in _SUPPORTED_PLATFORMS or not username:
+                continue
+            if any(ch.isspace() for ch in username):
+                continue
+            if search_text_lower is not None and username.lower() not in search_text_lower:
+                continue
+            accounts.append({"platform": platform, "username": username})
         if accounts:
             found.append({**item, "related_accounts": accounts})
     return found
@@ -527,6 +556,7 @@ async def _find_via_ollama() -> list[dict]:
 
     found_items: list[dict] = []
     forced_retries_used = 0  # lihat FORCE_RETRY_LIMIT di atas
+    accumulated_search_text: list[str] = []  # dipakai grounding check di _extract_items()
 
     for _ in range(MAX_ITERATIONS):
         response = client.chat.completions.create(model=settings.ollama_model_name, messages=messages, tools=tools)
@@ -571,15 +601,21 @@ async def _find_via_ollama() -> list[dict]:
         for call in submit_calls:
             args = json.loads(call.function.arguments)
             items = args.get("items", [])
-            found_items.extend(_extract_items(items, max_topics))
+            # search_text=None kalau has_web_search=False -- grounding check
+            # di-skip total (lihat docstring _extract_items), bukan menolak semua.
+            search_text = " ".join(accumulated_search_text) if has_web_search else None
+            accepted = _extract_items(items, max_topics, search_text=search_text)
+            found_items.extend(accepted)
             messages.append({
                 "role": "tool", "tool_call_id": call.id,
-                "content": f"Diterima {len(items)} topik.",
+                "content": f"Diterima {len(accepted)} dari {len(items)} topik (sisanya ditolak: "
+                           "akun tidak grounded di hasil pencarian atau username tidak valid).",
             })
 
         for call in search_calls:
             args = json.loads(call.function.arguments)
             result_text = await _web_search(args.get("query", ""))
+            accumulated_search_text.append(result_text)
             messages.append({"role": "tool", "tool_call_id": call.id, "content": result_text})
 
         if submit_calls:

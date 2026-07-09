@@ -4,7 +4,7 @@ docs/apify-instagram-method.md, docs/trend-recommendations.md).
 
 GET  /instagram/profile      — profil + recent posts dari username (Instagram internal API, bukan Apify)
 GET  /instagram/posts        — scrape + ambil post dari username (manual, tanpa budget cap)
-GET  /instagram/posts/search — cari post yang sudah discrape berdasarkan keyword/hashtag (bukan username)
+GET  /instagram/posts/search — cari post by keyword/hashtag (3 tingkat: DB lokal -> trend_recommendations -> search langsung Apify)
 GET  /instagram/trending     — topik viral Instagram dari trend_recommendations + hasil scrape
 GET  /instagram/analysis/summary — ringkasan MENYELURUH hasil analisis sentimen (semua akun, bukan cuma trend_recommendations)
 GET  /instagram/comments     — list komentar Instagram (filter username/post/sentimen/tanggal)
@@ -466,7 +466,7 @@ async def search_instagram_posts(
     Cari post Instagram berdasarkan isi CAPTION atau HASHTAG — bukan username
     (untuk username, pakai `GET /instagram/posts`).
 
-    **Alur:**
+    **Alur (3 tingkat):**
     1. Cari di `posts.content` dan tabel `entities` (hashtag) yang sudah
        tersimpan dari scrape sebelumnya.
     2. Kalau tidak ketemu: cari topik yang cocok di `trend_recommendations`
@@ -474,9 +474,12 @@ async def search_instagram_posts(
        akun Instagram — kuota masih ada -> scrape SEKARANG, langsung return
        hasilnya; kuota habis -> topik tetap/menjadi `pending`, otomatis
        kepilih di batch berikutnya (lihat `GET /instagram/trend-scrape/status`).
-    3. Kalau tidak ketemu post maupun topik sama sekali -> Apify tidak bisa
-       cari-by-keyword sendiri, jadi tidak ada akun yang bisa discrape;
-       submit manual kalau tahu akunnya via `POST /trend-recommendations`.
+    3. Kalau topik juga tidak ketemu (keyword genuinely baru) -> search
+       LANGSUNG post Instagram by keyword via Apify
+       (`apify/instagram-hashtag-scraper`, `source: "scraped_now_keyword_search"`)
+       — beda dari Facebook, di sini hasilnya POST langsung (lintas akun),
+       BUKAN cari akun dulu. Kalau tetap tidak ketemu apa-apa ->
+       `source: "not_found"`.
     """
     q_clean = q.strip().lstrip("#")
     if not q_clean:
@@ -519,16 +522,75 @@ async def search_instagram_posts(
             break
 
     if not matched_topic:
+        # ── 3. Topik juga tidak ketemu (keyword genuinely baru) -> search
+        # LANGSUNG post Instagram by keyword via Apify
+        # (apify/instagram-hashtag-scraper, keywordSearch=True) — BEDA dari
+        # Facebook: actor ini return POST langsung (bukan akun dulu), lihat
+        # docs/analisa-gap-instagram.md bagian C. ──────────────────────────
+        from app.domain.scrape_runs.models import ScrapeRun
+        from app.integrations.apify.instagram_search import search_instagram_posts_by_keyword
+        from app.services.instagram.pipeline_service import save_instagram_keyword_search_results
+
+        started_at = datetime.now(timezone.utc)
+        scrape_run = ScrapeRun(
+            keyword_text=f"search:{q_clean}", platform="instagram", api_source="apify_keyword_search",
+            status="running", triggered_by="manual_api", started_at=started_at,
+        )
+        db.add(scrape_run)
+        await db.commit()  # commit status='running' segera supaya kelihatan di monitor live
+
+        try:
+            raw_items = await search_instagram_posts_by_keyword(q_clean, max_results=5)
+        except Exception as exc:
+            scrape_run.status = "failed"
+            scrape_run.error_message = str(exc)[:1000]
+            scrape_run.finished_at = datetime.now(timezone.utc)
+            scrape_run.duration_seconds = (scrape_run.finished_at - started_at).total_seconds()
+            await db.commit()
+            return build_success_response({
+                "query": q_clean, "source": "not_found", "total": 0, "items": [],
+                "message": (
+                    "Tidak ditemukan post di database maupun topik terkait di "
+                    f"trend_recommendations, DAN search langsung ke Instagram gagal ({exc}). "
+                    "Kalau tahu akun Instagram-nya, submit manual via POST /trend-recommendations."
+                ),
+            })
+
+        save_result = await save_instagram_keyword_search_results(db, raw_items)
+
+        scrape_run.status = "success" if save_result["posts_scraped"] > 0 else "failed"
+        scrape_run.videos_fetched = save_result["posts_scraped"]
+        scrape_run.videos_new = save_result["posts_saved"]
+        scrape_run.finished_at = datetime.now(timezone.utc)
+        scrape_run.duration_seconds = (scrape_run.finished_at - started_at).total_seconds()
+        await db.commit()
+
+        if not raw_items:
+            return build_success_response({
+                "query": q_clean, "source": "not_found", "total": 0, "items": [],
+                "message": (
+                    "Tidak ditemukan post di database, topik terkait di trend_recommendations, "
+                    "MAUPUN post Instagram nyata yang bahas keyword ini via search langsung."
+                ),
+            })
+
+        shortcodes = [it["shortCode"] for it in raw_items if it.get("shortCode")]
+        fresh_rows = (await db.execute(text("""
+            SELECT p.id, p.external_id, p.content, p.author, p.url, p.published_at, p.metadata
+            FROM posts p
+            WHERE p.platform = 'instagram' AND p.external_id = ANY(:shortcodes)
+            ORDER BY p.published_at DESC NULLS LAST
+        """), {"shortcodes": shortcodes})).mappings().all()
+
+        items = await _build_search_items(db, fresh_rows)
         return build_success_response({
-            "query": q_clean, "source": "not_found", "total": 0, "items": [],
-            "message": (
-                "Tidak ditemukan post maupun topik terkait keyword ini. Apify tidak "
-                "bisa cari akun by keyword — kalau tahu akun Instagram-nya, submit "
-                "manual via POST /trend-recommendations."
-            ),
+            "query": q_clean, "source": "scraped_now_keyword_search", "total": len(items),
+            "note": "Sentimen post baru diproses async (Celery) — mungkin belum muncul kalau baru saja discrape.",
+            "items": items,
         })
 
-    # ── 3. Ketemu topik -> coba scrape sekarang (kalau kuota ada) ──────────────
+    # ── 2b. Topik ketemu di trend_recommendations -> coba scrape sekarang
+    # (kalau kuota ada) ──────────────────────────────────────────────────────
     from app.domain.scrape_runs.models import ScrapeRun
     from app.services.instagram.pipeline_service import scrape_instagram_posts
     from app.services.instagram.quota_service import enforce_quota
@@ -1039,7 +1101,11 @@ async def get_trend_scrape_status(
     Scraping otomatis jalan tiap hari jam 09:00 WIB (Celery Beat), maksimal
     `settings.instagram_trend_daily_budget` topik/hari. Kalau sebuah topik gagal
     di-scrape (0 post), statusnya TETAP `pending` dan otomatis dicoba lagi di run
-    berikutnya — tidak perlu campur tangan manual.
+    berikutnya — tidak perlu campur tangan manual. Kalau sudah gagal 3x
+    berturut-turut, status berubah jadi `failed_permanent` (berhenti dicoba lagi,
+    lihat `summary.failed_permanent_with_instagram_account` dan
+    `failed_permanent_topics`) supaya tidak terus menghabiskan budget harian
+    untuk akun yang genuinely tidak bisa discrape.
 
     `summary.ai_keyword_search_pending` = berapa dari topik pending itu yang berasal
     dari trigger `GET /instagram/posts/search` (keyword miss), bukan submission AI

@@ -43,6 +43,17 @@ class Settings(BaseSettings):
     # AI menebak. Pay-per-result (~$0.003/hasil), pakai apify_api_token yang sama.
     facebook_search_actor_id: str = "danek/facebook-search-ppr"
 
+    # Apify — Instagram SEARCH by keyword (beda dari apify_actor_id yang cuma
+    # bisa scrape profil yang SUDAH diketahui usernamenya). Dipakai
+    # GET /instagram/posts/search tingkat 3 untuk cari POST secara LANGSUNG
+    # by keyword -- beda arsitektur dari Facebook (cari akun dulu baru scrape
+    # akunnya): actor Instagram ini mengembalikan post nyata langsung,
+    # sudah lengkap caption/hashtag/author/likes/comments. Diverifikasi live
+    # 2026-07-09 (lihat docs/analisa-gap-instagram.md bagian C). Pay-per-event
+    # ~$2.60/1000 hasil (cek pricing terbaru di
+    # apify.com/apify/instagram-hashtag-scraper), pakai apify_api_token yang sama.
+    instagram_search_actor_id: str = "apify/instagram-hashtag-scraper"
+
     # Apify — TikTok. SATU actor untuk scrape profil MAUPUN search by
     # keyword/hashtag (beda dari Facebook yang butuh 2 actor terpisah) — lihat
     # app/integrations/apify/tiktok.py. Pay-per-result (~$0.0037/hasil di tier

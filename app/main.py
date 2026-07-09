@@ -328,7 +328,6 @@ async def scraping_status_page():
   .ig-card .label { font-size: 0.72rem; color: #64748b; text-transform: uppercase; margin-bottom: 4px; }
   .ig-card .value { font-size: 1.5rem; font-weight: 700; color: #e879f9; }
   .ig-card .sub { font-size: 0.72rem; color: #64748b; margin-top: 2px; }
-  .pill-ig-rank { background: #3b0764; color: #e879f9; }
   .pill-waiting { background: #451a03; color: #fbbf24; }
   /* Pipeline flow — alur live Subsistem A (AI Discovery) -> Subsistem B (Scrape Worker),
      melacak batch topik nyata dari viral_discovery_trace, bukan status independen. */
@@ -462,31 +461,12 @@ async def scraping_status_page():
   <tbody id="kt-table"></tbody>
 </table>
 
-<div class="section-title" style="margin-top:24px">Instagram Trending</div>
+<div class="section-title" style="margin-top:24px">Instagram — Statistik</div>
 <div class="ig-grid">
   <div class="ig-card"><div class="label">Total Posts</div><div class="value" id="ig-posts">-</div><div class="sub">platform instagram</div></div>
   <div class="ig-card"><div class="label">Total Komentar</div><div class="value" id="ig-comments">-</div><div class="sub">platform instagram</div></div>
-  <div class="ig-card"><div class="label">Akun Trending</div><div class="value" id="ig-accounts">-</div><div class="sub">terdaftar aktif</div></div>
   <div class="ig-card"><div class="label">Scrape Hari Ini</div><div class="value" id="ig-today">-</div><div class="sub">akun di-scrape</div></div>
-  <div class="ig-card"><div class="label">Last Discovery</div><div class="value" style="font-size:0.95rem;margin-top:4px" id="ig-discovery">-</div><div class="sub">via EnsembleData</div></div>
-  <div class="ig-card"><div class="label">Jadwal</div><div class="value" style="font-size:0.85rem;margin-top:4px">09:00</div><div class="sub">WIB daily (Beat)</div></div>
 </div>
-<table>
-  <thead>
-    <tr>
-      <th>Rank</th>
-      <th>Username</th>
-      <th>Followers</th>
-      <th>Trending Score</th>
-      <th>Engagement</th>
-      <th>Posts di DB</th>
-      <th>Last Scrape</th>
-      <th>Discovered Via</th>
-      <th>Status Log</th>
-    </tr>
-  </thead>
-  <tbody id="ig-table"></tbody>
-</table>
 
 <div class="section-title" style="margin-top:24px">Alur Pipeline Live — Subsistem A (AI Discovery) &rarr; Subsistem B (Scrape Worker)</div>
 <div class="pf-legend">
@@ -1121,44 +1101,11 @@ async function load() {
     edLastErr.textContent = ed.last_error_at  ? `Error terakhir: ${fmt(ed.last_error_at)}` : '';
     edLastOk.textContent  = ed.last_success_at ? `Sukses terakhir: ${fmt(ed.last_success_at)}` : '';
 
-    // ── Instagram trending section ─────────────────────────────────────────
+    // ── Instagram statistik ───────────────────────────────────────────────
     const ig = d.instagram || {};
-    const igt = ig.trending || {};
     document.getElementById('ig-posts').textContent    = (ig.total_posts    || 0).toLocaleString();
     document.getElementById('ig-comments').textContent = (ig.total_comments || 0).toLocaleString();
-    document.getElementById('ig-accounts').textContent = (igt.total_accounts || 0).toLocaleString();
     document.getElementById('ig-today').textContent    = (ig.accounts_scraped_today || 0).toLocaleString();
-    document.getElementById('ig-discovery').textContent = igt.last_discovery
-      ? fmt(igt.last_discovery + 'T00:00:00') : (ed.status === 'expired' ? '⏳ Menunggu' : '-');
-
-    const igTbody = document.getElementById('ig-table');
-    const igAccounts = igt.accounts || [];
-    if (igAccounts.length === 0) {
-      igTbody.innerHTML = '<tr><td colspan="9" style="color:#475569;font-style:italic;padding:12px">Belum ada akun trending — discovery berjalan jam 09:00 WIB saat EnsembleData aktif</td></tr>';
-    } else {
-      igTbody.innerHTML = igAccounts.map(acc => {
-        const ll = acc.last_scrape_log || {};
-        const hasErr = ll.errors && ll.errors.length > 0;
-        const logText = hasErr
-          ? `<span class="red" title="${ll.errors[0]||''}">${(ll.errors[0]||'').substring(0,40)}…</span>`
-          : (ll.posts_new !== undefined
-              ? `<span class="green">+${ll.posts_new} post</span>`
-              : '<span style="color:#475569">-</span>');
-        const waiting = ed.status === 'expired'
-          ? '<span class="pill pill-waiting">⏳ waiting</span>' : '';
-        return `<tr>
-          <td><span class="pill pill-ig-rank">#${acc.rank ?? '-'}</span></td>
-          <td><b>@${acc.username}</b>${waiting}</td>
-          <td style="color:#94a3b8">${(acc.followers||0).toLocaleString()}</td>
-          <td class="${(acc.trending_score||0)>5?'green':'yellow'}">${(acc.trending_score||0).toFixed(2)}</td>
-          <td style="color:#94a3b8">${(acc.engagement_rate||0).toFixed(2)}%</td>
-          <td class="${(acc.posts_collected||0)>0?'green':''}">${acc.posts_collected ?? 0}</td>
-          <td style="color:#94a3b8;font-size:.75rem">${acc.last_scraped || '-'}</td>
-          <td style="color:#475569;font-size:.75rem">${acc.discovered_via || '-'}</td>
-          <td style="font-size:.75rem">${logText}</td>
-        </tr>`;
-      }).join('');
-    }
 
     // ── Instagram trend-scrape (trend_recommendations + AI keyword search) ──
     const its = d.instagram_trend_scrape || {};
