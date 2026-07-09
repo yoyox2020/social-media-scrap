@@ -96,11 +96,14 @@ class Settings(BaseSettings):
 
     viral_discovery_max_topics: int = 5   # maks topik/hari dari AI discovery, ubah via .env
 
-    # News Fase 2 — maks artikel BARU (belum ada di DB) yang di-scrape penuh
-    # (Firecrawl /v1/scrape, berbayar) per run viral discovery harian. Cuma
-    # jalan saat provider Ollama (satu-satunya yang search-nya dieksekusi
-    # kode kita sendiri, lihat app/ai/llm/viral_discovery_service.py).
+    # News Fase 2 — pipeline MANDIRI (app/services/news/trend_scrape_service.py),
+    # TIDAK terikat/tergantung AI viral discovery Instagram dkk sama sekali
+    # (murni search+scrape Firecrawl langsung, tanpa LLM). maks artikel BARU
+    # (belum ada di DB) yang di-scrape penuh (Firecrawl /v1/scrape, berbayar)
+    # per run harian.
     news_discovery_daily_budget: int = 10
+    news_discovery_schedule_hour: int = 13
+    news_discovery_schedule_minute: int = 0
 
     # Jadwal Celery Beat (WIB) — bisa diganti via .env tanpa ubah kode.
     # Default: viral discovery jalan 2 jam sebelum scrape supaya topik yang

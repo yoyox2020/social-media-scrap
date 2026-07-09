@@ -40,6 +40,7 @@ celery_app = Celery(
         "app.workers.facebook_trending_worker",
         "app.workers.tiktok_trending_worker",
         "app.workers.twitter_trending_worker",
+        "app.workers.news_worker",
     ],
 )
 
@@ -123,6 +124,16 @@ celery_app.conf.update(
             "schedule": crontab(
                 hour=settings.twitter_trend_scrape_schedule_hour,
                 minute=settings.twitter_trend_scrape_schedule_minute,
+            ),
+        },
+        # News: search+scrape artikel trending via Firecrawl (TANPA LLM,
+        # pipeline mandiri, TIDAK menyentuh viral_discovery_service.py/
+        # Instagram/Facebook/TikTok/Twitter sama sekali), jadwal via .env
+        "news-discovery-daily": {
+            "task": "workers.news.daily_discovery",
+            "schedule": crontab(
+                hour=settings.news_discovery_schedule_hour,
+                minute=settings.news_discovery_schedule_minute,
             ),
         },
         # YouTube: fetch trending Indonesia setiap hari jam 12.00 WIB

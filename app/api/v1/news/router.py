@@ -7,8 +7,9 @@ GET /news/search?q=...        — cari artikel berita by keyword (2 tingkat:
 GET /news/analysis/summary    — ringkasan sentimen SEMUA artikel berita
                                  tersimpan.
 GET /news/trending             — artikel berita yang ditemukan pada tanggal
-                                 tertentu (default hari ini) lewat AI viral
-                                 discovery harian (Fase 2, provider Ollama).
+                                 tertentu (default hari ini) lewat pipeline
+                                 discovery harian MANDIRI (Fase 2, lihat
+                                 app/services/news/trend_scrape_service.py).
 
 Beda dari platform medsos (Instagram/Facebook/TikTok/Twitter): berita tidak
 punya konsep "akun" atau "komentar publik" — jadi tidak ada
@@ -19,10 +20,15 @@ level-komentar yang labelnya Indonesia -- dipetakan ke Indonesia di respons
 API ini demi konsistensi dengan endpoint lain).
 
 `GET /news/trending` SENGAJA tidak dikaitkan ke topik trend_recommendations
-tertentu (beda dari Instagram/Facebook/dst) -- artikel Fase 2 ditemukan
-selama satu run AI discovery yang menyapu BANYAK query sekaligus, tidak ada
-pencatatan query-mana-menghasilkan-artikel-mana. "Trending" di sini artinya
-"artikel yang ditemukan hari ini", dikelompokkan per tanggal koleksi.
+tertentu (beda dari Instagram/Facebook/dst) — pipeline Fase 2 search LANGSUNG
+ke Firecrawl pakai query generik ("berita trending hari ini", dst), TANPA
+AI/LLM sama sekali (beda dari discovery topik medsos yang butuh reasoning
+LLM buat cari akun) — jadi tidak ada satu "topik" tunggal per artikel.
+"Trending" di sini artinya "artikel yang ditemukan hari ini", dikelompokkan
+per tanggal koleksi. Pipeline ini MANDIRI TOTAL, tidak menyentuh atau
+tergantung app/ai/llm/viral_discovery_service.py (AI viral discovery
+Instagram/Facebook/TikTok/Twitter) sama sekali — supaya scraping medsos yang
+sudah live tidak pernah berisiko terganggu oleh perubahan di fitur News.
 """
 from __future__ import annotations
 
@@ -244,15 +250,11 @@ async def get_news_trending(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Artikel berita yang ditemukan pada tanggal tertentu lewat AI viral
-    discovery harian (Fase 2) — CUMA terisi kalau provider AI discovery yang
-    jalan hari itu adalah Ollama (satu-satunya yang search-nya dieksekusi
-    kode kita sendiri sehingga URL-nya bisa ditangkap, lihat
-    app/services/trend_recommendations/viral_discovery_scrape_service.py
-    `_save_discovered_news_articles()`). Kalau provider Anthropic yang jalan
-    hari itu, tidak ada artikel baru dari jalur ini (topik+akun medsos tetap
-    ditemukan seperti biasa, cuma bagian "simpan artikel"-nya yang tidak
-    aktif untuk Claude).
+    Artikel berita yang ditemukan pada tanggal tertentu lewat pipeline
+    discovery harian MANDIRI (Fase 2, `app/services/news/trend_scrape_service.py`,
+    jadwal `settings.news_discovery_schedule_hour/minute`) — search LANGSUNG
+    ke Firecrawl (query generik, TANPA AI/LLM), jadi SELALU aktif tiap hari,
+    tidak tergantung provider AI discovery medsos apa pun.
 
     Beda dari `GET /instagram/trending` dkk: TIDAK dikaitkan ke topik
     trend_recommendations tertentu — lihat catatan di docstring modul ini.
@@ -271,6 +273,6 @@ async def get_news_trending(
     return build_success_response({
         "date": target_date.isoformat(),
         "total_articles": len(items),
-        "source": "ai_viral_discovery (Ollama only, lihat docstring endpoint)",
+        "source": "news_daily_discovery (mandiri, lihat docstring endpoint)",
         "items": items,
     })

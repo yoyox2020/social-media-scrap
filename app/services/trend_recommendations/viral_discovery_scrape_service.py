@@ -51,10 +51,9 @@ async def run_daily_viral_discovery(db: AsyncSession) -> dict:
 
     items: list[dict] = []
     result: dict = {"created": [], "updated": [], "evicted": [], "rejected": []}
-    collected_urls: list[dict] = []  # diisi side-effect oleh find_daily_viral_topics() -- News Fase 2
 
     try:
-        items = await find_daily_viral_topics(collected_urls=collected_urls)
+        items = await find_daily_viral_topics()
         if items:
             body = TrendRecommendationBatchCreate(items=items, source="ai_viral_discovery")
             result = await submit_recommendations(db, body)
@@ -74,75 +73,8 @@ async def run_daily_viral_discovery(db: AsyncSession) -> dict:
         scrape_run.duration_seconds = (scrape_run.finished_at - started_at).total_seconds()
         await db.commit()
 
-    # ── News Fase 2: simpan artikel yang GENUINELY ditemukan selama pencarian
-    # topik di atas (URL asli dari Firecrawl, cuma terisi kalau provider
-    # Ollama yang jalan) — SENGAJA di luar try/except di atas & dibungkus
-    # try/except SENDIRI: kegagalan di sini TIDAK BOLEH mengubah status/hasil
-    # run_daily_viral_discovery() sama sekali, fitur topik+akun medsos yang
-    # SUDAH ADA harus tetap berperilaku identik walau bagian ini gagal total.
-    if collected_urls:
-        try:
-            await _save_discovered_news_articles(db, collected_urls)
-        except Exception as exc:
-            logger.warning("run_daily_viral_discovery: gagal simpan artikel news (%s)", exc)
-
     logger.info("run_daily_viral_discovery: found=%d submitted=%s", len(items), result)
     return {"found": len(items), "submitted": result}
-
-
-async def _save_discovered_news_articles(db: AsyncSession, collected_urls: list[dict]) -> None:
-    """
-    News Fase 2 — simpan artikel berita yang genuinely ditemukan selama
-    pencarian topik viral hari ini (URL asli dari Firecrawl, BUKAN snippet
-    yang sudah diringkas AI) sebagai `posts` (platform='news').
-
-    Dedup URL DULU terhadap `posts.external_id` yang sudah ada SEBELUM scrape
-    isi lengkap — hemat kuota Firecrawl `/v1/scrape` (berbayar), jangan
-    scrape ulang artikel yang sudah tersimpan. Dibatasi
-    `settings.news_discovery_daily_budget` artikel BARU per run.
-    """
-    from sqlalchemy import select
-
-    from app.domain.posts.models import Post
-    from app.integrations.firecrawl.news import scrape_article
-    from app.services.news.pipeline_service import compute_external_id, save_news_articles
-    from app.shared.config import settings
-
-    seen_urls: set[str] = set()
-    unique_urls: list[str] = []
-    for item in collected_urls:
-        url = item.get("url")
-        if url and url not in seen_urls:
-            seen_urls.add(url)
-            unique_urls.append(url)
-
-    if not unique_urls:
-        return
-
-    ext_ids = [compute_external_id(u) for u in unique_urls]
-    existing_ext_ids = set((await db.scalars(
-        select(Post.external_id).where(Post.platform == "news", Post.external_id.in_(ext_ids))
-    )).all())
-    new_urls = [u for u in unique_urls if compute_external_id(u) not in existing_ext_ids]
-
-    if not new_urls:
-        logger.info("run_daily_viral_discovery: news Fase 2 -- %d URL ditemukan, semua sudah tersimpan", len(unique_urls))
-        return
-
-    budget = settings.news_discovery_daily_budget
-    new_urls = new_urls[:budget]
-
-    articles = []
-    for url in new_urls:
-        article = await scrape_article(url)
-        if article:
-            articles.append(article)
-
-    save_result = await save_news_articles(db, articles)
-    logger.info(
-        "run_daily_viral_discovery: news Fase 2 -- %d URL ditemukan, %d baru (budget=%d), %d artikel tersimpan",
-        len(unique_urls), len(new_urls), budget, save_result["articles_saved"],
-    )
 
 
 async def get_viral_discovery_trace(db: AsyncSession) -> dict:
