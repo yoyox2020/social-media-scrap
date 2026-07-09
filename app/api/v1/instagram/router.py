@@ -343,7 +343,7 @@ async def get_instagram_posts(
             "comment_count": total_per_post.get(pid, meta.get("comments", 0)),
             "media_type":    meta.get("media_type", ""),
             "is_video":      meta.get("is_video", False),
-            "thumbnail":     meta.get("thumbnail", ""),
+            "thumbnail":     meta.get("photo_url") or "",
             "views":         meta.get("views", 0),
             "published_at":  r["published_at"].isoformat() if r["published_at"] else None,
             "collected_at":  r["collected_at"].isoformat() if r["collected_at"] else None,
@@ -762,6 +762,7 @@ async def get_instagram_trending(
                 "likes":        meta.get("likes", 0),
                 "comment_count": meta.get("comments", 0),
                 "hashtags":     meta.get("hashtags", []),
+                "photo_url":    meta.get("photo_url"),
                 "published_at": r["published_at"].isoformat() if r["published_at"] else None,
                 "comments":     comments_by_post.get(pid, []),
             })
@@ -955,6 +956,7 @@ async def list_instagram_comments(
             p.content              AS caption,
             p.url                  AS post_url,
             p.published_at         AS post_published_at,
+            p.metadata             AS post_metadata,
             la.label               AS sentiment,
             la.score               AS sentiment_score
         FROM comments c
@@ -968,6 +970,7 @@ async def list_instagram_comments(
     items = []
     for r in rows:
         meta = r["metadata"] or {}
+        post_meta = r["post_metadata"] or {}
         items.append({
             "id":             str(r["id"]),
             "comment_id":     r["comment_id"],
@@ -985,6 +988,7 @@ async def list_instagram_comments(
                 "post_owner":   r["post_owner"],
                 "caption":      (r["caption"] or "")[:200],
                 "post_url":     r["post_url"] or f"https://www.instagram.com/p/{r['post_id']}/",
+                "photo_url":    post_meta.get("photo_url"),
                 "published_at": r["post_published_at"].isoformat() if r["post_published_at"] else None,
             },
         })
