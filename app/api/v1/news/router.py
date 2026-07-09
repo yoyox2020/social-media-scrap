@@ -226,8 +226,11 @@ async def get_news_analysis_summary(
        lebih disarankan literatur sentiment analysis dibanding document-level
        untuk teks berita, lihat Liu 2012 "Sentiment Analysis and Opinion
        Mining"). **Catatan kualitas data**: NER kadang menangkap noise dari
-       teks navigasi situs (menu/link), bukan cuma isi artikel murni — cek
-       manual kalau ada entitas yang terlihat ganjil (misal fragmen URL).
+       teks navigasi situs (menu/link), bukan cuma isi artikel murni —
+       fragmen URL slug (huruf kecil semua + >=2 tanda hubung) sudah
+       DIFILTER dari daftar `top`, tapi noise lain (misal kata generik
+       "wikipedia" ke-tag ORGANIZATION) masih bisa lolos — cek manual kalau
+       ada entitas yang terlihat ganjil.
 
     Beda dari platform medsos lain: sentimen di sini dihitung dari ISI
     ARTIKEL langsung — berita tidak punya komentar publik terbuka seperti
@@ -252,11 +255,18 @@ async def get_news_analysis_summary(
         return round(count / base * 100, 1) if base else 0.0
 
     # ── Entitas trending (NER) — "siapa/apa yang dibicarakan", lintas artikel ──
+    # NOT (huruf kecil semua DAN >=2 tanda hubung) -- buang noise fragmen URL
+    # slug (contoh nyata: "pbvsi-targetkan-timnas-voli-putra-...") yang
+    # kadang ikut ter-NER karena Firecrawl markdown menyertakan teks
+    # navigasi/link situs, bukan cuma isi artikel murni. Entitas asli hampir
+    # selalu berhuruf kapital di awal kata, jadi heuristik ini rendah risiko
+    # membuang entitas valid (diuji live sebelum diterapkan).
     entity_rows = (await db.execute(text("""
         SELECT e.text, e.entity_type, count(DISTINCT e.post_id) AS mentions
         FROM entities e
         JOIN posts p ON p.id = e.post_id
         WHERE p.platform = 'news'
+          AND NOT (e.text = lower(e.text) AND (length(e.text) - length(replace(e.text, '-', ''))) >= 2)
         GROUP BY e.text, e.entity_type
         ORDER BY mentions DESC, e.text ASC
         LIMIT :top_n
