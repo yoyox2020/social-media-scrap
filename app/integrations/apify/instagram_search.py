@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 from apify_client import ApifyClient
@@ -45,14 +46,35 @@ from app.shared.exceptions import ExternalAPIError
 
 logger = logging.getLogger(__name__)
 
+# Field `hashtags` actor ini MENOLAK spasi/tanda baca APAPUN, terlepas dari
+# `keywordSearch=True` -- ditemukan LIVE 2026-07-09 (bukan cuma baca dokumentasi):
+# keyword natural "banjir rob semarang 2026" ditolak dengan error regex
+# "Values in input.hashtags at positions [0] must match expression
+# ^[^!?.,:;\-+=*&%$#@/~^|<>()[\]{}"'`\s]+$". Jadi keyword APAPUN yang
+# mengandung spasi/tanda baca wajib disanitasi jadi satu token dulu (gabung
+# kata, buang tanda baca) sebelum dikirim -- sama seperti orang menulis
+# hashtag manual di Instagram ("banjir rob semarang 2026" -> "banjirrobsemarang2026").
+_HASHTAG_UNSAFE_RE = re.compile(r"""[\s!?.,:;\-+=*&%$#@/~^|<>()\[\]{}"'`]""")
+
+
+def _to_hashtag_slug(keyword: str) -> str:
+    return _HASHTAG_UNSAFE_RE.sub("", keyword)
+
 
 def _run_search_sync(keyword: str, max_results: int) -> list[dict[str, Any]]:
     if not settings.apify_api_token:
         raise ExternalAPIError(service="Apify", message="APIFY_API_TOKEN belum di-set di .env")
 
+    slug = _to_hashtag_slug(keyword)
+    if not slug:
+        raise ExternalAPIError(
+            service="Apify",
+            message=f"Keyword {keyword!r} tidak menyisakan karakter valid untuk hashtag setelah disanitasi",
+        )
+
     client = ApifyClient(settings.apify_api_token)
     run_input: dict[str, Any] = {
-        "hashtags": [keyword],
+        "hashtags": [slug],
         "resultsType": "posts",
         "resultsLimit": max_results,
         "keywordSearch": True,
