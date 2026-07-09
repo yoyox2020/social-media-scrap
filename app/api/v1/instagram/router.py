@@ -556,16 +556,23 @@ async def search_instagram_posts(
                 ),
             })
 
-        save_result = await save_instagram_keyword_search_results(db, raw_items)
+        # Actor tetap return run.status="SUCCEEDED" walau 0 post nyata ketemu --
+        # dataset-nya berisi 1 item marker error ({"error":"no_items",...},
+        # TANPA shortCode), bukan array kosong (ditemukan live 2026-07-09).
+        # Filter dulu ke item yang genuinely post (punya shortCode) sebelum
+        # dianggap "ada hasil".
+        real_items = [it for it in raw_items if it.get("shortCode")]
+
+        save_result = await save_instagram_keyword_search_results(db, real_items)
 
         scrape_run.status = "success" if save_result["posts_scraped"] > 0 else "failed"
-        scrape_run.videos_fetched = save_result["posts_scraped"]
+        scrape_run.videos_fetched = len(real_items)
         scrape_run.videos_new = save_result["posts_saved"]
         scrape_run.finished_at = datetime.now(timezone.utc)
         scrape_run.duration_seconds = (scrape_run.finished_at - started_at).total_seconds()
         await db.commit()
 
-        if not raw_items:
+        if not real_items:
             return build_success_response({
                 "query": q_clean, "source": "not_found", "total": 0, "items": [],
                 "message": (
@@ -574,7 +581,7 @@ async def search_instagram_posts(
                 ),
             })
 
-        shortcodes = [it["shortCode"] for it in raw_items if it.get("shortCode")]
+        shortcodes = [it["shortCode"] for it in real_items]
         fresh_rows = (await db.execute(text("""
             SELECT p.id, p.external_id, p.content, p.author, p.url, p.published_at, p.metadata
             FROM posts p
