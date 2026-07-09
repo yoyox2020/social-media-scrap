@@ -79,6 +79,7 @@ from app.api.v1.instagram.router import router as instagram_router
 from app.api.v1.facebook.router import router as facebook_router
 from app.api.v1.tiktok.router import router as tiktok_router
 from app.api.v1.twitter.router import router as twitter_router
+from app.api.v1.news.router import router as news_router
 from app.infrastructure.database.connection import engine
 from app.infrastructure.logging.logger import get_logger, setup_logging
 from app.infrastructure.middleware.request_id import RequestIDMiddleware
@@ -1346,4 +1347,5 @@ app.include_router(instagram_router, prefix=API_PREFIX)
 app.include_router(facebook_router, prefix=API_PREFIX)
 app.include_router(tiktok_router, prefix=API_PREFIX)
 app.include_router(twitter_router, prefix=API_PREFIX)
+app.include_router(news_router, prefix=API_PREFIX)
 app.include_router(trend_recommendations.router, prefix=API_PREFIX)

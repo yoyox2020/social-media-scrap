@@ -233,13 +233,44 @@ harian. Trade-off: lebih sederhana & tidak menyentuh apapun yang berhubungan
 dengan tabel frozen, TAPI tidak "belajar" akun baru untuk scraping berulang
 seperti Facebook.
 
-**Diverifikasi**: syntax-check (`ast.parse`) lolos untuk 4 file. Unit test
-standalone `extract_comments()` 4 skenario lolos. **BELUM diverifikasi
-end-to-end live** (belum ada request nyata ke endpoint dengan keyword yang
-genuinely trigger tingkat 3) — rencana verifikasi setelah deploy: cari
-keyword yang dipastikan tidak ada di DB/trend_recommendations, panggil
-endpoint, cek response `source` + cek baris baru masuk ke `posts`/`entities`
-dengan `metadata->>'source' = 'apify_keyword_search'`.
+**Diverifikasi live end-to-end setelah deploy (2026-07-09)** — 2 bug nyata
+ditemukan & diperbaiki dalam proses verifikasi:
+
+1. **Bug: field `hashtags` actor menolak spasi/tanda baca** walau
+   `keywordSearch=true` — keyword natural (`"banjir rob semarang 2026"`)
+   ditolak Apify dengan error regex. **Fix**: `_to_hashtag_slug()` di
+   `instagram_search.py` — sanitasi keyword jadi satu token (buang
+   spasi/tanda baca) sebelum dikirim, commit `c6e583b`.
+2. **Bug: actor tetap `SUCCEEDED` walau 0 post nyata ketemu**, dataset-nya
+   berisi 1 item MARKER ERROR (`{"error":"no_items","errorDescription":
+   "Empty or private data for provided input"}`, TANPA `shortCode`) — bukan
+   array kosong. Sebelum fix, kasus ini salah dilaporkan `source:
+   "scraped_now_keyword_search"` dengan `total:0` (membingungkan) alih-alih
+   `source: "not_found"`. **Fix**: filter `raw_items` ke `real_items` (yang
+   punya `shortCode`) sebelum dianggap "ada hasil", commit `4d5096e`.
+
+**Hasil test live setelah kedua fix**:
+- Keyword genuinely tidak ada post (`"banjir rob semarang 2026"`) → benar
+  `source: "not_found"` dengan pesan jelas.
+- Keyword dengan post nyata (`"jakartafair2026"`) → `source:
+  "scraped_now_keyword_search"`, `total: 5`, post tersimpan lengkap
+  (caption, likes, published_at, thumbnail). **Komentar ASLI dari
+  `latestComments` berhasil ter-parse** (6 komentar dengan author berbeda-beda
+  muncul di salah satu post — bukan cuma fallback `firstComment` — jadi
+  dugaan field `text`/`ownerUsername` di `extract_comments()` TERBUKTI BENAR
+  untuk kasus yang genuinely punya komentar). Sentimen lexicon komentar
+  sudah otomatis jalan (label `netral`/`positif` langsung muncul di response).
+- `GET /youtube/monitor-public` dicek ulang setelah deploy: `instagram`
+  object cuma berisi `total_posts`/`total_comments`/`accounts_scraped_today`
+  — key `trending` sudah tidak ada lagi (fix A terkonfirmasi live).
+
+**Semua perubahan sesi ini (D+A+B+C) sudah di-deploy ke server produksi**
+(187.77.125.10): push GitHub (5 commit: `47a5a23`, `1c373d6`, `c6e583b`,
+`4d5096e`, ditambah commit awal Facebook), scp per-file ke server (file
+server dicek dulu via md5sum — mismatch di 2 file ternyata cuma beda line
+ending CRLF/LF, bukan patch manual, aman di-overwrite), restart
+`social_intel_api`+`worker`+`worker_beat`+`worker_ai`. Log container dicek
+bersih dari error baru setelah restart.
 - **D. Perbaiki kualitas AI viral discovery — SUDAH DIIMPLEMENTASI (prioritas
   pertama, dipilih user karena ini inti pencarian otomatis).**
 
