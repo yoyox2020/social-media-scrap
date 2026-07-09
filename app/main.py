@@ -654,6 +654,40 @@ async def scraping_status_page():
   <tbody id="twts-runs-table"></tbody>
 </table>
 
+<div class="section-title" style="margin-top:24px">News — Statistik & Jadwal (pipeline mandiri, Firecrawl)</div>
+<div class="ig-grid">
+  <div class="ig-card"><div class="label">Total Artikel</div><div class="value" id="news-total">-</div><div class="sub">platform news</div></div>
+  <div class="ig-card"><div class="label">Artikel Hari Ini</div><div class="value" id="news-today">-</div><div class="sub">ditemukan hari ini</div></div>
+  <div class="ig-card"><div class="label">Budget Harian</div><div class="value" id="news-budget">-</div><div class="sub">artikel baru/hari (Firecrawl)</div></div>
+  <div class="ig-card"><div class="label">Jadwal</div><div class="value" id="news-schedule" style="font-size:0.95rem">-</div><div class="sub">Celery Beat, mandiri</div></div>
+</div>
+<table>
+  <thead>
+    <tr>
+      <th>Judul</th>
+      <th>URL</th>
+      <th>Ditemukan</th>
+    </tr>
+  </thead>
+  <tbody id="news-latest-table"></tbody>
+</table>
+
+<div class="section-title" style="margin-top:24px">Riwayat Discovery News</div>
+<table>
+  <thead>
+    <tr>
+      <th>Run</th>
+      <th>Status</th>
+      <th>Sumber</th>
+      <th>Artikel Baru</th>
+      <th>Durasi</th>
+      <th>Waktu Mulai</th>
+      <th>Error</th>
+    </tr>
+  </thead>
+  <tbody id="news-runs-table"></tbody>
+</table>
+
 <div class="section-title" style="margin-top:24px">Riwayat Scraping Keyword</div>
 <table>
   <thead>
@@ -1245,6 +1279,45 @@ async function load() {
       twtsRunsTbody.innerHTML = '<tr><td colspan="7" style="color:#475569;font-style:italic;padding:12px">Belum ada riwayat scrape</td></tr>';
     } else {
       twtsRunsTbody.innerHTML = twtsRuns.map(r => {
+        const pillClass = r.status === 'success' ? 'pill-success' : (r.status === 'failed' ? 'pill-failed' : 'pill-running');
+        return `<tr>
+          <td>${r.topic}</td>
+          <td><span class="pill ${pillClass}">${r.status}</span></td>
+          <td style="color:#64748b;font-size:.72rem">${r.api_source || '-'}</td>
+          <td class="${(r.videos_new||0)>0?'green':''}">${r.videos_new ?? 0}</td>
+          <td style="color:#94a3b8">${r.duration_seconds ?? '-'}s</td>
+          <td style="color:#94a3b8;font-size:.75rem">${fmt(r.started_at)}</td>
+          <td class="error-text" title="${r.error_message||''}">${r.error_message || '-'}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    // ── News (pipeline mandiri, Firecrawl — TIDAK terkait trend_recommendations) ──
+    const news = d.news_trend_scrape || {};
+    const newsSummary = news.summary || {};
+    document.getElementById('news-total').textContent    = newsSummary.total_articles || 0;
+    document.getElementById('news-today').textContent    = newsSummary.articles_today || 0;
+    document.getElementById('news-budget').textContent   = news.daily_budget ?? '-';
+    document.getElementById('news-schedule').textContent = news.schedule ?? '-';
+
+    const newsLatestTbody = document.getElementById('news-latest-table');
+    const newsLatest = news.latest_articles || [];
+    if (newsLatest.length === 0) {
+      newsLatestTbody.innerHTML = '<tr><td colspan="3" style="color:#475569;font-style:italic;padding:12px">Belum ada artikel</td></tr>';
+    } else {
+      newsLatestTbody.innerHTML = newsLatest.map(a => `<tr>
+        <td>${a.title || '-'}</td>
+        <td style="font-size:.72rem"><a href="${a.url}" target="_blank" rel="noopener" style="color:#38bdf8">${(a.url||'').substring(0,60)}</a></td>
+        <td style="color:#94a3b8;font-size:.75rem">${fmt(a.collected_at)}</td>
+      </tr>`).join('');
+    }
+
+    const newsRunsTbody = document.getElementById('news-runs-table');
+    const newsRuns = news.recent_runs || [];
+    if (newsRuns.length === 0) {
+      newsRunsTbody.innerHTML = '<tr><td colspan="7" style="color:#475569;font-style:italic;padding:12px">Belum ada riwayat discovery</td></tr>';
+    } else {
+      newsRunsTbody.innerHTML = newsRuns.map(r => {
         const pillClass = r.status === 'success' ? 'pill-success' : (r.status === 'failed' ? 'pill-failed' : 'pill-running');
         return `<tr>
           <td>${r.topic}</td>
