@@ -426,9 +426,22 @@ async def search_facebook_posts(
         })
 
     new_identifier = accounts_found[0]["username"]
+
+    # discover_facebook_topic_by_keyword() di atas sudah submit topik ini ke
+    # trend_recommendations (status='pending') -- ambil row-nya supaya kalau
+    # scrape SEKARANG ini sukses, langsung ditandai 'used' juga. Tanpa ini,
+    # topik tetap 'pending' meski sudah discrape barusan, lalu ke-pick lagi
+    # oleh batch harian besok -> scrape ulang keyword yang sama, buang kuota
+    # Apify (lihat docs/analisa-gap-facebook.md gap 3).
+    newly_submitted_topic = await db.scalar(
+        select(TrendRecommendation).where(
+            TrendRecommendation.topic == q_clean,
+            TrendRecommendation.recommendation_date == date.today(),
+        )
+    )
     return await _scrape_now_and_respond(
         db, q_clean, new_identifier, limit,
-        topic=q_clean, mark_topic=None, source_label="scraped_now_external",
+        topic=q_clean, mark_topic=newly_submitted_topic, source_label="scraped_now_external",
     )
 
 

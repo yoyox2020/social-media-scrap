@@ -28,6 +28,7 @@ from app.domain.entities.models import Entity
 from app.domain.posts.models import Post
 from app.domain.youtube_analysis.models import LexiconAnalysis
 from app.integrations.facebook.connector import FacebookConnector
+from app.shared.apify_errors import tag_if_quota_error
 from app.shared.config import settings
 
 MAX_POSTS = 12
@@ -279,7 +280,7 @@ async def scrape_facebook_posts_via_provider(
     try:
         rows, provider_used = await search_profile_with_fallback(identifier, max_posts, max_comments)
     except Exception as exc:
-        errors.append(f"provider: {exc}")
+        errors.append(tag_if_quota_error(f"provider: {exc}", exc=exc))
         rows = []
 
     if not rows:

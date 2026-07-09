@@ -1,11 +1,12 @@
 from datetime import date
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.scrape_runs.models import ScrapeRun
 from app.domain.trend_recommendations.models import TrendRecommendation
 from app.domain.trend_recommendations.schemas import TrendRecommendationBatchCreate, TrendRecommendationItem
+from app.shared.apify_errors import QUOTA_ERROR_PREFIX
 
 MAX_PER_DAY = 20
 
@@ -128,11 +129,24 @@ async def mark_failed_permanent_if_exhausted(db: AsyncSession, topic: TrendRecom
     disengaja demi kesederhanaan (skema tabel dibekukan, tidak nambah kolom
     baru per-platform).
 
+    Kegagalan karena KUOTA/RATE-LIMIT APIFY HABIS (error_message ditandai
+    QUOTA_ERROR_PREFIX oleh app.shared.apify_errors.tag_if_quota_error(),
+    lihat pipeline_service masing-masing platform) TIDAK ikut dihitung --
+    itu kegagalan sementara di pihak kita, bukan bukti topik ini genuinely
+    tidak bisa discrape. Lihat docs/analisa-gap-facebook.md gap 2.
+
     Return True kalau topik BARU SAJA ditandai failed_permanent (buat log).
     """
     failed_count = await db.scalar(
         select(func.count()).select_from(ScrapeRun)
-        .where(ScrapeRun.keyword_text == topic.topic, ScrapeRun.status == "failed")
+        .where(
+            ScrapeRun.keyword_text == topic.topic,
+            ScrapeRun.status == "failed",
+            or_(
+                ScrapeRun.error_message.is_(None),
+                ~ScrapeRun.error_message.like(f"{QUOTA_ERROR_PREFIX}%"),
+            ),
+        )
     )
     if (failed_count or 0) >= FAILED_PERMANENT_THRESHOLD:
         topic.status = "failed_permanent"
