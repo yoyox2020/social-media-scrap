@@ -60,6 +60,11 @@ GET  /trend-discovery/visuals             — post ASLI (thumbnail+judul,
                                             simpan field gambar, lihat memory
                                             project_thumbnail_gap_facebook_
                                             tiktok_twitter.md).
+GET  /trend-discovery/feed                — feed mention individual (post+
+                                            komentar campur, kronologis) utk
+                                            satu keyword -- SEMUA platform
+                                            (beda dari /visuals yg cuma 3
+                                            platform ber-thumbnail).
 """
 from __future__ import annotations
 
@@ -936,6 +941,113 @@ async def get_trend_visuals(
         "date_from": since_aligned.date().isoformat(),
         "date_to": (until - timedelta(seconds=1)).date().isoformat(),
         "platform": platform or "youtube,instagram,news",
+        "total": len(items),
+        "items": items,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feed (mention individual -- post + komentar campur, kronologis)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/feed", response_model=dict, summary="Feed mention individual (post+komentar) utk satu topik")
+async def get_trend_feed(
+    keyword: str = Query(..., description="Kata/frasa yang dicari (ILIKE ke posts.content DAN comments.content) -- ambil dari Word count/Timeline/topic_clusters"),
+    date_from: date | None = Query(default=None, description="Filter dari tanggal (YYYY-MM-DD). Kosong: date_to - 7 hari (atau dari `hours` kalau date_to juga kosong)"),
+    date_to: date | None = Query(default=None, description="Filter sampai tanggal (YYYY-MM-DD), inklusif. Kosong: hari ini"),
+    hours: int = Query(default=24, ge=1, le=168, description="Dipakai HANYA kalau date_from & date_to keduanya kosong — rentang jam ke belakang dari sekarang, maks 168 (7 hari)"),
+    platform: str | None = Query(default=None, description="Batasi ke satu platform. Kosong (default): semua platform digabung"),
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Feed mention individual (BUKAN agregat) yang mengandung `keyword` --
+    gabungan `posts` DAN `comments` (dihubungkan `comments.post_id =
+    posts.id`, sama pola dgn `/geo-distribution`), diurutkan waktu terbaru
+    duluan. Tiap item ditandai `source_type` (`post` atau `comment`) supaya
+    jelas asalnya.
+
+    Beda dari `/visuals` (khusus post ber-thumbnail, 3 platform saja) --
+    endpoint ini teks murni, jalan di SEMUA platform, TERMASUK komentar
+    (yang tidak punya thumbnail sama sekali, tapi tetap sinyal berharga --
+    lihat contoh nyata: warganet berkomentar soal suatu topik seringnya
+    lewat komentar, bukan bikin post sendiri).
+
+    Sama metodologi tanggal dgn endpoint lain di modul ini -- hasilnya
+    konsisten dgn topik yang sudah kamu lihat di Word count/Timeline/
+    Visuals/geo-distribution.
+    """
+    if platform and platform not in _VALID_PLATFORMS:
+        raise HTTPException(status_code=422, detail=f"platform harus salah satu: {', '.join(sorted(_VALID_PLATFORMS))}")
+
+    now = datetime.now(timezone.utc)
+    if date_from or date_to:
+        resolved_date_to = date_to or now.date()
+        resolved_date_from = date_from or (resolved_date_to - timedelta(days=7))
+        since_aligned = datetime.combine(resolved_date_from, time.min, tzinfo=timezone.utc)
+        until = datetime.combine(resolved_date_to, time.min, tzinfo=timezone.utc) + timedelta(days=1)
+    else:
+        until = now
+        since_aligned = now - timedelta(hours=hours)
+
+    pattern = f"%{keyword}%"
+    platform_param = {"platform": platform} if platform else {}
+
+    post_platform_clause = "AND platform = :platform" if platform else ""
+    post_rows = (await db.execute(text(f"""
+        SELECT id, platform, author, url, content, published_at
+        FROM posts
+        WHERE published_at >= :since AND published_at < :until AND published_at IS NOT NULL
+          AND content ILIKE :pattern
+          {post_platform_clause}
+        ORDER BY published_at DESC
+        LIMIT :limit
+    """), {"since": since_aligned, "until": until, "pattern": pattern, "limit": limit, **platform_param})).mappings().all()
+
+    comment_platform_clause = "AND p.platform = :platform" if platform else ""
+    comment_rows = (await db.execute(text(f"""
+        SELECT c.id, p.platform, c.author, p.url, c.content, c.published_at
+        FROM comments c
+        JOIN posts p ON p.id = c.post_id
+        WHERE c.published_at >= :since AND c.published_at < :until AND c.published_at IS NOT NULL
+          AND c.content ILIKE :pattern
+          {comment_platform_clause}
+        ORDER BY c.published_at DESC
+        LIMIT :limit
+    """), {"since": since_aligned, "until": until, "pattern": pattern, "limit": limit, **platform_param})).mappings().all()
+
+    items = [
+        {
+            "id": str(r["id"]),
+            "source_type": "post",
+            "platform": r["platform"],
+            "author": r["author"],
+            "content": r["content"],
+            "url": r["url"],
+            "published_at": r["published_at"].isoformat() if r["published_at"] else None,
+        }
+        for r in post_rows
+    ] + [
+        {
+            "id": str(r["id"]),
+            "source_type": "comment",
+            "platform": r["platform"],
+            "author": r["author"],
+            "content": r["content"],
+            "url": r["url"],
+            "published_at": r["published_at"].isoformat() if r["published_at"] else None,
+        }
+        for r in comment_rows
+    ]
+    items.sort(key=lambda it: it["published_at"] or "", reverse=True)
+    items = items[:limit]
+
+    return build_success_response({
+        "keyword": keyword,
+        "date_from": since_aligned.date().isoformat(),
+        "date_to": (until - timedelta(seconds=1)).date().isoformat(),
+        "platform": platform or "all",
         "total": len(items),
         "items": items,
     })
