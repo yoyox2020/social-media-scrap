@@ -51,6 +51,15 @@ GET  /trend-discovery/geo-distribution    — distribusi nama tempat (negara/
                                             dgn /timeline, `from_posts` bisa
                                             dicocokkan langsung ke angka di
                                             /timeline (posts-only), independen.
+GET  /trend-discovery/visuals             — post ASLI (thumbnail+judul,
+                                            bukan agregat) utk satu keyword,
+                                            drill-down dari topik yang sudah
+                                            ditemukan lewat panel lain. HANYA
+                                            platform youtube/instagram/news
+                                            (Facebook/TikTok/Twitter belum
+                                            simpan field gambar, lihat memory
+                                            project_thumbnail_gap_facebook_
+                                            tiktok_twitter.md).
 """
 from __future__ import annotations
 
@@ -818,4 +827,115 @@ async def get_geo_distribution(
         "total_places_checked": len(places),
         "total_places_matched": len(results),
         "places": results,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Visuals (post ASLI dgn thumbnail, utk satu keyword/topik)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# HANYA 3 platform ini yang punya field gambar tersimpan -- dicek langsung ke
+# pipeline_service.py tiap platform 2026-07-10: Facebook (jalur search/tier-3
+# yang lebih sering kepakai)/TikTok/Twitter TIDAK PERNAH ambil field
+# gambar/cover dari respons Apify sama sekali (gap di kode kita, BUKAN
+# keterbatasan Apify -- kemungkinan besar datanya ADA di respons mentah,
+# belum dikonfirmasi). SENGAJA belum dikerjakan -- itu ubah pipeline_service.py
+# (beda risiko dari nambah endpoint baru), minta konfirmasi eksplisit dulu.
+# Lihat memory project_thumbnail_gap_facebook_tiktok_twitter.md.
+_VISUAL_PLATFORMS = {"youtube", "instagram", "news"}
+
+
+def _extract_visual(platform: str, content: str | None, meta: dict) -> tuple[str | None, str | None]:
+    """Return (title, thumbnail_url) -- field beda nama per platform."""
+    if platform == "youtube":
+        return (content or "")[:200], meta.get("thumbnail")
+    if platform == "instagram":
+        return (content or "")[:200], meta.get("photo_url")
+    if platform == "news":
+        return meta.get("title") or (content or "")[:200], meta.get("image_url")
+    return (content or "")[:200], None
+
+
+@router.get("/visuals", response_model=dict, summary="Post asli (thumbnail+judul) utk satu topik")
+async def get_trend_visuals(
+    keyword: str = Query(..., description="Kata/frasa yang dicari (ILIKE ke posts.content) -- ambil dari Word count/Timeline/topic_clusters"),
+    date_from: date | None = Query(default=None, description="Filter dari tanggal (YYYY-MM-DD). Kosong: date_to - 7 hari (atau dari `hours` kalau date_to juga kosong)"),
+    date_to: date | None = Query(default=None, description="Filter sampai tanggal (YYYY-MM-DD), inklusif. Kosong: hari ini"),
+    hours: int = Query(default=24, ge=1, le=168, description="Dipakai HANYA kalau date_from & date_to keduanya kosong — rentang jam ke belakang dari sekarang, maks 168 (7 hari)"),
+    platform: str | None = Query(default=None, description="Batasi ke satu platform (youtube/instagram/news). Kosong (default): gabungan ketiganya"),
+    limit: int = Query(default=12, ge=1, le=50),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Post ASLI (bukan cuma angka/agregat) yang mengandung `keyword`, lengkap
+    dengan thumbnail siap tampil -- panel "Visuals", drill-down dari topik
+    yang sudah ditemukan lewat Word count/Timeline/topic_clusters.
+
+    **HANYA platform `youtube`/`instagram`/`news`** yang didukung sekarang --
+    Facebook/TikTok/Twitter TIDAK menyimpan field gambar post sama sekali
+    (gap di kode `pipeline_service.py` masing2 platform, BUKAN keterbatasan
+    Apify -- lihat memory project_thumbnail_gap_facebook_tiktok_twitter.md).
+    SENGAJA belum ditambah krn itu perlu ubah kode scraping platform yang
+    sudah jalan, beda risiko dari endpoint baca-saja ini.
+
+    Sama metodologi tanggal dgn endpoint lain di modul ini. `content`
+    di-ILIKE persis sama seperti Word count/Timeline, jadi hasilnya
+    konsisten dgn topik yang sudah kamu lihat di panel lain.
+    """
+    if platform and platform not in _VISUAL_PLATFORMS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"platform harus salah satu: {', '.join(sorted(_VISUAL_PLATFORMS))} (Facebook/TikTok/Twitter belum didukung -- tidak punya field gambar tersimpan)",
+        )
+
+    now = datetime.now(timezone.utc)
+    if date_from or date_to:
+        resolved_date_to = date_to or now.date()
+        resolved_date_from = date_from or (resolved_date_to - timedelta(days=7))
+        since_aligned = datetime.combine(resolved_date_from, time.min, tzinfo=timezone.utc)
+        until = datetime.combine(resolved_date_to, time.min, tzinfo=timezone.utc) + timedelta(days=1)
+    else:
+        until = now
+        since_aligned = now - timedelta(hours=hours)
+
+    platform_clause = "AND platform = :platform" if platform else "AND platform IN ('youtube', 'instagram', 'news')"
+    params: dict = {
+        "since": since_aligned, "until": until,
+        "pattern": f"%{keyword}%", "limit": limit,
+    }
+    if platform:
+        params["platform"] = platform
+
+    rows = (await db.execute(text(f"""
+        SELECT id, platform, author, url, content, published_at, metadata
+        FROM posts
+        WHERE published_at >= :since AND published_at < :until AND published_at IS NOT NULL
+          AND content ILIKE :pattern
+          {platform_clause}
+        ORDER BY published_at DESC
+        LIMIT :limit
+    """), params)).mappings().all()
+
+    items = []
+    for r in rows:
+        meta = r["metadata"] or {}
+        title, thumbnail = _extract_visual(r["platform"], r["content"], meta)
+        items.append({
+            "post_id": str(r["id"]),
+            "platform": r["platform"],
+            "author": r["author"],
+            "url": r["url"],
+            "title": title,
+            "thumbnail": thumbnail,
+            "published_at": r["published_at"].isoformat() if r["published_at"] else None,
+        })
+
+    return build_success_response({
+        "keyword": keyword,
+        "date_from": since_aligned.date().isoformat(),
+        "date_to": (until - timedelta(seconds=1)).date().isoformat(),
+        "platform": platform or "youtube,instagram,news",
+        "total": len(items),
+        "items": items,
     })
