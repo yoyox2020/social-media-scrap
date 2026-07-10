@@ -322,9 +322,11 @@ async def get_news_analysis_summary(
 # GET /news/trending
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/trending", response_model=dict, summary="Artikel berita yang ditemukan pada tanggal tertentu")
+@router.get("/trending", response_model=dict, summary="Artikel berita yang ditemukan pada tanggal/rentang tanggal tertentu")
 async def get_news_trending(
-    collection_date: date | None = Query(default=None, description="Default: hari ini"),
+    collection_date: date | None = Query(default=None, description="Filter tanggal tunggal. Default: hari ini (kalau date_from/date_to juga kosong)"),
+    date_from: date | None = Query(default=None, description="Filter dari tanggal (YYYY-MM-DD), inklusif — diabaikan kalau collection_date diisi"),
+    date_to: date | None = Query(default=None, description="Filter sampai tanggal (YYYY-MM-DD), inklusif — diabaikan kalau collection_date diisi"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -337,21 +339,48 @@ async def get_news_trending(
 
     Beda dari `GET /instagram/trending` dkk: TIDAK dikaitkan ke topik
     trend_recommendations tertentu — lihat catatan di docstring modul ini.
-    """
-    target_date = collection_date or datetime.now(timezone.utc).date()
 
-    post_rows = (await db.execute(text("""
+    **Filter tanggal:** `collection_date` (tanggal tunggal) PALING
+    diprioritaskan. Kalau kosong, pakai `date_from`/`date_to` (salah satu
+    boleh kosong — rentang terbuka). Kalau ketiganya kosong, default hari ini.
+    """
+    resolved_from: date | None
+    resolved_to: date | None
+    if collection_date:
+        where_clause = "collected_at::date = :single_date"
+        params: dict = {"single_date": collection_date}
+        resolved_from = resolved_to = collection_date
+    elif date_from or date_to:
+        conditions = []
+        params = {}
+        if date_from:
+            conditions.append("collected_at::date >= :date_from")
+            params["date_from"] = date_from
+        if date_to:
+            conditions.append("collected_at::date <= :date_to")
+            params["date_to"] = date_to
+        where_clause = " AND ".join(conditions)
+        resolved_from, resolved_to = date_from, date_to
+    else:
+        today = datetime.now(timezone.utc).date()
+        where_clause = "collected_at::date = :single_date"
+        params = {"single_date": today}
+        resolved_from = resolved_to = today
+
+    post_rows = (await db.execute(text(f"""
         SELECT id, external_id, content, author, url, published_at, collected_at, metadata
         FROM posts
-        WHERE platform = 'news' AND collected_at::date = :target_date
+        WHERE platform = 'news' AND {where_clause}
         ORDER BY collected_at DESC
-    """), {"target_date": target_date})).mappings().all()
+    """), params)).mappings().all()
 
     items = await _build_news_items(db, post_rows)
 
     return build_success_response({
-        "date": target_date.isoformat(),
-        "total_articles": len(items),
+        "date":            resolved_from.isoformat() if resolved_from == resolved_to and resolved_from else None,
+        "date_from":       resolved_from.isoformat() if resolved_from else None,
+        "date_to":         resolved_to.isoformat() if resolved_to else None,
+        "total_articles":  len(items),
         "source": "news_daily_discovery (mandiri, lihat docstring endpoint)",
         "items": items,
     })
