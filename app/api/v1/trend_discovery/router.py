@@ -307,6 +307,9 @@ _STOPWORDS = {
     "viralvideo", "viraltiktok", "explore", "explorepage", "capcut", "cut",
     "video", "reels", "reel", "shorts", "share", "like", "follow", "followme",
     "xyzbca", "tiktok", "instagram", "instagood", "photooftheday",
+    # Sisa HTML entity yang kadang tidak ke-strip bersih dari markdown
+    # Firecrawl (News) -- "&amp;" dst kalau lolos jadi kata "amp" sendirian.
+    "amp", "nbsp", "quot", "lt", "gt", "apos",
 }
 
 
