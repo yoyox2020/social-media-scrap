@@ -22,13 +22,21 @@ POST /trend-discovery/run                — trigger manual satu pipeline
                                             (?source=twitter|tiktok|instagram|
                                             combined), buat testing/debug
                                             tanpa nunggu jadwal
+GET  /trend-discovery/timeline            — volume mention per keyword dari
+                                            waktu ke waktu (multi-series,
+                                            lintas SEMUA platform termasuk
+                                            News), utk chart timeline/deteksi
+                                            burst. TIDAK terikat 5-sumber
+                                            triangulasi di atas -- baca
+                                            langsung dari `posts` (ILIKE
+                                            content), independen.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.users.models import User
@@ -258,3 +266,98 @@ async def trigger_trend_discovery(
         raise HTTPException(status_code=422, detail="source harus salah satu: twitter, tiktok, instagram, combined")
 
     return build_success_response({"source": source, "result": result})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Timeline (volume mention per keyword dari waktu ke waktu)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_VALID_PLATFORMS = {"instagram", "facebook", "tiktok", "twitter", "youtube", "news"}
+
+
+@router.get("/timeline", response_model=dict, summary="Volume mention per keyword dari waktu ke waktu (multi-series)")
+async def get_trend_timeline(
+    keywords: str = Query(..., description="Daftar keyword/frasa dipisah koma, mis. 'Prabowo,Bank Indonesia'"),
+    hours: int = Query(default=24, ge=1, le=168, description="Rentang waktu ke belakang dari sekarang (jam), maks 168 (7 hari)"),
+    interval: str = Query(default="hour", pattern="^(hour|day)$", description="Granularitas bucket: hour atau day"),
+    platform: str | None = Query(default=None, description="Filter satu platform (instagram/facebook/tiktok/twitter/youtube/news). Kosong = semua platform digabung"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Volume mention per keyword dari waktu ke waktu (multi-series time-series)
+    — dipakai utk chart timeline / deteksi lonjakan pembicaraan (burst),
+    lintas SEMUA platform (`posts` generik, TERMASUK News) kecuali difilter
+    `platform`. TIDAK terikat ke 5-sumber triangulasi endpoint lain di modul
+    ini — baca langsung `posts.content` (ILIKE, bukan exact match/NER)
+    supaya bisa cocok frasa apa saja, termasuk yang tidak ada di
+    `trend_recommendations` sama sekali.
+
+    **Dibucket dari `published_at`** (waktu ASLI post/artikel dibuat, BUKAN
+    `collected_at`/waktu kita scrape) — lihat docs/trend-discovery-api.md
+    soal kelengkapan data per platform (sosmed+YouTube ~100% lengkap; News
+    tergantung apakah situs sumber menyediakan tanggal publish di metadata,
+    baru diperbaiki 2026-07-10, lihat app/integrations/firecrawl/news.py).
+    Post/artikel yang `published_at`-nya NULL otomatis tidak ikut terhitung
+    (bukan hilang diam-diam — TIDAK ADA cara membucket sesuatu yang waktu
+    aslinya tidak diketahui).
+
+    Bucket KOSONG tetap muncul dengan `count: 0` (tidak di-skip) supaya
+    chart line tidak berlubang.
+    """
+    kw_list = [k.strip() for k in keywords.split(",") if k.strip()]
+    if not kw_list:
+        raise HTTPException(status_code=422, detail="keywords tidak boleh kosong")
+    if len(kw_list) > 10:
+        raise HTTPException(status_code=422, detail="maks 10 keyword per request")
+    if platform and platform not in _VALID_PLATFORMS:
+        raise HTTPException(status_code=422, detail=f"platform harus salah satu: {', '.join(sorted(_VALID_PLATFORMS))}")
+
+    trunc_unit = "hour" if interval == "hour" else "day"
+    step = timedelta(hours=1) if interval == "hour" else timedelta(days=1)
+
+    now = datetime.now(timezone.utc)
+    since_aligned = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=hours)
+    if interval == "day":
+        since_aligned = since_aligned.replace(hour=0)
+
+    all_buckets: list[datetime] = []
+    cursor = since_aligned
+    while cursor <= now:
+        all_buckets.append(cursor)
+        cursor += step
+
+    platform_clause = "AND platform = :platform" if platform else ""
+
+    series: dict[str, list[dict]] = {}
+    for kw in kw_list:
+        rows = (await db.execute(text(f"""
+            SELECT date_trunc(:trunc_unit, published_at) AS bucket, count(*) AS cnt
+            FROM posts
+            WHERE published_at >= :since
+              AND published_at IS NOT NULL
+              AND content ILIKE :pattern
+              {platform_clause}
+            GROUP BY bucket
+        """), {
+            "trunc_unit": trunc_unit,
+            "since": since_aligned,
+            "pattern": f"%{kw}%",
+            **({"platform": platform} if platform else {}),
+        })).mappings().all()
+
+        counts_by_bucket = {r["bucket"]: r["cnt"] for r in rows}
+        series[kw] = [
+            {"bucket": b.isoformat(), "count": counts_by_bucket.get(b, 0)}
+            for b in all_buckets
+        ]
+
+    return build_success_response({
+        "hours": hours,
+        "interval": interval,
+        "platform": platform or "all",
+        "since": since_aligned.isoformat(),
+        "until": now.isoformat(),
+        "keywords": kw_list,
+        "series": series,
+    })
