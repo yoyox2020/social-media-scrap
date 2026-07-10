@@ -105,6 +105,37 @@ class Settings(BaseSettings):
     news_discovery_schedule_hour: int = 13
     news_discovery_schedule_minute: int = 0
 
+    # Multi-Signal Trend Discovery — pipeline MANDIRI (app/services/trends/),
+    # TIDAK menyentuh app/ai/llm/viral_discovery_service.py atau kode
+    # platform manapun yang sudah ada. Tujuannya ganti "AI menebak viral"
+    # dengan sinyal OBJEKTIF: native trending TikTok/Twitter (kalau ada) +
+    # sapuan hashtag independen + Google Trends + silang-cek YouTube
+    # TrendingTopic (baca-saja) -> topik yang dikonfirmasi >1 sumber baru
+    # disubmit ke trend_recommendations (source='multi_signal_trending').
+    twitter_trends_actor_id: str = "automation-lab/twitter-trends-scraper"  # native Trends X, diverifikasi live 2026-07-10
+    trends_geo: str = "ID"
+    trends_max_per_source: int = 10  # maks item diambil per sumber per run
+
+    # Query sapuan generik utk TikTok/Instagram (TIDAK ada actor trending
+    # native yang reliable per verifikasi live 2026-07-10 -- TikTok Trends
+    # actor gagal 2x, Instagram memang tidak punya halaman trending publik)
+    trends_sweep_queries: list[str] = [
+        "viral hari ini",
+        "trending Indonesia",
+        "lagi rame",
+    ]
+
+    # Jadwal (WIB) -- 3 sumber jalan dulu, gabungan/triangulasi PALING
+    # TERAKHIR (butuh data hari itu dari ketiganya + Google Trends)
+    twitter_trends_schedule_hour: int = 14
+    twitter_trends_schedule_minute: int = 0
+    tiktok_trends_schedule_hour: int = 14
+    tiktok_trends_schedule_minute: int = 15
+    instagram_trends_schedule_hour: int = 14
+    instagram_trends_schedule_minute: int = 30
+    trends_combined_schedule_hour: int = 15
+    trends_combined_schedule_minute: int = 0
+
     # Jadwal Celery Beat (WIB) — bisa diganti via .env tanpa ubah kode.
     # Default: viral discovery jalan 2 jam sebelum scrape supaya topik yang
     # ditemukan punya kesempatan discrape di hari yang sama.

@@ -41,6 +41,7 @@ celery_app = Celery(
         "app.workers.tiktok_trending_worker",
         "app.workers.twitter_trending_worker",
         "app.workers.news_worker",
+        "app.workers.trends_worker",
     ],
 )
 
@@ -134,6 +135,40 @@ celery_app.conf.update(
             "schedule": crontab(
                 hour=settings.news_discovery_schedule_hour,
                 minute=settings.news_discovery_schedule_minute,
+            ),
+        },
+        # Multi-Signal Trend Discovery — pipeline MANDIRI (app/services/trends/),
+        # TIDAK menyentuh viral_discovery_service.py/kode platform manapun yang
+        # sudah ada. Urutan jadwal SENGAJA: Twitter dulu (sumber paling objektif),
+        # baru TikTok/Instagram (pakai topik Twitter hari ini sbg query
+        # pencarian), gabungan/triangulasi PALING TERAKHIR (butuh ketiganya +
+        # Google Trends + YouTube TrendingTopic baca-saja).
+        "twitter-trends-daily": {
+            "task": "workers.trends.twitter_discovery",
+            "schedule": crontab(
+                hour=settings.twitter_trends_schedule_hour,
+                minute=settings.twitter_trends_schedule_minute,
+            ),
+        },
+        "tiktok-trends-daily": {
+            "task": "workers.trends.tiktok_discovery",
+            "schedule": crontab(
+                hour=settings.tiktok_trends_schedule_hour,
+                minute=settings.tiktok_trends_schedule_minute,
+            ),
+        },
+        "instagram-trends-daily": {
+            "task": "workers.trends.instagram_discovery",
+            "schedule": crontab(
+                hour=settings.instagram_trends_schedule_hour,
+                minute=settings.instagram_trends_schedule_minute,
+            ),
+        },
+        "trends-combined-daily": {
+            "task": "workers.trends.combined_discovery",
+            "schedule": crontab(
+                hour=settings.trends_combined_schedule_hour,
+                minute=settings.trends_combined_schedule_minute,
             ),
         },
         # YouTube: fetch trending Indonesia setiap hari jam 12.00 WIB
