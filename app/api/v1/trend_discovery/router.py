@@ -24,17 +24,27 @@ POST /trend-discovery/run                — trigger manual satu pipeline
                                             tanpa nunggu jadwal
 GET  /trend-discovery/timeline            — volume topik dari waktu ke waktu
                                             (multi-series). Default AUTO-
-                                            DISCOVER topik ter-ramai (dari
-                                            entitas NER) di rentang tanggal
-                                            yang diminta -- tidak perlu tau
-                                            nama topiknya duluan, cuma perlu
-                                            date_from/date_to. `keywords`
-                                            opsional utk override manual.
-                                            TIDAK terikat 5-sumber
-                                            triangulasi di atas, independen.
+                                            DISCOVER topik ter-ramai (word
+                                            count di posts.content) di
+                                            rentang tanggal yang diminta --
+                                            tidak perlu tau nama topiknya
+                                            duluan, cuma perlu date_from/
+                                            date_to. `keywords` opsional utk
+                                            override manual.
+                                            `include_topic_clusters=true`
+                                            (opsional, SATU response yang
+                                            sama) -- kata yang sering muncul
+                                            BARENGAN otomatis digabung jadi
+                                            satu "topik gabungan" (mis.
+                                            "prabowo bank indonesia
+                                            danantara"), tanpa perlu
+                                            definisi filter manual. TIDAK
+                                            terikat 5-sumber triangulasi di
+                                            atas, independen.
 """
 from __future__ import annotations
 
+import itertools
 from datetime import date, datetime, time, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -312,6 +322,17 @@ _STOPWORDS = {
     "amp", "nbsp", "quot", "lt", "gt", "apos",
 }
 
+# Ambang co-occurrence utk clustering topik (include_topic_clusters=true):
+# dua kata digabung jadi satu cluster kalau jumlah post yang mengandung
+# KEDUA kata itu >= rasio ini dari total mention kata yang LEBIH JARANG di
+# antara pasangan itu (mirip Jaccard, bukan hitungan mentah -- supaya adil
+# lintas kata dgn frekuensi beda jauh). Sama filosofinya dgn threshold
+# overlap-kata 0.5 yang dipakai combined_trend_service.py utk triangulasi
+# lintas-sumber -- di sini dipilih lebih rendah (0.3) krn co-occurrence
+# dalam TEKS (butuh 2 kata di post yang SAMA) secara alami lebih jarang
+# terjadi drpd overlap kata ANTAR topik string.
+_COOCCUR_RATIO_THRESHOLD = 0.3
+
 
 @router.get("/timeline", response_model=dict, summary="Volume topik dari waktu ke waktu (auto-discover ATAU keyword manual)")
 async def get_trend_timeline(
@@ -323,6 +344,7 @@ async def get_trend_timeline(
     interval: str = Query(default="hour", pattern="^(hour|day)$", description="Granularitas bucket: hour atau day"),
     platform: str | None = Query(default=None, description="Filter opsional ke satu platform saja. Kosong (default): semua platform digabung"),
     include_platform_breakdown: bool = Query(default=False, description="True: tiap topik juga dapat breakdown per platform (respons jauh lebih besar). Default False: cuma `total` gabungan per topik, respons ringkas"),
+    include_topic_clusters: bool = Query(default=False, description="True: kata yang sering muncul BARENGAN di post yang sama otomatis digabung jadi satu 'topik gabungan' (field topic_clusters di respons) -- utk chart 'Number per search/filter', TANPA definisi filter manual"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -368,6 +390,16 @@ async def get_trend_timeline(
     Default respons CUMA `total` gabungan per topik (ringkas). Set
     `include_platform_breakdown=true` kalau butuh breakdown per platform
     juga (respons jadi ~6x lebih besar).
+
+    **Topik gabungan (opsional):** set `include_topic_clusters=true` utk
+    dapat field `topic_clusters` tambahan -- kata-kata di `keywords` yang
+    SERING MUNCUL BARENGAN di post yang sama (co-occurrence, bukan definisi
+    filter manual) otomatis digabung jadi satu "topik" (mis. kata "prabowo",
+    "bank", "indonesia", "danantara" yang sering nyambung di post yang sama
+    -> jadi satu cluster "prabowo bank indonesia danantara"). Tiap cluster
+    dapat `total_mentions` + `total` (bucket per hari/jam) yang SAMA
+    strukturnya dengan per-kata di `series` -- cocok utk chart ranking
+    "Number per search/filter" ATAU timeline per topik gabungan.
     """
     if platform and platform not in _VALID_PLATFORMS:
         raise HTTPException(status_code=422, detail=f"platform harus salah satu: {', '.join(sorted(_VALID_PLATFORMS))}")
@@ -437,6 +469,7 @@ async def get_trend_timeline(
             raise HTTPException(status_code=422, detail="maks 10 keyword per request")
 
     series: dict[str, dict] = {}
+    mentions_by_word: dict[str, int] = {}
     for kw in kw_list:
         rows = (await db.execute(text(f"""
             SELECT date_trunc(:trunc_unit, published_at) AS bucket, platform, count(*) AS cnt
@@ -457,6 +490,7 @@ async def get_trend_timeline(
             totals_by_bucket[r["bucket"]] = totals_by_bucket.get(r["bucket"], 0) + r["cnt"]
 
         total_mentions = sum(totals_by_bucket.values())
+        mentions_by_word[kw] = total_mentions
         kw_series = {
             "total_mentions": total_mentions,
             "total": [
@@ -474,7 +508,7 @@ async def get_trend_timeline(
             }
         series[kw] = kw_series
 
-    return build_success_response({
+    response_body = {
         "mode":       "auto_discover" if auto_mode else "manual_keywords",
         "date_from":  since_aligned.date().isoformat(),
         "date_to":    (until - timedelta(seconds=1)).date().isoformat(),
@@ -484,4 +518,122 @@ async def get_trend_timeline(
         "platform":   platform or "all",
         "keywords":   kw_list,
         "series":     series,
-    })
+    }
+
+    if include_topic_clusters and len(kw_list) >= 2:
+        response_body["topic_clusters"] = await _build_topic_clusters(
+            db, kw_list, mentions_by_word, since_aligned, until, trunc_unit,
+            all_buckets, platform_clause_posts, platform_param,
+        )
+    elif include_topic_clusters:
+        # < 2 kata -- tidak ada pasangan utk dicek co-occurrence, tiap kata
+        # jadi cluster sendiri (kalau ada 1 kata) atau kosong (0 kata).
+        response_body["topic_clusters"] = [
+            {"label": kw, "words": [kw], **series[kw]} for kw in kw_list
+        ]
+
+    return build_success_response(response_body)
+
+
+async def _build_topic_clusters(
+    db: AsyncSession,
+    words: list[str],
+    mentions_by_word: dict[str, int],
+    since_aligned: datetime,
+    until: datetime,
+    trunc_unit: str,
+    all_buckets: list[datetime],
+    platform_clause_posts: str,
+    platform_param: dict,
+) -> list[dict]:
+    """
+    Cluster kata-kata di `words` yang SERING MUNCUL BARENGAN di post yang
+    sama (co-occurrence), TANPA definisi filter manual -- lihat catatan
+    metodologi _COOCCUR_RATIO_THRESHOLD. Union-find sederhana (bukan
+    embedding/ML), sengaja mulai simpel dulu sama seperti pendekatan
+    triangulasi di combined_trend_service.py.
+
+    CATATAN soal union-find: sifatnya TRANSITIF ("chaining") -- kalau A-B
+    lolos ambang DAN B-C lolos ambang, A/B/C digabung jadi 1 cluster walau
+    A-C sendiri TIDAK pernah dicek langsung lolos ambang atau tidak. Ini
+    perilaku NORMAL utk union-find, bukan bug -- kalau hasilnya kelihatan
+    "kegabung semua jadi 1 cluster besar" utk suatu rentang tanggal, itu
+    tandanya topik-topik itu memang saling nyambung erat di data (mis. semua
+    bagian dari 1 peristiwa besar) -- solusinya naikkan _COOCCUR_RATIO_THRESHOLD,
+    bukan ganti algoritma dulu (upgrade ke clustering yang lebih ketat/
+    embedding kalau cara sederhana ini terbukti tidak cukup, sesuai prinsip
+    "mulai sederhana dulu" yang sama dipakai combined_trend_service.py).
+    """
+    n = len(words)
+    pairs = list(itertools.combinations(range(n), 2))
+
+    cooccur_params: dict = {"since": since_aligned, "until": until, **platform_param}
+    for i, w in enumerate(words):
+        cooccur_params[f"w{i}"] = f"%{w}%"
+
+    select_clauses = [
+        f"count(*) FILTER (WHERE content ILIKE :w{i} AND content ILIKE :w{j}) AS c_{i}_{j}"
+        for i, j in pairs
+    ]
+    cooccur_row = (await db.execute(text(f"""
+        SELECT {', '.join(select_clauses)}
+        FROM posts
+        WHERE published_at >= :since AND published_at < :until AND published_at IS NOT NULL
+          {platform_clause_posts}
+    """), cooccur_params)).mappings().first()
+
+    # Union-find: gabungkan indeks kata yang co-occurrence-nya lolos ambang.
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    for i, j in pairs:
+        cooccur = cooccur_row[f"c_{i}_{j}"] or 0
+        denom = min(mentions_by_word[words[i]], mentions_by_word[words[j]])
+        if denom > 0 and (cooccur / denom) >= _COOCCUR_RATIO_THRESHOLD:
+            union(i, j)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    clusters = []
+    for indices in groups.values():
+        cluster_words = [words[i] for i in indices]
+        or_clause = " OR ".join(f"content ILIKE :cw{k}" for k in range(len(indices)))
+        cluster_params = {f"cw{k}": f"%{cluster_words[k]}%" for k in range(len(indices))}
+
+        rows = (await db.execute(text(f"""
+            SELECT date_trunc(:trunc_unit, published_at) AS bucket, count(*) AS cnt
+            FROM posts
+            WHERE published_at >= :since AND published_at < :until AND published_at IS NOT NULL
+              AND ({or_clause})
+              {platform_clause_posts}
+            GROUP BY bucket
+        """), {
+            "trunc_unit": trunc_unit, "since": since_aligned, "until": until,
+            **cluster_params, **platform_param,
+        })).mappings().all()
+
+        totals_by_bucket = {r["bucket"]: r["cnt"] for r in rows}
+        clusters.append({
+            "label": " ".join(cluster_words),
+            "words": cluster_words,
+            "total_mentions": sum(totals_by_bucket.values()),
+            "total": [
+                {"bucket": b.isoformat(), "count": totals_by_bucket.get(b, 0)}
+                for b in all_buckets
+            ],
+        })
+
+    clusters.sort(key=lambda c: c["total_mentions"], reverse=True)
+    return clusters
