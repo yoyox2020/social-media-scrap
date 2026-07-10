@@ -22,7 +22,7 @@ from collections import Counter
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select, text
+from sqlalchemy import and_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.users.models import User
@@ -462,7 +462,9 @@ async def _scrape_now_and_respond(
 
 @router.get("/trending", response_model=dict, summary="Topik trending Twitter dari trend_recommendations")
 async def get_twitter_trending(
-    recommendation_date: date | None = Query(default=None, description="Default: hari ini"),
+    recommendation_date: date | None = Query(default=None, description="Filter tanggal tunggal. Default: hari ini (kalau date_from/date_to juga kosong)"),
+    date_from: date | None = Query(default=None, description="Filter dari tanggal (YYYY-MM-DD), inklusif — diabaikan kalau recommendation_date diisi"),
+    date_to: date | None = Query(default=None, description="Filter sampai tanggal (YYYY-MM-DD), inklusif — diabaikan kalau recommendation_date diisi"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -473,14 +475,35 @@ async def get_twitter_trending(
 
     Scraping otomatis berjalan tiap hari (Celery Beat, jadwal di .env), maksimal
     `settings.twitter_trend_daily_budget` topik/hari (urut score tertinggi).
+
+    **Filter tanggal:** `recommendation_date` (tanggal tunggal) PALING
+    diprioritaskan. Kalau kosong, pakai `date_from`/`date_to` (salah satu
+    boleh kosong — rentang terbuka). Kalau ketiganya kosong, default hari ini.
     """
     from app.domain.trend_recommendations.models import TrendRecommendation
 
-    target_date = recommendation_date or date.today()
+    resolved_from: date | None
+    resolved_to: date | None
+    if recommendation_date:
+        date_filter = TrendRecommendation.recommendation_date == recommendation_date
+        resolved_from = resolved_to = recommendation_date
+    elif date_from or date_to:
+        conditions = []
+        if date_from:
+            conditions.append(TrendRecommendation.recommendation_date >= date_from)
+        if date_to:
+            conditions.append(TrendRecommendation.recommendation_date <= date_to)
+        date_filter = and_(*conditions)
+        resolved_from, resolved_to = date_from, date_to
+    else:
+        today = date.today()
+        date_filter = TrendRecommendation.recommendation_date == today
+        resolved_from = resolved_to = today
+
     topics = (await db.scalars(
         select(TrendRecommendation)
-        .where(TrendRecommendation.recommendation_date == target_date)
-        .order_by(TrendRecommendation.score.desc())
+        .where(date_filter)
+        .order_by(TrendRecommendation.recommendation_date.desc(), TrendRecommendation.score.desc())
     )).all()
 
     tw_topics = []
@@ -495,10 +518,12 @@ async def get_twitter_trending(
     if not tw_topics:
         return build_success_response({
             "platform":      "twitter",
-            "date":          target_date.isoformat(),
+            "date":          resolved_from.isoformat() if resolved_from == resolved_to and resolved_from else None,
+            "date_from":     resolved_from.isoformat() if resolved_from else None,
+            "date_to":       resolved_to.isoformat() if resolved_to else None,
             "total_topics":  0,
             "daily_budget":  settings.twitter_trend_daily_budget,
-            "message": "Belum ada topik trending Twitter untuk tanggal ini. Submit via POST /twitter/discover.",
+            "message": "Belum ada topik trending Twitter untuk filter tanggal ini. Coba perlebar date_from/date_to, atau submit via POST /twitter/discover.",
             "topics": [],
         })
 
@@ -566,6 +591,7 @@ async def get_twitter_trending(
             "topic":              topic.topic,
             "score":              topic.score,
             "status":             topic.status,
+            "recommendation_date": topic.recommendation_date.isoformat(),
             "twitter_identifier": username,
             "sentiment": {
                 lbl: {
@@ -579,7 +605,9 @@ async def get_twitter_trending(
 
     return build_success_response({
         "platform":       "twitter",
-        "date":           target_date.isoformat(),
+        "date":           resolved_from.isoformat() if resolved_from == resolved_to and resolved_from else None,
+        "date_from":      resolved_from.isoformat() if resolved_from else None,
+        "date_to":        resolved_to.isoformat() if resolved_to else None,
         "total_topics":   len(result_topics),
         "daily_budget":   settings.twitter_trend_daily_budget,
         "schedule": (

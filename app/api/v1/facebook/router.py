@@ -20,7 +20,7 @@ from collections import Counter
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select, text
+from sqlalchemy import and_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.users.models import User
@@ -502,7 +502,9 @@ async def _scrape_now_and_respond(
 
 @router.get("/trending", response_model=dict, summary="Topik trending Facebook dari trend_recommendations")
 async def get_facebook_trending(
-    recommendation_date: date | None = Query(default=None, description="Default: hari ini"),
+    recommendation_date: date | None = Query(default=None, description="Filter tanggal tunggal. Default: hari ini (kalau date_from/date_to juga kosong)"),
+    date_from: date | None = Query(default=None, description="Filter dari tanggal (YYYY-MM-DD), inklusif — diabaikan kalau recommendation_date diisi"),
+    date_to: date | None = Query(default=None, description="Filter sampai tanggal (YYYY-MM-DD), inklusif — diabaikan kalau recommendation_date diisi"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -515,14 +517,37 @@ async def get_facebook_trending(
     `settings.facebook_trend_daily_budget` topik/hari (urut score tertinggi).
     `status='used'` berarti sudah discrape, `status='pending'` berarti masih
     menunggu giliran.
+
+    **Filter tanggal:** `recommendation_date` (tanggal tunggal) PALING
+    diprioritaskan. Kalau kosong, pakai `date_from`/`date_to` (salah satu
+    boleh kosong — rentang terbuka). Kalau ketiganya kosong, default hari ini.
+    Berguna kalau AI discovery hari ini belum/gagal jalan (mis. saldo provider
+    AI habis) — bisa lihat topik dari beberapa hari terakhir sekaligus.
     """
     from app.domain.trend_recommendations.models import TrendRecommendation
 
-    target_date = recommendation_date or date.today()
+    resolved_from: date | None
+    resolved_to: date | None
+    if recommendation_date:
+        date_filter = TrendRecommendation.recommendation_date == recommendation_date
+        resolved_from = resolved_to = recommendation_date
+    elif date_from or date_to:
+        conditions = []
+        if date_from:
+            conditions.append(TrendRecommendation.recommendation_date >= date_from)
+        if date_to:
+            conditions.append(TrendRecommendation.recommendation_date <= date_to)
+        date_filter = and_(*conditions)
+        resolved_from, resolved_to = date_from, date_to
+    else:
+        today = date.today()
+        date_filter = TrendRecommendation.recommendation_date == today
+        resolved_from = resolved_to = today
+
     topics = (await db.scalars(
         select(TrendRecommendation)
-        .where(TrendRecommendation.recommendation_date == target_date)
-        .order_by(TrendRecommendation.score.desc())
+        .where(date_filter)
+        .order_by(TrendRecommendation.recommendation_date.desc(), TrendRecommendation.score.desc())
     )).all()
 
     fb_topics = []
@@ -537,10 +562,12 @@ async def get_facebook_trending(
     if not fb_topics:
         return build_success_response({
             "platform":      "facebook",
-            "date":          target_date.isoformat(),
+            "date":          resolved_from.isoformat() if resolved_from == resolved_to and resolved_from else None,
+            "date_from":     resolved_from.isoformat() if resolved_from else None,
+            "date_to":       resolved_to.isoformat() if resolved_to else None,
             "total_topics":  0,
             "daily_budget":  settings.facebook_trend_daily_budget,
-            "message": "Belum ada topik trending Facebook untuk tanggal ini. Submit via POST /trend-recommendations.",
+            "message": "Belum ada topik trending Facebook untuk filter tanggal ini. Coba perlebar date_from/date_to, atau submit via POST /trend-recommendations.",
             "topics": [],
         })
 
@@ -606,6 +633,7 @@ async def get_facebook_trending(
             "topic":              topic.topic,
             "score":              topic.score,
             "status":             topic.status,
+            "recommendation_date": topic.recommendation_date.isoformat(),
             "facebook_identifier": username,
             "sentiment": {
                 lbl: {
@@ -619,7 +647,9 @@ async def get_facebook_trending(
 
     return build_success_response({
         "platform":       "facebook",
-        "date":           target_date.isoformat(),
+        "date":           resolved_from.isoformat() if resolved_from == resolved_to and resolved_from else None,
+        "date_from":      resolved_from.isoformat() if resolved_from else None,
+        "date_to":        resolved_to.isoformat() if resolved_to else None,
         "total_topics":   len(result_topics),
         "daily_budget":   settings.facebook_trend_daily_budget,
         "schedule": (
