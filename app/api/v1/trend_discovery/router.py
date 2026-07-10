@@ -279,28 +279,34 @@ _VALID_PLATFORMS = set(_ALL_PLATFORMS)
 _MAX_BUCKETS = 1000
 
 
-# NOT (huruf kecil semua DAN >=2 tanda hubung) -- buang noise fragmen URL
-# slug yang kadang ikut ter-NER dari teks navigasi/link situs News (lihat
-# docs analisis /news/analysis/summary, filter yang sama dipakai di sini).
-_ENTITY_NOISE_FILTER = "AND NOT (e.text = lower(e.text) AND (length(e.text) - length(replace(e.text, '-', ''))) >= 2)"
+# Auto-discover BERDASARKAN WORD COUNT (frekuensi kata mentah di
+# posts.content), BUKAN entitas NER -- diverifikasi 2026-07-10: NER penuh
+# (PERSON/ORGANIZATION/dst) SENGAJA cuma jalan utk News (run_ner=False utk
+# medsos, hemat compute worker-ai), jadi kalau auto-discover pakai entitas,
+# hasilnya cuma hashtag selama volume medsos > volume News. Word count TIDAK
+# punya keterbatasan itu -- jalan sama rata di SEMUA platform (posts.content
+# selalu ada, tidak tergantung pipeline NER opsional).
 
-# CATATAN PENTING soal auto-discover: NER penuh (PERSON/ORGANIZATION/EVENT/
-# LOCATION/dst, GLiNER) SENGAJA HANYA jalan utk News (`run_ner=True`, lihat
-# app/services/news/pipeline_service.py) -- platform medsos (Instagram/
-# Facebook/TikTok/Twitter) SENGAJA `run_ner=False` (keputusan sebelum
-# endpoint ini dibuat, demi hemat compute worker-ai). Diverifikasi live
-# 2026-07-10: 100% baris `entities` utk rentang tanggal manapun yang
-# didominasi medsos hasilnya entity_type='HASHTAG' semua (ekstraksi hashtag
-# sederhana, BUKAN GLiNER) -- jadi auto-discover di bawah ini efektifnya
-# "top hashtag", bukan "top entitas nyata (nama orang/organisasi)" selama
-# volume medsos > volume News. Hashtag generik non-topik (dipakai di HAMPIR
-# SEMUA video terlepas dari isinya, jadi tidak representatif "topik ramai")
-# dibuang di sini -- daftar ini BUKAN daftar lengkap, gampang ditambah.
-_GENERIC_HASHTAGS = {
-    "fyp", "fypage", "fypシ", "fypシ゚viral", "foryou", "foryoupage", "fypdongggggggg",
-    "viral", "trending", "trend", "viralvideo", "viraltiktok", "explore", "explorepage",
-    "capcut", "cut", "video", "reels", "reel", "shorts", "share", "like", "follow",
-    "followme", "xyzbca", "tiktok", "instagram", "instagood", "photooftheday",
+# Kata umum (Indonesia+Inggris) yang dibuang dari hasil word-count karena
+# terlalu generik utk jadi sinyal "topik" (function words, bukan konten) --
+# plus hashtag generik non-topik (dipakai di hampir semua post terlepas
+# isinya). Daftar ini BUKAN daftar lengkap, gampang ditambah.
+_STOPWORDS = {
+    "yang", "dan", "atau", "di", "ke", "dari", "ini", "itu", "untuk", "dengan",
+    "pada", "adalah", "akan", "juga", "tidak", "ada", "saat", "hari", "lagi",
+    "saya", "kita", "kami", "anda", "dia", "mereka", "tak", "gak", "nggak",
+    "ga", "sih", "deh", "dong", "kok", "aja", "saja", "banget", "bgt", "nya",
+    "karena", "kalau", "kalo", "jadi", "bisa", "harus", "sudah", "sdh", "udah",
+    "belum", "blm", "lebih", "kurang", "sangat", "oleh", "seperti", "tersebut",
+    "tanpa", "hingga", "sampai", "antara", "bagi", "atas", "bawah", "dalam",
+    "luar", "kata", "orang", "waktu", "tahun", "bulan", "para",
+    "the", "a", "an", "of", "in", "on", "for", "and", "or", "is", "to", "are",
+    "was", "were", "be", "been", "this", "that", "these", "those", "with",
+    "as", "at", "by", "from", "it", "its",
+    "fyp", "fypage", "foryou", "foryoupage", "viral", "trending", "trend",
+    "viralvideo", "viraltiktok", "explore", "explorepage", "capcut", "cut",
+    "video", "reels", "reel", "shorts", "share", "like", "follow", "followme",
+    "xyzbca", "tiktok", "instagram", "instagood", "photooftheday",
 }
 
 
@@ -323,21 +329,23 @@ async def get_trend_timeline(
     filter-nya TANGGAL, bukan platform — platform cuma filter opsional.
 
     **Dua mode pemilihan topik:**
-    1. `keywords` KOSONG (default) — AUTO-DISCOVER: `top_n` topik yang
-       paling banyak disebut (dari tabel `entities`) di rentang tanggal ini
-       otomatis dipilih dan di-chart, TANPA perlu tau nama topiknya duluan.
-       **PENTING**: NER penuh (nama orang/organisasi/dst) SENGAJA cuma
-       jalan utk News -- platform medsos cuma diekstrak HASHTAG-nya (bukan
-       GLiNER). Jadi selama volume medsos > volume News, hasil auto-discover
-       efektifnya "hashtag paling ramai", bukan "nama tokoh/isu paling
-       ramai". Hashtag generik non-topik (fyp, capcut, viral, dst) sudah
-       DIBUANG (lihat `_GENERIC_HASHTAGS`) tapi daftarnya tidak lengkap.
-    2. `keywords` diisi — MANUAL: pakai persis keyword yang dikasih (ILIKE
-       ke `posts.content`, cocok frasa apa saja termasuk yang bukan
-       entitas bersih).
+    1. `keywords` KOSONG (default) — AUTO-DISCOVER berdasarkan WORD COUNT:
+       `top_n` KATA yang paling sering muncul di `posts.content` (SEMUA
+       platform, TERMASUK News) pada rentang tanggal ini otomatis dipilih
+       dan di-chart, TANPA perlu tau kata apa yang lagi ramai duluan. Kata
+       umum/function word (yang, dan, untuk, dst) dan hashtag generik non-
+       topik (fyp, capcut, dst) dibuang duluan (lihat `_STOPWORDS`, daftar
+       tidak lengkap, gampang ditambah) supaya sinyalnya lebih bermakna.
+       BUKAN entitas NER -- word count jalan SAMA RATA di semua platform,
+       tidak tergantung NER (yang sengaja cuma aktif utk News, lihat
+       app/services/news/pipeline_service.py).
+    2. `keywords` diisi — MANUAL: pakai persis keyword/frasa yang dikasih.
 
-    TIDAK terikat ke 5-sumber triangulasi endpoint lain di modul ini — baca
-    langsung dari `posts`/`entities`, lintas SEMUA platform termasuk News.
+    Kedua mode SAMA PERSIS cara pencarian mention-nya: ILIKE ke
+    `posts.content` (cocok substring, bukan exact-word) — konsisten,
+    auto-discover cuma beda di cara MEMILIH kata awal saja.
+
+    TIDAK terikat ke 5-sumber triangulasi endpoint lain di modul ini.
 
     **Dibucket dari `published_at`** (waktu ASLI post/artikel dibuat, BUKAN
     `collected_at`/waktu kita scrape) — lihat docs/trend-discovery-api.md
@@ -390,28 +398,34 @@ async def get_trend_timeline(
         cursor += step
 
     platform_clause_posts = "AND platform = :platform" if platform else ""
-    platform_clause_joined = "AND p.platform = :platform" if platform else ""
     platform_param = {"platform": platform} if platform else {}
     platforms_to_show = [platform] if platform else _ALL_PLATFORMS
 
     auto_mode = not keywords
     if auto_mode:
+        # Tokenisasi + hitung frekuensi kata LANGSUNG di SQL (buang tanda
+        # baca, split whitespace, lowercase) -- dilakukan di DB, bukan tarik
+        # semua content ke Python, supaya efisien (artikel News bisa sampai
+        # 20rb karakter/baris).
         top_rows = (await db.execute(text(f"""
-            SELECT e.text, count(DISTINCT e.post_id) AS mentions
-            FROM entities e
-            JOIN posts p ON p.id = e.post_id
-            WHERE p.published_at >= :since AND p.published_at < :until AND p.published_at IS NOT NULL
-              AND lower(e.text) != ALL(:generic_hashtags)
-              {_ENTITY_NOISE_FILTER}
-              {platform_clause_joined}
-            GROUP BY e.text
+            SELECT word, count(*) AS mentions
+            FROM (
+                SELECT lower(unnest(regexp_split_to_array(
+                    regexp_replace(content, '[^\\w\\s]', ' ', 'g'), '\\s+'
+                ))) AS word
+                FROM posts
+                WHERE published_at >= :since AND published_at < :until AND published_at IS NOT NULL
+                  {platform_clause_posts}
+            ) w
+            WHERE length(word) > 2 AND word != ALL(:stopwords)
+            GROUP BY word
             ORDER BY mentions DESC
             LIMIT :top_n
         """), {
             "since": since_aligned, "until": until, "top_n": top_n,
-            "generic_hashtags": list(_GENERIC_HASHTAGS), **platform_param,
+            "stopwords": list(_STOPWORDS), **platform_param,
         })).mappings().all()
-        kw_list = [r["text"] for r in top_rows]
+        kw_list = [r["word"] for r in top_rows]
     else:
         kw_list = [k.strip() for k in keywords.split(",") if k.strip()]
         if not kw_list:
@@ -421,31 +435,17 @@ async def get_trend_timeline(
 
     series: dict[str, dict] = {}
     for kw in kw_list:
-        if auto_mode:
-            rows = (await db.execute(text(f"""
-                SELECT date_trunc(:trunc_unit, p.published_at) AS bucket, p.platform, count(DISTINCT p.id) AS cnt
-                FROM entities e
-                JOIN posts p ON p.id = e.post_id
-                WHERE e.text = :entity_text
-                  AND p.published_at >= :since AND p.published_at < :until AND p.published_at IS NOT NULL
-                  {platform_clause_joined}
-                GROUP BY bucket, p.platform
-            """), {
-                "trunc_unit": trunc_unit, "entity_text": kw,
-                "since": since_aligned, "until": until, **platform_param,
-            })).mappings().all()
-        else:
-            rows = (await db.execute(text(f"""
-                SELECT date_trunc(:trunc_unit, published_at) AS bucket, platform, count(*) AS cnt
-                FROM posts
-                WHERE published_at >= :since AND published_at < :until AND published_at IS NOT NULL
-                  AND content ILIKE :pattern
-                  {platform_clause_posts}
-                GROUP BY bucket, platform
-            """), {
-                "trunc_unit": trunc_unit, "pattern": f"%{kw}%",
-                "since": since_aligned, "until": until, **platform_param,
-            })).mappings().all()
+        rows = (await db.execute(text(f"""
+            SELECT date_trunc(:trunc_unit, published_at) AS bucket, platform, count(*) AS cnt
+            FROM posts
+            WHERE published_at >= :since AND published_at < :until AND published_at IS NOT NULL
+              AND content ILIKE :pattern
+              {platform_clause_posts}
+            GROUP BY bucket, platform
+        """), {
+            "trunc_unit": trunc_unit, "pattern": f"%{kw}%",
+            "since": since_aligned, "until": until, **platform_param,
+        })).mappings().all()
 
         counts_by_bucket_platform: dict[tuple, int] = {}
         totals_by_bucket: dict[datetime, int] = {}
