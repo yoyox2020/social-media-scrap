@@ -284,6 +284,25 @@ _MAX_BUCKETS = 1000
 # docs analisis /news/analysis/summary, filter yang sama dipakai di sini).
 _ENTITY_NOISE_FILTER = "AND NOT (e.text = lower(e.text) AND (length(e.text) - length(replace(e.text, '-', ''))) >= 2)"
 
+# CATATAN PENTING soal auto-discover: NER penuh (PERSON/ORGANIZATION/EVENT/
+# LOCATION/dst, GLiNER) SENGAJA HANYA jalan utk News (`run_ner=True`, lihat
+# app/services/news/pipeline_service.py) -- platform medsos (Instagram/
+# Facebook/TikTok/Twitter) SENGAJA `run_ner=False` (keputusan sebelum
+# endpoint ini dibuat, demi hemat compute worker-ai). Diverifikasi live
+# 2026-07-10: 100% baris `entities` utk rentang tanggal manapun yang
+# didominasi medsos hasilnya entity_type='HASHTAG' semua (ekstraksi hashtag
+# sederhana, BUKAN GLiNER) -- jadi auto-discover di bawah ini efektifnya
+# "top hashtag", bukan "top entitas nyata (nama orang/organisasi)" selama
+# volume medsos > volume News. Hashtag generik non-topik (dipakai di HAMPIR
+# SEMUA video terlepas dari isinya, jadi tidak representatif "topik ramai")
+# dibuang di sini -- daftar ini BUKAN daftar lengkap, gampang ditambah.
+_GENERIC_HASHTAGS = {
+    "fyp", "fypage", "fypシ", "fypシ゚viral", "foryou", "foryoupage", "fypdongggggggg",
+    "viral", "trending", "trend", "viralvideo", "viraltiktok", "explore", "explorepage",
+    "capcut", "cut", "video", "reels", "reel", "shorts", "share", "like", "follow",
+    "followme", "xyzbca", "tiktok", "instagram", "instagood", "photooftheday",
+}
+
 
 @router.get("/timeline", response_model=dict, summary="Volume topik dari waktu ke waktu (auto-discover ATAU keyword manual)")
 async def get_trend_timeline(
@@ -294,6 +313,7 @@ async def get_trend_timeline(
     hours: int = Query(default=24, ge=1, le=168, description="Dipakai HANYA kalau date_from & date_to keduanya kosong — rentang jam ke belakang dari sekarang, maks 168 (7 hari)"),
     interval: str = Query(default="hour", pattern="^(hour|day)$", description="Granularitas bucket: hour atau day"),
     platform: str | None = Query(default=None, description="Filter opsional ke satu platform saja. Kosong (default): semua platform digabung"),
+    include_platform_breakdown: bool = Query(default=False, description="True: tiap topik juga dapat breakdown per platform (respons jauh lebih besar). Default False: cuma `total` gabungan per topik, respons ringkas"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -304,11 +324,14 @@ async def get_trend_timeline(
 
     **Dua mode pemilihan topik:**
     1. `keywords` KOSONG (default) — AUTO-DISCOVER: `top_n` topik yang
-       paling banyak disebut (dari tabel `entities`, hasil NER) di rentang
-       tanggal ini otomatis dipilih dan di-chart, TANPA perlu tau nama
-       topiknya duluan. Ini yang bikin chart bisa langsung tampil banyak
-       garis begitu buka halaman (mirip tool social listening pada
-       umumnya) -- match PERSIS ke entitas (bukan substring).
+       paling banyak disebut (dari tabel `entities`) di rentang tanggal ini
+       otomatis dipilih dan di-chart, TANPA perlu tau nama topiknya duluan.
+       **PENTING**: NER penuh (nama orang/organisasi/dst) SENGAJA cuma
+       jalan utk News -- platform medsos cuma diekstrak HASHTAG-nya (bukan
+       GLiNER). Jadi selama volume medsos > volume News, hasil auto-discover
+       efektifnya "hashtag paling ramai", bukan "nama tokoh/isu paling
+       ramai". Hashtag generik non-topik (fyp, capcut, viral, dst) sudah
+       DIBUANG (lihat `_GENERIC_HASHTAGS`) tapi daftarnya tidak lengkap.
     2. `keywords` diisi — MANUAL: pakai persis keyword yang dikasih (ILIKE
        ke `posts.content`, cocok frasa apa saja termasuk yang bukan
        entitas bersih).
@@ -325,8 +348,15 @@ async def get_trend_timeline(
     diprioritaskan) — kalau kosong, fallback ke `hours` (rentang N jam ke
     belakang dari sekarang).
 
-    Bucket KOSONG tetap muncul dengan `count: 0` (tidak di-skip) supaya
-    chart line tidak berlubang.
+    **Volume data saat ini masih tipis** (diverifikasi live: topik
+    ter-ramai pun biasanya cuma 2-3 mention per 10 hari) — banyak bucket
+    `count: 0` di respons adalah REALITA data, bukan bug. Bucket KOSONG
+    tetap muncul dengan `count: 0` (tidak di-skip) supaya chart line tidak
+    berlubang.
+
+    Default respons CUMA `total` gabungan per topik (ringkas). Set
+    `include_platform_breakdown=true` kalau butuh breakdown per platform
+    juga (respons jadi ~6x lebih besar).
     """
     if platform and platform not in _VALID_PLATFORMS:
         raise HTTPException(status_code=422, detail=f"platform harus salah satu: {', '.join(sorted(_VALID_PLATFORMS))}")
@@ -371,12 +401,16 @@ async def get_trend_timeline(
             FROM entities e
             JOIN posts p ON p.id = e.post_id
             WHERE p.published_at >= :since AND p.published_at < :until AND p.published_at IS NOT NULL
+              AND lower(e.text) != ALL(:generic_hashtags)
               {_ENTITY_NOISE_FILTER}
               {platform_clause_joined}
             GROUP BY e.text
             ORDER BY mentions DESC
             LIMIT :top_n
-        """), {"since": since_aligned, "until": until, "top_n": top_n, **platform_param})).mappings().all()
+        """), {
+            "since": since_aligned, "until": until, "top_n": top_n,
+            "generic_hashtags": list(_GENERIC_HASHTAGS), **platform_param,
+        })).mappings().all()
         kw_list = [r["text"] for r in top_rows]
     else:
         kw_list = [k.strip() for k in keywords.split(",") if k.strip()]
@@ -419,19 +453,23 @@ async def get_trend_timeline(
             counts_by_bucket_platform[(r["bucket"], r["platform"])] = r["cnt"]
             totals_by_bucket[r["bucket"]] = totals_by_bucket.get(r["bucket"], 0) + r["cnt"]
 
-        series[kw] = {
+        total_mentions = sum(totals_by_bucket.values())
+        kw_series = {
+            "total_mentions": total_mentions,
             "total": [
                 {"bucket": b.isoformat(), "count": totals_by_bucket.get(b, 0)}
                 for b in all_buckets
             ],
-            "by_platform": {
+        }
+        if include_platform_breakdown:
+            kw_series["by_platform"] = {
                 p: [
                     {"bucket": b.isoformat(), "count": counts_by_bucket_platform.get((b, p), 0)}
                     for b in all_buckets
                 ]
                 for p in platforms_to_show
-            },
-        }
+            }
+        series[kw] = kw_series
 
     return build_success_response({
         "mode":       "auto_discover" if auto_mode else "manual_keywords",
