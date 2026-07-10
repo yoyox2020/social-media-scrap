@@ -41,6 +41,16 @@ GET  /trend-discovery/timeline            — volume topik dari waktu ke waktu
                                             definisi filter manual. TIDAK
                                             terikat 5-sumber triangulasi di
                                             atas, independen.
+GET  /trend-discovery/geo-distribution    — distribusi nama tempat (negara/
+                                            kota) yang DISEBUT di post+
+                                            komentar (BUKAN geotag/lokasi
+                                            asli poster -- data itu tidak
+                                            ada di platform manapun yang
+                                            kita scrape, sudah diverifikasi).
+                                            Sama metodologi tanggal/platform
+                                            dgn /timeline, `from_posts` bisa
+                                            dicocokkan langsung ke angka di
+                                            /timeline (posts-only), independen.
 """
 from __future__ import annotations
 
@@ -637,3 +647,175 @@ async def _build_topic_clusters(
 
     clusters.sort(key=lambda c: c["total_mentions"], reverse=True)
     return clusters
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Geo distribution (nama tempat yang DISEBUT di teks -- BUKAN geotag/lokasi
+# asli poster, lihat catatan metodologi di docstring endpoint)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Diverifikasi 2026-07-10: TIDAK ADA field lokasi/geotag di metadata/raw_data
+# platform manapun yang sudah kita scrape (Instagram/Facebook/TikTok/Twitter/
+# YouTube/News semua dicek langsung ke database, kosong semua) -- jadi
+# pendekatan di sini BUKAN "lokasi asli si poster", tapi "nama tempat yang
+# DISEBUT di teks post/komentar" (mirip cara kerja tool media-monitoring pada
+# umumnya utk topik ekonomi/politik -- peta menunjukkan negara/kota mana yang
+# jadi SUBJEK pembicaraan, bukan geolocation audiens).
+#
+# Daftar BUKAN lengkap, gampang ditambah -- beberapa nama kota Indonesia yang
+# JUGA kata umum Bahasa Indonesia (mis. "Malang"=sial, "Medan"=arena/lapangan,
+# "Solo"=sendirian dlm konteks tertentu) SENGAJA DIKELUARKAN/diganti nama
+# alternatif (mis. "Surakarta" bukan "Solo") supaya tidak banyak
+# false-positive. "Padang" tetap dimasukkan meski kadang muncul dlm konteks
+# kuliner ("nasi padang") -- risiko diterima, masih cukup terkait geografis.
+_GEO_GAZETTEER: dict[str, tuple[float, float]] = {
+    # Kota/wilayah Indonesia
+    "Jakarta": (-6.2088, 106.8456),
+    "Surabaya": (-7.2575, 112.7521),
+    "Bandung": (-6.9175, 107.6191),
+    "Semarang": (-6.9932, 110.4203),
+    "Makassar": (-5.1477, 119.4327),
+    "Palembang": (-2.9761, 104.7754),
+    "Yogyakarta": (-7.7956, 110.3695),
+    "Denpasar": (-8.6705, 115.2126),
+    "Bali": (-8.4095, 115.1889),
+    "Batam": (1.0456, 104.0305),
+    "Bogor": (-6.5971, 106.8060),
+    "Bekasi": (-6.2383, 106.9756),
+    "Depok": (-6.4025, 106.7942),
+    "Tangerang": (-6.1783, 106.6319),
+    "Balikpapan": (-1.2379, 116.8529),
+    "Manado": (1.4748, 124.8421),
+    "Padang": (-0.9471, 100.4172),
+    "Pekanbaru": (0.5333, 101.4500),
+    "Banjarmasin": (-3.3186, 114.5944),
+    "Jayapura": (-2.5337, 140.7181),
+    "Pontianak": (-0.0263, 109.3425),
+    "Samarinda": (-0.5022, 117.1536),
+    "Surakarta": (-7.5755, 110.8243),
+    "Aceh": (4.6951, 96.7494),
+    "Lampung": (-4.5586, 105.4068),
+    "Indonesia": (-2.5, 118.0),
+    # Negara/region dunia (relevan utk topik internasional, mis. Piala Dunia)
+    "Amerika Serikat": (37.0902, -95.7129),
+    "Inggris": (55.3781, -3.4360),
+    "Argentina": (-38.4161, -63.6167),
+    "Brasil": (-14.2350, -51.9253),
+    "Prancis": (46.6034, 1.8883),
+    "Belgia": (50.5039, 4.4699),
+    "Maroko": (31.7917, -7.0926),
+    "Jerman": (51.1657, 10.4515),
+    "China": (35.8617, 104.1954),
+    "Jepang": (36.2048, 138.2529),
+    "Australia": (-25.2744, 133.7751),
+    "India": (20.5937, 78.9629),
+    "Arab Saudi": (23.8859, 45.0792),
+    "Singapura": (1.3521, 103.8198),
+    "Malaysia": (4.2105, 101.9758),
+    "Qatar": (25.3548, 51.1839),
+    "Belanda": (52.1326, 5.2913),
+    "Spanyol": (40.4637, -3.7492),
+    "Italia": (41.8719, 12.5674),
+    "Portugal": (39.3999, -8.2245),
+    "Korea Selatan": (35.9078, 127.7669),
+    "Rusia": (61.5240, 105.3188),
+    "Mesir": (26.8206, 30.8025),
+}
+
+
+@router.get("/geo-distribution", response_model=dict, summary="Distribusi nama tempat yang disebut di post+komentar")
+async def get_geo_distribution(
+    date_from: date | None = Query(default=None, description="Filter dari tanggal (YYYY-MM-DD). Kosong: date_to - 7 hari (atau dari `hours` kalau date_to juga kosong)"),
+    date_to: date | None = Query(default=None, description="Filter sampai tanggal (YYYY-MM-DD), inklusif. Kosong: hari ini"),
+    hours: int = Query(default=24, ge=1, le=168, description="Dipakai HANYA kalau date_from & date_to keduanya kosong — rentang jam ke belakang dari sekarang, maks 168 (7 hari)"),
+    platform: str | None = Query(default=None, description="Filter opsional ke satu platform saja. Kosong (default): semua platform digabung"),
+    min_mentions: int = Query(default=1, ge=1, description="Buang tempat dengan mention di bawah angka ini dari hasil"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Distribusi geografis berdasarkan NAMA TEMPAT yang DISEBUT di teks post
+    DAN komentar (dihubungkan lewat `comments.post_id = posts.id`) -- lihat
+    catatan metodologi penting di komentar kode `_GEO_GAZETTEER` di atas:
+    ini BUKAN geotag/lokasi asli poster (data itu TIDAK ADA di platform
+    manapun yang kita scrape, sudah diverifikasi langsung ke database), tapi
+    "tempat mana yang jadi SUBJEK pembicaraan" -- cocok utk topik
+    ekonomi/politik/berita yang menyebut negara/kota spesifik.
+
+    Independen TOTAL dari endpoint lain di modul ini (tidak reuse
+    auto-discover kata/cluster) -- daftar tempat SUDAH ditentukan
+    (`_GEO_GAZETTEER`), bukan hasil auto-discovery.
+
+    Return list tempat yang match (mention > 0, difilter `min_mentions`),
+    tiap item ada `lat`/`lng` siap dipakai taruh marker di peta.
+    """
+    if platform and platform not in _VALID_PLATFORMS:
+        raise HTTPException(status_code=422, detail=f"platform harus salah satu: {', '.join(sorted(_VALID_PLATFORMS))}")
+
+    now = datetime.now(timezone.utc)
+    if date_from or date_to:
+        resolved_date_to = date_to or now.date()
+        resolved_date_from = date_from or (resolved_date_to - timedelta(days=7))
+        since_aligned = datetime.combine(resolved_date_from, time.min, tzinfo=timezone.utc)
+        until = datetime.combine(resolved_date_to, time.min, tzinfo=timezone.utc) + timedelta(days=1)
+    else:
+        until = now
+        since_aligned = now - timedelta(hours=hours)
+
+    places = list(_GEO_GAZETTEER.keys())
+    params: dict = {"since": since_aligned, "until": until}
+    for i, place in enumerate(places):
+        params[f"g{i}"] = f"%{place}%"
+
+    select_clauses = [f"count(*) FILTER (WHERE content ILIKE :g{i}) AS c{i}" for i in range(len(places))]
+
+    post_platform_clause = "AND platform = :platform" if platform else ""
+    post_params = dict(params)
+    if platform:
+        post_params["platform"] = platform
+    posts_row = (await db.execute(text(f"""
+        SELECT {', '.join(select_clauses)}
+        FROM posts
+        WHERE published_at >= :since AND published_at < :until AND published_at IS NOT NULL
+          {post_platform_clause}
+    """), post_params)).mappings().first()
+
+    comment_platform_clause = "AND p.platform = :platform" if platform else ""
+    comment_select_clauses = [f"count(*) FILTER (WHERE c.content ILIKE :g{i}) AS c{i}" for i in range(len(places))]
+    comment_params = dict(params)
+    if platform:
+        comment_params["platform"] = platform
+    comments_row = (await db.execute(text(f"""
+        SELECT {', '.join(comment_select_clauses)}
+        FROM comments c
+        JOIN posts p ON p.id = c.post_id
+        WHERE c.published_at >= :since AND c.published_at < :until AND c.published_at IS NOT NULL
+          {comment_platform_clause}
+    """), comment_params)).mappings().first()
+
+    results = []
+    for i, place in enumerate(places):
+        post_count = posts_row[f"c{i}"] or 0
+        comment_count = comments_row[f"c{i}"] or 0
+        total = post_count + comment_count
+        if total >= min_mentions:
+            lat, lng = _GEO_GAZETTEER[place]
+            results.append({
+                "place": place,
+                "lat": lat,
+                "lng": lng,
+                "total_mentions": total,
+                "from_posts": post_count,
+                "from_comments": comment_count,
+            })
+
+    results.sort(key=lambda r: r["total_mentions"], reverse=True)
+
+    return build_success_response({
+        "date_from": since_aligned.date().isoformat(),
+        "date_to": (until - timedelta(seconds=1)).date().isoformat(),
+        "platform": platform or "all",
+        "total_places_checked": len(places),
+        "total_places_matched": len(results),
+        "places": results,
+    })
