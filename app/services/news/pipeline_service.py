@@ -69,7 +69,12 @@ async def save_news_articles(
             content=article["content"][:MAX_CONTENT_CHARS],
             author=article.get("author"),
             url=url,
-            published_at=None,  # Firecrawl scrape tidak selalu kasih tanggal publish yang bisa diandalkan
+            # Tanggal publish ASLI dari metadata situs sumber (JSON-LD/OG tag),
+            # lihat _parse_published_at() di app/integrations/firecrawl/news.py --
+            # None kalau situs tidak menyediakannya (mis. halaman homepage/
+            # kategori, bukan artikel tunggal) -- SENGAJA tidak di-fallback ke
+            # collected_at, itu bukan waktu kejadian asli.
+            published_at=article.get("published_at"),
             collected_at=datetime.now(timezone.utc),
             metadata_={
                 "title":     article.get("title"),

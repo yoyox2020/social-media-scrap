@@ -21,6 +21,7 @@ provider Ollama — tidak perlu API key baru.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -43,6 +44,47 @@ def _first(val: Any) -> str | None:
                 return str(v)
         return None
     return str(val) if val else None
+
+
+def _parse_published_at(meta: dict[str, Any]) -> datetime | None:
+    """
+    Coba ekstrak tanggal publish ASLI artikel dari metadata Firecrawl
+    (JSON-LD schema.org / OG tags situs sumber) -- key beda-beda per situs,
+    dicoba berurutan. Diverifikasi LIVE 2026-07-10 lewat data yang sudah
+    tersimpan: `datePublished`/`uploadDate` (JSON-LD) dan
+    `article:published_time`/`publishedTime` (OG tag) semuanya PERNAH
+    ditemukan valid di artikel nyata.
+
+    CATATAN PENTING: banyak URL hasil search Firecrawl ternyata halaman
+    HOMEPAGE/KATEGORI/TAG (bukan artikel tunggal, mis. kompas.com,
+    cnnindonesia.com tanpa path) -- situs itu WAJAR tidak punya field ini
+    sama sekali (bukan bug, homepage memang tidak punya "tanggal publish").
+    Beberapa situs (mis. liputan6.com) bahkan kadang taruh placeholder
+    template YANG BELUM DIRENDER, contoh nyata: `"article:published_time":
+    "[publishdate]"` -- BUKAN tanggal valid, akan gagal parse & dilewati di
+    sini, TIDAK boleh sampai nyangkut sebagai string mentah ke kolom
+    datetime (akan error di level DB kalau dipaksa).
+
+    Return None kalau tidak ada kandidat valid -- JANGAN fallback ke waktu
+    scrape kita (`collected_at`), itu bukan waktu kejadian asli dan akan
+    bikin timeline menyesatkan (numpuk di jam scraping, bukan jam publish).
+    """
+    candidates = [
+        meta.get("datePublished"),
+        meta.get("article:published_time"),
+        meta.get("publishedTime"),
+        meta.get("uploadDate"),
+    ]
+    for raw in candidates:
+        raw = _first(raw)
+        if not raw:
+            continue
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            logger.debug("_parse_published_at: nilai bukan tanggal valid, dilewati: %r", raw)
+            continue
+    return None
 
 
 async def search_news_by_keyword(query: str, max_results: int = 5) -> list[dict[str, Any]]:
@@ -98,6 +140,7 @@ async def scrape_article(url: str) -> dict[str, Any] | None:
     title = _first(meta.get("title")) or _first(meta.get("og:title"))
     image = _first(meta.get("og:image")) or _first(meta.get("ogImage"))
     author = _first(meta.get("author"))
+    published_at = _parse_published_at(meta)
 
     return {
         "url": url,
@@ -105,5 +148,6 @@ async def scrape_article(url: str) -> dict[str, Any] | None:
         "content": markdown,
         "image_url": image,
         "author": author,
+        "published_at": published_at,
         "raw_metadata": meta,
     }
