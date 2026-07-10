@@ -22,18 +22,20 @@ POST /trend-discovery/run                — trigger manual satu pipeline
                                             (?source=twitter|tiktok|instagram|
                                             combined), buat testing/debug
                                             tanpa nunggu jadwal
-GET  /trend-discovery/timeline            — volume mention per keyword dari
-                                            waktu ke waktu (multi-series,
-                                            lintas SEMUA platform termasuk
-                                            News), utk chart timeline/deteksi
-                                            burst. TIDAK terikat 5-sumber
-                                            triangulasi di atas -- baca
-                                            langsung dari `posts` (ILIKE
-                                            content), independen.
+GET  /trend-discovery/timeline            — volume topik dari waktu ke waktu
+                                            (multi-series). Default AUTO-
+                                            DISCOVER topik ter-ramai (dari
+                                            entitas NER) di rentang tanggal
+                                            yang diminta -- tidak perlu tau
+                                            nama topiknya duluan, cuma perlu
+                                            date_from/date_to. `keywords`
+                                            opsional utk override manual.
+                                            TIDAK terikat 5-sumber
+                                            triangulasi di atas, independen.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, text
@@ -272,44 +274,60 @@ async def trigger_trend_discovery(
 # Timeline (volume mention per keyword dari waktu ke waktu)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_VALID_PLATFORMS = {"instagram", "facebook", "tiktok", "twitter", "youtube", "news"}
+_ALL_PLATFORMS = ["instagram", "facebook", "tiktok", "twitter", "youtube", "news"]
+_VALID_PLATFORMS = set(_ALL_PLATFORMS)
+_MAX_BUCKETS = 1000
 
 
-@router.get("/timeline", response_model=dict, summary="Volume mention per keyword dari waktu ke waktu (multi-series)")
+# NOT (huruf kecil semua DAN >=2 tanda hubung) -- buang noise fragmen URL
+# slug yang kadang ikut ter-NER dari teks navigasi/link situs News (lihat
+# docs analisis /news/analysis/summary, filter yang sama dipakai di sini).
+_ENTITY_NOISE_FILTER = "AND NOT (e.text = lower(e.text) AND (length(e.text) - length(replace(e.text, '-', ''))) >= 2)"
+
+
+@router.get("/timeline", response_model=dict, summary="Volume topik dari waktu ke waktu (auto-discover ATAU keyword manual)")
 async def get_trend_timeline(
-    keywords: str = Query(..., description="Daftar keyword/frasa dipisah koma, mis. 'Prabowo,Bank Indonesia'"),
-    hours: int = Query(default=24, ge=1, le=168, description="Rentang waktu ke belakang dari sekarang (jam), maks 168 (7 hari)"),
+    keywords: str | None = Query(default=None, description="Daftar keyword/frasa dipisah koma. KOSONG (default): auto-pilih `top_n` topik paling banyak disebut di rentang tanggal ini -- tidak perlu tau nama topiknya duluan."),
+    top_n: int = Query(default=6, ge=1, le=15, description="Jumlah topik auto-pilih kalau `keywords` kosong"),
+    date_from: date | None = Query(default=None, description="Filter dari tanggal (YYYY-MM-DD). Kosong: date_to - 7 hari (atau dari `hours` kalau date_to juga kosong)"),
+    date_to: date | None = Query(default=None, description="Filter sampai tanggal (YYYY-MM-DD), inklusif. Kosong: hari ini"),
+    hours: int = Query(default=24, ge=1, le=168, description="Dipakai HANYA kalau date_from & date_to keduanya kosong — rentang jam ke belakang dari sekarang, maks 168 (7 hari)"),
     interval: str = Query(default="hour", pattern="^(hour|day)$", description="Granularitas bucket: hour atau day"),
-    platform: str | None = Query(default=None, description="Filter satu platform (instagram/facebook/tiktok/twitter/youtube/news). Kosong = semua platform digabung"),
+    platform: str | None = Query(default=None, description="Filter opsional ke satu platform saja. Kosong (default): semua platform digabung"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Volume mention per keyword dari waktu ke waktu (multi-series time-series)
-    — dipakai utk chart timeline / deteksi lonjakan pembicaraan (burst),
-    lintas SEMUA platform (`posts` generik, TERMASUK News) kecuali difilter
-    `platform`. TIDAK terikat ke 5-sumber triangulasi endpoint lain di modul
-    ini — baca langsung `posts.content` (ILIKE, bukan exact match/NER)
-    supaya bisa cocok frasa apa saja, termasuk yang tidak ada di
-    `trend_recommendations` sama sekali.
+    Volume topik dari waktu ke waktu (multi-series time-series) — dipakai
+    utk chart timeline / deteksi lonjakan pembicaraan (burst). Sumbu utama
+    filter-nya TANGGAL, bukan platform — platform cuma filter opsional.
+
+    **Dua mode pemilihan topik:**
+    1. `keywords` KOSONG (default) — AUTO-DISCOVER: `top_n` topik yang
+       paling banyak disebut (dari tabel `entities`, hasil NER) di rentang
+       tanggal ini otomatis dipilih dan di-chart, TANPA perlu tau nama
+       topiknya duluan. Ini yang bikin chart bisa langsung tampil banyak
+       garis begitu buka halaman (mirip tool social listening pada
+       umumnya) -- match PERSIS ke entitas (bukan substring).
+    2. `keywords` diisi — MANUAL: pakai persis keyword yang dikasih (ILIKE
+       ke `posts.content`, cocok frasa apa saja termasuk yang bukan
+       entitas bersih).
+
+    TIDAK terikat ke 5-sumber triangulasi endpoint lain di modul ini — baca
+    langsung dari `posts`/`entities`, lintas SEMUA platform termasuk News.
 
     **Dibucket dari `published_at`** (waktu ASLI post/artikel dibuat, BUKAN
     `collected_at`/waktu kita scrape) — lihat docs/trend-discovery-api.md
-    soal kelengkapan data per platform (sosmed+YouTube ~100% lengkap; News
-    tergantung apakah situs sumber menyediakan tanggal publish di metadata,
-    baru diperbaiki 2026-07-10, lihat app/integrations/firecrawl/news.py).
-    Post/artikel yang `published_at`-nya NULL otomatis tidak ikut terhitung
-    (bukan hilang diam-diam — TIDAK ADA cara membucket sesuatu yang waktu
-    aslinya tidak diketahui).
+    soal kelengkapan data per platform. Post/artikel yang `published_at`-nya
+    NULL otomatis tidak ikut terhitung.
+
+    **Filter waktu:** `date_from`/`date_to` (tanggal kalender, PALING
+    diprioritaskan) — kalau kosong, fallback ke `hours` (rentang N jam ke
+    belakang dari sekarang).
 
     Bucket KOSONG tetap muncul dengan `count: 0` (tidak di-skip) supaya
     chart line tidak berlubang.
     """
-    kw_list = [k.strip() for k in keywords.split(",") if k.strip()]
-    if not kw_list:
-        raise HTTPException(status_code=422, detail="keywords tidak boleh kosong")
-    if len(kw_list) > 10:
-        raise HTTPException(status_code=422, detail="maks 10 keyword per request")
     if platform and platform not in _VALID_PLATFORMS:
         raise HTTPException(status_code=422, detail=f"platform harus salah satu: {', '.join(sorted(_VALID_PLATFORMS))}")
 
@@ -317,47 +335,112 @@ async def get_trend_timeline(
     step = timedelta(hours=1) if interval == "hour" else timedelta(days=1)
 
     now = datetime.now(timezone.utc)
-    since_aligned = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=hours)
-    if interval == "day":
-        since_aligned = since_aligned.replace(hour=0)
+    if date_from or date_to:
+        resolved_date_to = date_to or now.date()
+        resolved_date_from = date_from or (resolved_date_to - timedelta(days=7))
+        since_aligned = datetime.combine(resolved_date_from, time.min, tzinfo=timezone.utc)
+        until = datetime.combine(resolved_date_to, time.min, tzinfo=timezone.utc) + timedelta(days=1)
+    else:
+        until = now
+        since_aligned = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=hours)
+        if interval == "day":
+            since_aligned = since_aligned.replace(hour=0)
+
+    bucket_count = int((until - since_aligned) / step) + 1
+    if bucket_count > _MAX_BUCKETS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Rentang waktu terlalu lebar ({bucket_count} bucket) — perlebar interval ke 'day' atau perkecil rentang tanggal (maks {_MAX_BUCKETS} bucket)",
+        )
 
     all_buckets: list[datetime] = []
     cursor = since_aligned
-    while cursor <= now:
+    while cursor < until:
         all_buckets.append(cursor)
         cursor += step
 
-    platform_clause = "AND platform = :platform" if platform else ""
+    platform_clause_posts = "AND platform = :platform" if platform else ""
+    platform_clause_joined = "AND p.platform = :platform" if platform else ""
+    platform_param = {"platform": platform} if platform else {}
+    platforms_to_show = [platform] if platform else _ALL_PLATFORMS
 
-    series: dict[str, list[dict]] = {}
+    auto_mode = not keywords
+    if auto_mode:
+        top_rows = (await db.execute(text(f"""
+            SELECT e.text, count(DISTINCT e.post_id) AS mentions
+            FROM entities e
+            JOIN posts p ON p.id = e.post_id
+            WHERE p.published_at >= :since AND p.published_at < :until AND p.published_at IS NOT NULL
+              {_ENTITY_NOISE_FILTER}
+              {platform_clause_joined}
+            GROUP BY e.text
+            ORDER BY mentions DESC
+            LIMIT :top_n
+        """), {"since": since_aligned, "until": until, "top_n": top_n, **platform_param})).mappings().all()
+        kw_list = [r["text"] for r in top_rows]
+    else:
+        kw_list = [k.strip() for k in keywords.split(",") if k.strip()]
+        if not kw_list:
+            raise HTTPException(status_code=422, detail="keywords tidak boleh kosong string")
+        if len(kw_list) > 10:
+            raise HTTPException(status_code=422, detail="maks 10 keyword per request")
+
+    series: dict[str, dict] = {}
     for kw in kw_list:
-        rows = (await db.execute(text(f"""
-            SELECT date_trunc(:trunc_unit, published_at) AS bucket, count(*) AS cnt
-            FROM posts
-            WHERE published_at >= :since
-              AND published_at IS NOT NULL
-              AND content ILIKE :pattern
-              {platform_clause}
-            GROUP BY bucket
-        """), {
-            "trunc_unit": trunc_unit,
-            "since": since_aligned,
-            "pattern": f"%{kw}%",
-            **({"platform": platform} if platform else {}),
-        })).mappings().all()
+        if auto_mode:
+            rows = (await db.execute(text(f"""
+                SELECT date_trunc(:trunc_unit, p.published_at) AS bucket, p.platform, count(DISTINCT p.id) AS cnt
+                FROM entities e
+                JOIN posts p ON p.id = e.post_id
+                WHERE e.text = :entity_text
+                  AND p.published_at >= :since AND p.published_at < :until AND p.published_at IS NOT NULL
+                  {platform_clause_joined}
+                GROUP BY bucket, p.platform
+            """), {
+                "trunc_unit": trunc_unit, "entity_text": kw,
+                "since": since_aligned, "until": until, **platform_param,
+            })).mappings().all()
+        else:
+            rows = (await db.execute(text(f"""
+                SELECT date_trunc(:trunc_unit, published_at) AS bucket, platform, count(*) AS cnt
+                FROM posts
+                WHERE published_at >= :since AND published_at < :until AND published_at IS NOT NULL
+                  AND content ILIKE :pattern
+                  {platform_clause_posts}
+                GROUP BY bucket, platform
+            """), {
+                "trunc_unit": trunc_unit, "pattern": f"%{kw}%",
+                "since": since_aligned, "until": until, **platform_param,
+            })).mappings().all()
 
-        counts_by_bucket = {r["bucket"]: r["cnt"] for r in rows}
-        series[kw] = [
-            {"bucket": b.isoformat(), "count": counts_by_bucket.get(b, 0)}
-            for b in all_buckets
-        ]
+        counts_by_bucket_platform: dict[tuple, int] = {}
+        totals_by_bucket: dict[datetime, int] = {}
+        for r in rows:
+            counts_by_bucket_platform[(r["bucket"], r["platform"])] = r["cnt"]
+            totals_by_bucket[r["bucket"]] = totals_by_bucket.get(r["bucket"], 0) + r["cnt"]
+
+        series[kw] = {
+            "total": [
+                {"bucket": b.isoformat(), "count": totals_by_bucket.get(b, 0)}
+                for b in all_buckets
+            ],
+            "by_platform": {
+                p: [
+                    {"bucket": b.isoformat(), "count": counts_by_bucket_platform.get((b, p), 0)}
+                    for b in all_buckets
+                ]
+                for p in platforms_to_show
+            },
+        }
 
     return build_success_response({
-        "hours": hours,
-        "interval": interval,
-        "platform": platform or "all",
-        "since": since_aligned.isoformat(),
-        "until": now.isoformat(),
-        "keywords": kw_list,
-        "series": series,
+        "mode":       "auto_discover" if auto_mode else "manual_keywords",
+        "date_from":  since_aligned.date().isoformat(),
+        "date_to":    (until - timedelta(seconds=1)).date().isoformat(),
+        "since":      since_aligned.isoformat(),
+        "until":      until.isoformat(),
+        "interval":   interval,
+        "platform":   platform or "all",
+        "keywords":   kw_list,
+        "series":     series,
     })
