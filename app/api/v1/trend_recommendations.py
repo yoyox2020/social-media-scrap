@@ -37,24 +37,39 @@ async def create_trend_recommendations(
     return build_success_response(result)
 
 
-@router.get("", response_model=dict, summary="Lihat topik viral tersimpan (max 20/hari)")
+@router.get("", response_model=dict, summary="Lihat/cari topik viral tersimpan")
 async def list_trend_recommendations(
-    recommendation_date: date | None = Query(default=None),
+    recommendation_date: date | None = Query(default=None, description="Filter tanggal tertentu. Kosong + topic kosong = default hari ini."),
     platform: str | None = Query(default=None, description="Filter topik yang punya related_accounts di platform ini"),
-    topic: str | None = Query(default=None, description="Cari topik (partial match)"),
+    topic: str | None = Query(default=None, description="Cari topik (partial match) -- LINTAS SEMUA TANGGAL kalau recommendation_date tidak diisi"),
     limit: int = Query(default=20, ge=1, le=20),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    target_date = recommendation_date or date.today()
-    stmt = select(TrendRecommendation).where(TrendRecommendation.recommendation_date == target_date)
+    """
+    Dua mode pencarian:
+    - `recommendation_date` DIISI -> topik pada tanggal itu saja (opsional
+      dipersempit `topic`/`platform`).
+    - `recommendation_date` KOSONG + `topic` DIISI -> search topik LINTAS
+      SEMUA TANGGAL (tidak dibatasi hari ini) -- supaya topik yang cuma
+      ditemukan di hari-hari sebelumnya tetap ketemu.
+    - Keduanya kosong -> default browse topik HARI INI (perilaku lama).
+    """
+    stmt = select(TrendRecommendation)
+
+    if recommendation_date:
+        stmt = stmt.where(TrendRecommendation.recommendation_date == recommendation_date)
+    elif not topic:
+        stmt = stmt.where(TrendRecommendation.recommendation_date == date.today())
+    # else: topic diisi tanpa recommendation_date -> sengaja TIDAK difilter
+    # tanggal, search lintas semua tanggal.
 
     if topic:
         stmt = stmt.where(TrendRecommendation.topic.ilike(f"%{topic}%"))
     if platform:
         stmt = stmt.where(TrendRecommendation.related_accounts.op("@>")([{"platform": platform}]))
 
-    stmt = stmt.order_by(TrendRecommendation.score.desc()).limit(limit)
+    stmt = stmt.order_by(TrendRecommendation.recommendation_date.desc(), TrendRecommendation.score.desc()).limit(limit)
 
     rows = (await db.execute(stmt)).scalars().all()
     return build_success_response(
