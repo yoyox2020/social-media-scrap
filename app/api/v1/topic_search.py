@@ -491,6 +491,79 @@ async def list_saved_topics(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: Semua Keyword yang Pernah Dicari (lintas semua topik+platform)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/topics/keywords", response_model=dict)
+async def list_all_searched_keywords(
+    limit: int = Query(default=50, ge=1, le=200, description="Maks jumlah keyword ditampilkan"),
+    offset: int = Query(default=0, ge=0),
+    limit_per_keyword: int = Query(default=10, ge=1, le=100, description="Maks sample post per keyword"),
+    include_sentiment: bool = Query(default=True),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Semua keyword yang PERNAH dimasukkan user lewat topik manapun yang masih
+    aktif, digabung jadi SATU daftar rata -- TIDAK perlu topic_id/keyword_id/
+    platform apa pun sbg filter. Tiap keyword otomatis dicari lintas SEMUA
+    platform sekaligus (`platforms=None` di tier_search.py berarti tanpa
+    filter platform, bukan platform kosong berarti tidak ada hasil).
+
+    Kalau keyword yang sama (case-insensitive) dipakai di lebih dari satu
+    topik (mis. "korupsi" ada di topik "Riset KPU" dan "Riset Hukum"), cuma
+    tampil SEKALI di sini -- field `topics` menunjukkan semua topik yang
+    memakainya.
+    """
+    from sqlalchemy.orm import selectinload
+    topics = (await db.scalars(
+        select(SearchTopic)
+        .options(selectinload(SearchTopic.topic_keywords))
+        .where(SearchTopic.is_active == True)
+    )).all()
+
+    dedup: dict[str, dict] = {}
+    for topic in topics:
+        for stk in topic.topic_keywords:
+            key = stk.keyword_text.strip().lower()
+            entry = dedup.setdefault(key, {"keyword": stk.keyword_text, "topics": [], "last_rescanned_at": None})
+            entry["topics"].append(topic.name)
+            if stk.last_rescanned_at and (
+                entry["last_rescanned_at"] is None or stk.last_rescanned_at > entry["last_rescanned_at"]
+            ):
+                entry["last_rescanned_at"] = stk.last_rescanned_at
+
+    all_keywords = sorted(dedup.values(), key=lambda e: e["keyword"].lower())
+    total_keywords = len(all_keywords)
+    page = all_keywords[offset: offset + limit]
+
+    items = []
+    for entry in page:
+        kw_text = entry["keyword"]
+        total_posts, total_comments = await tier_search.count_posts_and_comments_by_keyword(db, kw_text, None)
+        posts = await tier_search.find_posts_by_keyword(db, kw_text, None, limit_per_keyword)
+        item = {
+            "keyword": kw_text,
+            "topics": entry["topics"],
+            "total_posts": total_posts,
+            "total_comments": total_comments,
+            "platforms_found": sorted({p["platform"] for p in posts}),
+            "results": posts,
+            "last_rescanned_at": entry["last_rescanned_at"].isoformat() if entry["last_rescanned_at"] else None,
+        }
+        if include_sentiment and posts:
+            item["sentiment"] = await tier_search.get_sentiment_summary_by_keyword(db, kw_text, None)
+        items.append(item)
+
+    return build_success_response({
+        "total_keywords": total_keywords,
+        "offset": offset,
+        "limit": limit,
+        "keywords": items,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ENDPOINT: Detail Satu Topik
 # ─────────────────────────────────────────────────────────────────────────────
 
