@@ -555,9 +555,19 @@ async def search_saved_topic(
     now = datetime.now(timezone.utc)
 
     for stk in topic.topic_keywords:
+        # SENGAJA tidak pakai topic.auto_crawl di sini (beda dgn search_by_topics())
+        # -- itu nilai yang DI-PERSIST saat topik dibuat/disimpan, kalau kebetulan
+        # ke-set false (mis. sengaja auto_crawl=false saat 'Simpan Topik' krn
+        # cuma mau simpan definisi, bukan cari), topik itu akan PERMANEN tidak
+        # pernah bisa ditawari tier-3 lewat endpoint ini lagi -- tidak ada UI
+        # utk toggle auto_crawl balik (beda dgn schedule yang punya endpoint
+        # sendiri). confirm_third_party per-request SUDAH jadi gerbang keamanan
+        # yang cukup (persis spirit yang diminta user), jadi endpoint by-id ini
+        # selalu izinkan tier-3 kalau confirm_third_party=true, terlepas dari
+        # auto_crawl yang tersimpan.
         kw_result = await _search_keyword_tiered(
             db, stk.keyword_text, platforms, body.limit_per_keyword, body.include_sentiment,
-            topic.auto_crawl, body.confirm_third_party,
+            True, body.confirm_third_party,
         )
         kw_result["keyword_id"] = str(stk.keyword_id)
 
