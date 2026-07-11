@@ -37,6 +37,16 @@ search ulang dari awal.
 soft-delete (`is_active=False`) -- keyword & post/comment yang sudah
 ditemukan tetap tersimpan permanen, dan otomatis berhenti diambil jadwal
 berkala (task harian filter `is_active==True`).
+
+**Platform kosong = SEMUA platform.** Field `platforms` di POST /search/topics
+kalau tidak dikirim/kosong otomatis diisi SEMUA platform terdaftar (`_resolve_platforms()`),
+BUKAN cuma youtube seperti sebelumnya -- keputusan eksplisit user, cocok
+utk form 'buat topik' yang tidak punya selector platform sama sekali.
+
+**Cari ulang topik tersimpan:** POST /search/topics/{id}/search -- utk UI
+'pilih topik dari dropdown, klik Search' yang cuma tahu topic_id (tidak
+perlu kirim ulang name+keywords+platforms seperti POST /search/topics).
+Alur konfirmasi tier-3 SAMA PERSIS.
 """
 
 import uuid
@@ -72,7 +82,7 @@ class TopicItem(BaseModel):
 
 class TopicSearchRequest(BaseModel):
     topics: list[TopicItem] = Field(..., min_length=1)
-    platforms: list[str] = Field(default=["youtube"], description="Platform: youtube, instagram, facebook, tiktok, twitter, news")
+    platforms: list[str] = Field(default_factory=list, description="Platform: youtube, instagram, facebook, tiktok, twitter, news. KOSONG/tidak dikirim = otomatis SEMUA platform terdaftar.")
     limit_per_keyword: int = Field(default=10, ge=1, le=100)
     include_sentiment: bool = Field(default=True)
     include_comments: bool = Field(default=False)
@@ -87,6 +97,17 @@ class TopicSearchRequest(BaseModel):
 class TopicScheduleRequest(BaseModel):
     enabled: bool = Field(..., description="Aktif/nonaktifkan pencarian berkala")
     duration_days: int | None = Field(default=None, ge=1, le=90, description="Ubah durasi (hari), dihitung ulang dari SEKARANG. Kosong = pakai durasi yang sudah ada / default 7")
+
+
+class SavedTopicSearchRequest(BaseModel):
+    """Body utk POST /search/topics/{topic_id}/search -- cari ulang topik yang
+    SUDAH tersimpan pakai keyword/platform yang sudah di-set saat topik
+    dibuat, TANPA perlu kirim ulang name+keywords+platforms (beda dengan
+    POST /search/topics yang butuh payload penuh). Cocok utk UI dropdown
+    'pilih topik tersimpan' + tombol Search."""
+    limit_per_keyword: int = Field(default=10, ge=1, le=100)
+    include_sentiment: bool = Field(default=True)
+    confirm_third_party: bool = Field(default=False, description="Sama seperti di POST /search/topics -- wajib true baru tier-3 benar-benar dipanggil.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,6 +172,61 @@ def _resolve_schedule_fields(enable_recurring: bool, duration_days: int | None) 
         "schedule_started_at": now,
         "schedule_expires_at": now + timedelta(days=days),
     }
+
+
+def _resolve_platforms(platforms: list[str]) -> list[str]:
+    """Kosong/tidak dikirim = otomatis SEMUA platform terdaftar (keputusan
+    user eksplisit) -- dulu default cuma youtube, banyak topik lawas kena
+    default itu diam-diam padahal maksudnya lintas semua platform."""
+    if platforms:
+        return platforms
+    return sorted(discovery.ALL_SMART_SEARCH_PLATFORMS)
+
+
+async def _search_keyword_tiered(
+    db: AsyncSession,
+    kw_text: str,
+    platforms: list[str],
+    limit_per_keyword: int,
+    include_sentiment: bool,
+    auto_crawl: bool,
+    confirm_third_party: bool,
+) -> dict:
+    """Tier-1 (DB) -> tier-3 (third-party, HANYA kalau confirm_third_party=true)
+    utk SATU keyword. Dipakai search_by_topics() (topik baru/existing lewat
+    nama) DAN search_saved_topic() (topik tersimpan lewat topic_id) --
+    logic-nya identik, cuma beda dari mana kw_text/platforms berasal."""
+    kw_result: dict = {"keyword": kw_text, "status": "not_found", "total": 0, "posts": []}
+
+    posts = await tier_search.find_posts_by_keyword(db, kw_text, platforms, limit_per_keyword)
+    total = len(posts)
+    kw_result.update({"status": "found" if total > 0 else "empty", "total": total, "posts": posts})
+
+    if include_sentiment and total > 0:
+        kw_result["sentiment"] = await tier_search.get_sentiment_summary_by_keyword(db, kw_text, platforms)
+
+    if total == 0 and auto_crawl and not confirm_third_party:
+        kw_result["status"] = "needs_confirmation"
+        kw_result["confirmation_message"] = (
+            f"Data '{kw_text}' tidak ditemukan di database. Cari ke third-party "
+            f"({', '.join(platforms)})? Kirim ulang dengan confirm_third_party=true untuk melanjutkan."
+        )
+    elif total == 0 and auto_crawl and confirm_third_party:
+        crawl_results = {}
+        for platform in platforms:
+            if platform not in discovery.ALL_SMART_SEARCH_PLATFORMS:
+                crawl_results[platform] = {"error": f"platform '{platform}' tidak didukung"}
+                continue
+            source_tag = (
+                f"smart_search_{platform}" if platform in discovery.ACCOUNT_DISCOVERY_PLATFORMS else None
+            )
+            crawl_results[platform] = await discovery.run_tier3_discovery(
+                db, platform, kw_text, max_results=limit_per_keyword, source_tag=source_tag,
+            )
+        kw_result["crawl"] = crawl_results
+        kw_result["status"] = "crawling"
+
+    return kw_result
 
 
 async def _save_topic(
@@ -233,6 +309,7 @@ async def search_by_topics(
     """
     logger.info("topic_search", topics=[t.name for t in body.topics], user=str(current_user.id))
 
+    platforms = _resolve_platforms(body.platforms)
     topic_results = []
     crawling_keywords = []
     needs_confirmation_keywords = []
@@ -244,48 +321,17 @@ async def search_by_topics(
 
         for kw_text in topic.keywords:
             keyword = await _get_or_create_keyword(db, kw_text)
-            kw_result: dict = {
-                "keyword": kw_text,
-                "keyword_id": str(keyword.id) if keyword else None,
-                "status": "not_found",
-                "total": 0,
-                "posts": [],
-            }
 
-            posts = await tier_search.find_posts_by_keyword(db, kw_text, body.platforms, body.limit_per_keyword)
-            total = len(posts)
-            topic_total_posts += total
-            kw_result.update({"status": "found" if total > 0 else "empty", "total": total, "posts": posts})
+            kw_result = await _search_keyword_tiered(
+                db, kw_text, platforms, body.limit_per_keyword, body.include_sentiment,
+                body.auto_crawl, body.confirm_third_party,
+            )
+            kw_result["keyword_id"] = str(keyword.id) if keyword else None
+            topic_total_posts += kw_result["total"]
 
-            if body.include_sentiment and total > 0:
-                kw_result["sentiment"] = await tier_search.get_sentiment_summary_by_keyword(db, kw_text, body.platforms)
-
-            if total == 0 and body.auto_crawl and not body.confirm_third_party:
-                # Data tidak ada di DB -- JANGAN langsung panggil third-party
-                # (Apify/Firecrawl/YouTube API = biaya/kuota nyata). Lapor ke
-                # frontend dulu, minta izin eksplisit lewat konfirmasi user.
-                kw_result["status"] = "needs_confirmation"
-                kw_result["confirmation_message"] = (
-                    f"Data '{kw_text}' tidak ditemukan di database. Cari ke third-party "
-                    f"({', '.join(body.platforms)})? Kirim ulang request yang SAMA (topics+platforms) "
-                    f"dengan confirm_third_party=true untuk melanjutkan."
-                )
+            if kw_result["status"] == "needs_confirmation":
                 needs_confirmation_keywords.append(kw_text)
-
-            elif total == 0 and body.auto_crawl and body.confirm_third_party:
-                crawl_results = {}
-                for platform in body.platforms:
-                    if platform not in discovery.ALL_SMART_SEARCH_PLATFORMS:
-                        crawl_results[platform] = {"error": f"platform '{platform}' tidak didukung"}
-                        continue
-                    source_tag = (
-                        f"smart_search_{platform}" if platform in discovery.ACCOUNT_DISCOVERY_PLATFORMS else None
-                    )
-                    crawl_results[platform] = await discovery.run_tier3_discovery(
-                        db, platform, kw_text, max_results=body.limit_per_keyword, source_tag=source_tag,
-                    )
-                kw_result["crawl"] = crawl_results
-                kw_result["status"] = "crawling"
+            elif kw_result["status"] == "crawling":
                 crawling_keywords.append(kw_text)
 
             keyword_objects.append((kw_text, keyword))
@@ -297,7 +343,7 @@ async def search_by_topics(
                 topic_name=topic.name,
                 description=topic.description,
                 keyword_objects=keyword_objects,
-                platforms=body.platforms,
+                platforms=platforms,
                 scheduled_hour=body.scheduled_hour,
                 auto_crawl=body.auto_crawl,
                 enable_recurring=body.enable_recurring,
@@ -343,7 +389,7 @@ async def search_by_topics(
 
     return build_success_response({
         "status": overall,
-        "platforms": body.platforms,
+        "platforms": platforms,
         "total_topics": len(topic_results),
         "crawling_keywords": crawling_keywords,
         "needs_confirmation_keywords": needs_confirmation_keywords,
@@ -467,6 +513,100 @@ async def get_topic_detail(
         "schedule_expires_at": topic.schedule_expires_at.isoformat() if topic.schedule_expires_at else None,
         "created_at": topic.created_at.isoformat(),
         "updated_at": topic.updated_at.isoformat(),
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: Cari Ulang Topik Tersimpan (by ID)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/topics/{topic_id}/search", response_model=dict)
+async def search_saved_topic(
+    topic_id: uuid.UUID,
+    body: SavedTopicSearchRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Cari ulang SATU topik yang sudah tersimpan, pakai keyword+platform yang
+    sudah di-set saat topik dibuat -- cukup kirim topic_id, TIDAK perlu kirim
+    ulang name+keywords+platforms (beda dengan POST /search/topics). Cocok
+    utk UI 'pilih topik dari dropdown lalu klik Search'.
+
+    Alur SAMA PERSIS dengan POST /search/topics (tier-1 -> butuh
+    confirm_third_party=true baru tier-3 jalan, lihat docstring modul) --
+    cuma di sini scope-nya SATU topik yang sudah ada, bukan bikin/update
+    topik baru.
+    """
+    from sqlalchemy.orm import selectinload
+    topic = await db.scalar(
+        select(SearchTopic)
+        .options(selectinload(SearchTopic.topic_keywords))
+        .where(SearchTopic.id == topic_id, SearchTopic.is_active == True)
+    )
+    if not topic:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError(f"Topik {topic_id} tidak ditemukan atau sudah dinonaktifkan")
+
+    platforms = _resolve_platforms(topic.platforms)
+    keyword_results = []
+    crawling_keywords = []
+    needs_confirmation_keywords = []
+    now = datetime.now(timezone.utc)
+
+    for stk in topic.topic_keywords:
+        kw_result = await _search_keyword_tiered(
+            db, stk.keyword_text, platforms, body.limit_per_keyword, body.include_sentiment,
+            topic.auto_crawl, body.confirm_third_party,
+        )
+        kw_result["keyword_id"] = str(stk.keyword_id)
+
+        if kw_result["status"] == "needs_confirmation":
+            needs_confirmation_keywords.append(stk.keyword_text)
+        elif kw_result["status"] == "crawling":
+            crawling_keywords.append(stk.keyword_text)
+            # Update last_rescanned_at supaya rescan_service.py (jadwal
+            # berkala) tidak langsung ulang tier-3 lagi kalau topik ini
+            # JUGA schedule_recurring=true -- pencarian manual barusan
+            # sudah menghitung sbg "baru dicek" utk cooldown yang sama.
+            stk.last_rescanned_at = now
+
+        keyword_results.append(kw_result)
+
+    await db.commit()
+
+    total_posts = sum(kd["total"] for kd in keyword_results)
+    has_data = total_posts > 0
+    if crawling_keywords:
+        status = "partial" if has_data else "crawling"
+    elif needs_confirmation_keywords:
+        status = "partial_needs_confirmation" if has_data else "needs_confirmation"
+    else:
+        status = "ready"
+
+    note = None
+    if crawling_keywords:
+        note = "Keyword dengan status 'crawling' baru saja dicari ke third-party (Apify/Firecrawl/YouTube API)."
+    elif needs_confirmation_keywords:
+        note = (
+            "Keyword dengan status 'needs_confirmation' tidak ditemukan di database. "
+            "Panggil ulang endpoint ini dengan confirm_third_party=true untuk mencari ke third-party."
+        )
+
+    return build_success_response({
+        "topic_id": str(topic.id),
+        "topic": topic.name,
+        "platforms": platforms,
+        "status": status,
+        "total_posts": total_posts,
+        "status_per_keyword": {kd["keyword"]: kd["status"] for kd in keyword_results},
+        "sentiment_per_keyword": {
+            kd["keyword"]: kd.get("sentiment") for kd in keyword_results if kd.get("sentiment")
+        },
+        "results": [p for kd in keyword_results for p in kd.get("posts", [])],
+        "crawling_keywords": crawling_keywords,
+        "needs_confirmation_keywords": needs_confirmation_keywords,
+        "note": note,
     })
 
 
