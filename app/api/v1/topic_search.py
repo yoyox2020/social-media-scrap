@@ -14,7 +14,7 @@ platform sekaligus per topik:**
    platform lain kalau dipakai.
 2. Tier-2: (opsional, dipakai rescan_service.py utk jadwal berkala -- lihat
    file itu) cek trend_recommendations utk akun yang sudah pernah ketemu.
-3. Tier-3: search LANGSUNG ke third-party (Apify utk Facebook/Instagram/
+3. Tier-3: search ke third-party (Apify utk Facebook/Instagram/
    TikTok/Twitter, Firecrawl utk News, YouTube Data API/EnsembleData utk
    YouTube) lewat app/services/search_topics/discovery.py -- TANPA AI/LLM,
    reuse fungsi yang SUDAH ADA & terbukti dipakai endpoint /posts/search
@@ -25,6 +25,16 @@ platform sekaligus per topik:**
    berkala (`schedule_recurring=true`, lihat rescan_service.py) TETAP jalan
    otomatis tanpa konfirmasi ulang tiap hari -- user sudah memberi izin di
    muka saat mengaktifkan `enable_recurring=true`.
+
+   **Tier-3 yang dikonfirmasi TIDAK jalan sinkron di request ini** --
+   Apify/Firecrawl bisa 15-60+ detik per panggilan, kalau ada beberapa
+   keyword sekaligus gampang melebihi timeout browser/reverse-proxy.
+   Begitu `confirm_third_party=true`, endpoint cuma DAFTARKAN keyword yang
+   perlu dicari ke antrian Celery (workers.search_topics.process_confirmed_queue,
+   lihat queue_service.py) lalu LANGSUNG balas status 'queued' -- proses
+   sebenarnya jalan di background SATU KEYWORD PER SATU KEYWORD berurutan.
+   Cek hasilnya belakangan lewat GET /search/topics/{id} (posts baru
+   otomatis kehitung begitu tersimpan, tidak perlu endpoint status baru).
 
 **Pencarian berkala (opsional):** `enable_recurring=true` + `schedule_duration_days`
 menjadwalkan topik utk di-scan ulang tiap hari (Celery task
@@ -192,11 +202,18 @@ async def _search_keyword_tiered(
     auto_crawl: bool,
     confirm_third_party: bool,
 ) -> dict:
-    """Tier-1 (DB) -> tier-3 (third-party, HANYA kalau confirm_third_party=true)
+    """Tier-1 (DB) -> tandai utk antrian tier-3 (HANYA kalau confirm_third_party=true)
     utk SATU keyword. Dipakai search_by_topics() (topik baru/existing lewat
     nama) DAN search_saved_topic() (topik tersimpan lewat topic_id) --
-    logic-nya identik, cuma beda dari mana kw_text/platforms berasal."""
-    kw_result: dict = {"keyword": kw_text, "status": "not_found", "total": 0, "posts": []}
+    logic-nya identik, cuma beda dari mana kw_text/platforms berasal.
+
+    TIDAK memanggil third-party APAPUN di sini -- kalau confirm_third_party=true
+    & data kosong, cuma menyusun `queue_items` (dict siap dipakai Celery task
+    workers.search_topics.process_confirmed_queue). Pemanggil yang gabungkan
+    queue_items dari semua keyword lalu dispatch SATU task di background --
+    supaya request HTTP tidak menunggu Apify/Firecrawl (15-60+ detik per
+    panggilan), lihat app/services/search_topics/queue_service.py."""
+    kw_result: dict = {"keyword": kw_text, "status": "not_found", "total": 0, "posts": [], "queue_items": []}
 
     posts = await tier_search.find_posts_by_keyword(db, kw_text, platforms, limit_per_keyword)
     total = len(posts)
@@ -212,19 +229,16 @@ async def _search_keyword_tiered(
             f"({', '.join(platforms)})? Kirim ulang dengan confirm_third_party=true untuk melanjutkan."
         )
     elif total == 0 and auto_crawl and confirm_third_party:
-        crawl_results = {}
-        for platform in platforms:
-            if platform not in discovery.ALL_SMART_SEARCH_PLATFORMS:
-                crawl_results[platform] = {"error": f"platform '{platform}' tidak didukung"}
-                continue
-            source_tag = (
-                f"smart_search_{platform}" if platform in discovery.ACCOUNT_DISCOVERY_PLATFORMS else None
-            )
-            crawl_results[platform] = await discovery.run_tier3_discovery(
-                db, platform, kw_text, max_results=limit_per_keyword, source_tag=source_tag,
-            )
-        kw_result["crawl"] = crawl_results
-        kw_result["status"] = "crawling"
+        kw_result["status"] = "queued"
+        kw_result["queue_items"] = [
+            {
+                "keyword_text": kw_text,
+                "platform": platform,
+                "source_tag": f"smart_search_{platform}" if platform in discovery.ACCOUNT_DISCOVERY_PLATFORMS else None,
+                "limit": limit_per_keyword,
+            }
+            for platform in platforms if platform in discovery.ALL_SMART_SEARCH_PLATFORMS
+        ]
 
     return kw_result
 
@@ -302,22 +316,25 @@ async def search_by_topics(
     - Jika ada data → kembalikan posts + sentimen (status "found")
     - Jika belum ada + auto_crawl=true + confirm_third_party=false (default)
       → status "needs_confirmation", TIDAK memanggil third-party apa pun
-    - Jika belum ada + auto_crawl=true + confirm_third_party=true → search
-      LANGSUNG ke third-party tiap platform (Apify/Firecrawl/YouTube API,
-      TANPA AI/LLM), status "crawling"
+    - Jika belum ada + auto_crawl=true + confirm_third_party=true → keyword
+      masuk ANTRIAN background (Celery, status "queued"), diproses SATU PER
+      SATU berurutan (bukan sinkron di request ini -- Apify/Firecrawl bisa
+      15-60+ detik per panggilan, lihat queue_service.py). Cek hasil lewat
+      GET /search/topics/{id} atau /list setelah beberapa saat.
     - Topik disimpan ke DB → tampil di `GET /search/topics/list`
     """
     logger.info("topic_search", topics=[t.name for t in body.topics], user=str(current_user.id))
 
     platforms = _resolve_platforms(body.platforms)
     topic_results = []
-    crawling_keywords = []
+    queued_keywords = []
     needs_confirmation_keywords = []
 
     for topic in body.topics:
         keyword_results = []
         topic_total_posts = 0
         keyword_objects: list[tuple[str, Keyword | None]] = []
+        topic_queue_items: list[dict] = []
 
         for kw_text in topic.keywords:
             keyword = await _get_or_create_keyword(db, kw_text)
@@ -331,8 +348,9 @@ async def search_by_topics(
 
             if kw_result["status"] == "needs_confirmation":
                 needs_confirmation_keywords.append(kw_text)
-            elif kw_result["status"] == "crawling":
-                crawling_keywords.append(kw_text)
+            elif kw_result["status"] == "queued":
+                queued_keywords.append(kw_text)
+                topic_queue_items.extend(kw_result["queue_items"])
 
             keyword_objects.append((kw_text, keyword))
             keyword_results.append(kw_result)
@@ -353,6 +371,18 @@ async def search_by_topics(
         else:
             topic_id = None
 
+        if topic_queue_items:
+            await db.commit()  # pastikan topik/keyword ke-commit dulu sebelum task background jalan
+            from app.workers.search_topics_worker import process_confirmed_search_queue_task
+            # TIDAK pakai queue="default" -- bukan nama antrian nyata yang
+            # dikonsumsi worker manapun (lihat social_intel_worker/-ai's
+            # --queues=..., tidak ada "default" di situ). Biarkan tanpa
+            # argumen queue supaya masuk antrian default Celery sendiri
+            # ("celery"), yang MEMANG dikonsumsi semua worker container.
+            process_confirmed_search_queue_task.apply_async(
+                kwargs={"items": topic_queue_items, "topic_id": topic_id},
+            )
+
         topic_results.append({
             "topic_id": topic_id,
             "topic": topic.name.title(),
@@ -364,23 +394,26 @@ async def search_by_topics(
                 for kd in keyword_results if kd.get("sentiment")
             },
             "results": [p for kd in keyword_results for p in kd.get("posts", [])],
-            "crawling": [kd["keyword"] for kd in keyword_results if kd["status"] == "crawling"],
+            "queued": [kd["keyword"] for kd in keyword_results if kd["status"] == "queued"],
             "needs_confirmation": [kd["keyword"] for kd in keyword_results if kd["status"] == "needs_confirmation"],
         })
 
     await db.commit()
 
     has_data = any(t["total_posts"] > 0 for t in topic_results)
-    if crawling_keywords:
-        overall = "partial" if has_data else "crawling"
+    if queued_keywords:
+        overall = "partial" if has_data else "queued"
     elif needs_confirmation_keywords:
         overall = "partial_needs_confirmation" if has_data else "needs_confirmation"
     else:
         overall = "ready"
 
     note = None
-    if crawling_keywords:
-        note = "Keyword dengan status 'crawling' baru saja dicari ke third-party (Apify/Firecrawl/YouTube API)."
+    if queued_keywords:
+        note = (
+            "Keyword dengan status 'queued' sedang dicari ke third-party SATU PER SATU di background "
+            "(Apify/Firecrawl/YouTube API). Cek lagi lewat GET /search/topics/{topic_id} setelah beberapa saat."
+        )
     elif needs_confirmation_keywords:
         note = (
             "Keyword dengan status 'needs_confirmation' tidak ditemukan di database. "
@@ -391,7 +424,7 @@ async def search_by_topics(
         "status": overall,
         "platforms": platforms,
         "total_topics": len(topic_results),
-        "crawling_keywords": crawling_keywords,
+        "queued_keywords": queued_keywords,
         "needs_confirmation_keywords": needs_confirmation_keywords,
         "note": note,
         "topics": topic_results,
@@ -550,9 +583,9 @@ async def search_saved_topic(
 
     platforms = _resolve_platforms(topic.platforms)
     keyword_results = []
-    crawling_keywords = []
+    queued_keywords = []
     needs_confirmation_keywords = []
-    now = datetime.now(timezone.utc)
+    queue_items: list[dict] = []
 
     for stk in topic.topic_keywords:
         # SENGAJA tidak pakai topic.auto_crawl di sini (beda dgn search_by_topics())
@@ -573,30 +606,40 @@ async def search_saved_topic(
 
         if kw_result["status"] == "needs_confirmation":
             needs_confirmation_keywords.append(stk.keyword_text)
-        elif kw_result["status"] == "crawling":
-            crawling_keywords.append(stk.keyword_text)
-            # Update last_rescanned_at supaya rescan_service.py (jadwal
-            # berkala) tidak langsung ulang tier-3 lagi kalau topik ini
-            # JUGA schedule_recurring=true -- pencarian manual barusan
-            # sudah menghitung sbg "baru dicek" utk cooldown yang sama.
-            stk.last_rescanned_at = now
+        elif kw_result["status"] == "queued":
+            queued_keywords.append(stk.keyword_text)
+            queue_items.extend(kw_result["queue_items"])
 
         keyword_results.append(kw_result)
 
     await db.commit()
 
+    if queue_items:
+        # last_rescanned_at per keyword di-set di dalam Celery task saat
+        # item itu MULAI diproses (lihat queue_service.py), bukan di sini --
+        # supaya "sedang diproses" & "selesai diproses" sama2 tercermin walau
+        # task masih jalan lama di background.
+        from app.workers.search_topics_worker import process_confirmed_search_queue_task
+        # TIDAK pakai queue="default" -- lihat catatan di search_by_topics().
+        process_confirmed_search_queue_task.apply_async(
+            kwargs={"items": queue_items, "topic_id": str(topic.id)},
+        )
+
     total_posts = sum(kd["total"] for kd in keyword_results)
     has_data = total_posts > 0
-    if crawling_keywords:
-        status = "partial" if has_data else "crawling"
+    if queued_keywords:
+        status = "partial" if has_data else "queued"
     elif needs_confirmation_keywords:
         status = "partial_needs_confirmation" if has_data else "needs_confirmation"
     else:
         status = "ready"
 
     note = None
-    if crawling_keywords:
-        note = "Keyword dengan status 'crawling' baru saja dicari ke third-party (Apify/Firecrawl/YouTube API)."
+    if queued_keywords:
+        note = (
+            "Keyword dengan status 'queued' sedang dicari ke third-party SATU PER SATU di background "
+            "(Apify/Firecrawl/YouTube API). Cek lagi lewat GET /search/topics/{topic_id} setelah beberapa saat."
+        )
     elif needs_confirmation_keywords:
         note = (
             "Keyword dengan status 'needs_confirmation' tidak ditemukan di database. "
@@ -614,7 +657,7 @@ async def search_saved_topic(
             kd["keyword"]: kd.get("sentiment") for kd in keyword_results if kd.get("sentiment")
         },
         "results": [p for kd in keyword_results for p in kd.get("posts", [])],
-        "crawling_keywords": crawling_keywords,
+        "queued_keywords": queued_keywords,
         "needs_confirmation_keywords": needs_confirmation_keywords,
         "note": note,
     })

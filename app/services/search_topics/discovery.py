@@ -143,9 +143,14 @@ async def _discover_youtube(db: AsyncSession, keyword_text: str) -> dict[str, An
         await db.flush()
         await db.refresh(kw)
 
+    # TIDAK pakai queue="default" -- bukan nama antrian nyata yang dikonsumsi
+    # worker manapun (social_intel_worker/-ai listen di "collector,processing,
+    # reports,celery" / "ai,celery", tidak ada "default"). Callers lain yang
+    # TERBUKTI jalan (app/services/youtube/pipeline_service.py) pakai
+    # .delay() TANPA argumen queue -- otomatis masuk antrian default Celery
+    # sendiri ("celery"), yang MEMANG dikonsumsi semua worker container.
     collect_youtube_pipeline_task.apply_async(
         kwargs={"keyword_id": str(kw.id), "max_pages": 2, "max_comment_pages": 2, "max_comments_per_video": 50},
-        queue="default",
     )
     return {
         "keyword": keyword_text, "keyword_id": str(kw.id), "status": "crawling",
