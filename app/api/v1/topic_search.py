@@ -18,7 +18,13 @@ platform sekaligus per topik:**
    TikTok/Twitter, Firecrawl utk News, YouTube Data API/EnsembleData utk
    YouTube) lewat app/services/search_topics/discovery.py -- TANPA AI/LLM,
    reuse fungsi yang SUDAH ADA & terbukti dipakai endpoint /posts/search
-   interaktif tiap platform.
+   interaktif tiap platform. **BUTUH KONFIRMASI EKSPLISIT** (lihat
+   `confirm_third_party` di bawah) -- kalau data tidak ada di DB, endpoint
+   TIDAK langsung crawl, cuma melapor status 'needs_confirmation' dulu.
+   Ini HANYA berlaku utk request interaktif lewat endpoint ini; pemindaian
+   berkala (`schedule_recurring=true`, lihat rescan_service.py) TETAP jalan
+   otomatis tanpa konfirmasi ulang tiap hari -- user sudah memberi izin di
+   muka saat mengaktifkan `enable_recurring=true`.
 
 **Pencarian berkala (opsional):** `enable_recurring=true` + `schedule_duration_days`
 menjadwalkan topik utk di-scan ulang tiap hari (Celery task
@@ -70,7 +76,8 @@ class TopicSearchRequest(BaseModel):
     limit_per_keyword: int = Field(default=10, ge=1, le=100)
     include_sentiment: bool = Field(default=True)
     include_comments: bool = Field(default=False)
-    auto_crawl: bool = Field(default=True, description="Cari ke third-party otomatis jika data belum ada (tier-3)")
+    auto_crawl: bool = Field(default=True, description="Izinkan pencarian ke third-party (tier-3) utk topik ini kalau data belum ada -- tetap butuh confirm_third_party=true di request yang sama utk BENAR-BENAR jalan, lihat confirm_third_party")
+    confirm_third_party: bool = Field(default=False, description="WAJIB true baru tier-3 (Apify/Firecrawl/YouTube API) benar-benar dipanggil. Kalau false (default) & data tidak ketemu di DB, endpoint cuma melapor status 'needs_confirmation' TANPA memanggil third-party apa pun -- kirim ulang request yang SAMA (topics+platforms sama persis) dengan confirm_third_party=true setelah user/frontend setuju utk lanjut.")
     scheduled_hour: int | None = Field(default=None, ge=0, le=23, description="TIDAK DIPAKAI -- field lama, dibiarkan apa adanya. Lihat enable_recurring.")
     save_topic: bool = Field(default=True, description="Simpan konfigurasi topik ke DB untuk dashboard")
     enable_recurring: bool = Field(default=False, description="Jadwalkan pencarian berkala harian utk topik ini")
@@ -216,15 +223,19 @@ async def search_by_topics(
 
     **Alur (tier-1 -> tier-3, lihat docstring modul):**
     - Cari setiap keyword di `posts`/`comments` (ILIKE, lintas SEMUA platform diminta)
-    - Jika ada data → kembalikan posts + sentimen
-    - Jika belum ada + auto_crawl=true → search LANGSUNG ke third-party tiap
-      platform (Apify/Firecrawl/YouTube API, TANPA AI/LLM)
+    - Jika ada data → kembalikan posts + sentimen (status "found")
+    - Jika belum ada + auto_crawl=true + confirm_third_party=false (default)
+      → status "needs_confirmation", TIDAK memanggil third-party apa pun
+    - Jika belum ada + auto_crawl=true + confirm_third_party=true → search
+      LANGSUNG ke third-party tiap platform (Apify/Firecrawl/YouTube API,
+      TANPA AI/LLM), status "crawling"
     - Topik disimpan ke DB → tampil di `GET /search/topics/list`
     """
     logger.info("topic_search", topics=[t.name for t in body.topics], user=str(current_user.id))
 
     topic_results = []
     crawling_keywords = []
+    needs_confirmation_keywords = []
 
     for topic in body.topics:
         keyword_results = []
@@ -249,7 +260,19 @@ async def search_by_topics(
             if body.include_sentiment and total > 0:
                 kw_result["sentiment"] = await tier_search.get_sentiment_summary_by_keyword(db, kw_text, body.platforms)
 
-            if total == 0 and body.auto_crawl:
+            if total == 0 and body.auto_crawl and not body.confirm_third_party:
+                # Data tidak ada di DB -- JANGAN langsung panggil third-party
+                # (Apify/Firecrawl/YouTube API = biaya/kuota nyata). Lapor ke
+                # frontend dulu, minta izin eksplisit lewat konfirmasi user.
+                kw_result["status"] = "needs_confirmation"
+                kw_result["confirmation_message"] = (
+                    f"Data '{kw_text}' tidak ditemukan di database. Cari ke third-party "
+                    f"({', '.join(body.platforms)})? Kirim ulang request yang SAMA (topics+platforms) "
+                    f"dengan confirm_third_party=true untuk melanjutkan."
+                )
+                needs_confirmation_keywords.append(kw_text)
+
+            elif total == 0 and body.auto_crawl and body.confirm_third_party:
                 crawl_results = {}
                 for platform in body.platforms:
                     if platform not in discovery.ALL_SMART_SEARCH_PLATFORMS:
@@ -295,21 +318,36 @@ async def search_by_topics(
                 for kd in keyword_results if kd.get("sentiment")
             },
             "results": [p for kd in keyword_results for p in kd.get("posts", [])],
-            "crawling": [kd["keyword"] for kd in keyword_results if kd["status"] in ("crawling",)],
+            "crawling": [kd["keyword"] for kd in keyword_results if kd["status"] == "crawling"],
+            "needs_confirmation": [kd["keyword"] for kd in keyword_results if kd["status"] == "needs_confirmation"],
         })
 
     await db.commit()
 
-    overall = "ready"
+    has_data = any(t["total_posts"] > 0 for t in topic_results)
     if crawling_keywords:
-        overall = "partial" if any(t["total_posts"] > 0 for t in topic_results) else "crawling"
+        overall = "partial" if has_data else "crawling"
+    elif needs_confirmation_keywords:
+        overall = "partial_needs_confirmation" if has_data else "needs_confirmation"
+    else:
+        overall = "ready"
+
+    note = None
+    if crawling_keywords:
+        note = "Keyword dengan status 'crawling' baru saja dicari ke third-party (Apify/Firecrawl/YouTube API)."
+    elif needs_confirmation_keywords:
+        note = (
+            "Keyword dengan status 'needs_confirmation' tidak ditemukan di database. "
+            "Kirim ulang request yang SAMA dengan confirm_third_party=true untuk mencari ke third-party."
+        )
 
     return build_success_response({
         "status": overall,
         "platforms": body.platforms,
         "total_topics": len(topic_results),
         "crawling_keywords": crawling_keywords,
-        "note": "Keyword dengan status 'crawling' sedang dicari ke third-party di background." if crawling_keywords else None,
+        "needs_confirmation_keywords": needs_confirmation_keywords,
+        "note": note,
         "topics": topic_results,
     })
 
