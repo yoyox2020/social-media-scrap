@@ -245,6 +245,7 @@ DISCOVER_DEFAULT_SCORE = 0.9
 
 async def discover_facebook_topic_by_keyword(
     db: AsyncSession, keyword: str, max_results: int = 10, location: str | None = None,
+    source: str = "manual_facebook_search",
 ) -> dict:
     """
     Search Facebook LANGSUNG by keyword (Apify `facebook-search-ppr`, lihat
@@ -254,9 +255,11 @@ async def discover_facebook_topic_by_keyword(
     POST /facebook/discover, BUKAN bagian dari jadwal Celery Beat.
 
     Hasil (kalau ada akun yang ketemu) langsung di-submit ke
-    trend_recommendations (source='manual_facebook_search', status='pending')
-    lewat submit_recommendations() yang SUDAH ADA — topiknya lalu ikut antrian
-    budget harian run_daily_trend_scrape_facebook() seperti topik AI biasa,
+    trend_recommendations (source=`source` param, default 'manual_facebook_search',
+    status='pending') lewat submit_recommendations() yang SUDAH ADA — param
+    `source` opsional dipakai app/services/search_topics/discovery.py (Smart
+    Search) utk tag 'smart_search_facebook' tanpa ubah perilaku default caller
+    lain — topiknya lalu ikut antrian budget harian run_daily_trend_scrape_facebook() seperti topik AI biasa,
     BUKAN langsung discrape saat itu juga.
     """
     from app.integrations.apify.facebook_search import extract_identifier, search_facebook_by_keyword
@@ -293,7 +296,7 @@ async def discover_facebook_topic_by_keyword(
 
     body = TrendRecommendationBatchCreate(
         items=[TrendRecommendationItem(topic=keyword, score=DISCOVER_DEFAULT_SCORE, related_accounts=accounts)],
-        source="manual_facebook_search",
+        source=source,
     )
     result = await submit_recommendations(db, body)
 

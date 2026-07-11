@@ -42,6 +42,7 @@ celery_app = Celery(
         "app.workers.twitter_trending_worker",
         "app.workers.news_worker",
         "app.workers.trends_worker",
+        "app.workers.search_topics_worker",
     ],
 )
 
@@ -79,6 +80,19 @@ celery_app.conf.update(
         "retry-missing-embeddings-every-6h": {
             "task": "workers.retry_missing_embeddings",
             "schedule": crontab(minute=30, hour="1,7,13,19"),
+        },
+        # Smart Search: scan ulang SearchTopic yang schedule_recurring=True
+        # (lihat app/services/search_topics/rescan_service.py). Jalan
+        # PALING PAGI (sebelum viral-discovery-daily 07:00 & konsumer harian
+        # tiap platform) supaya akun/post yang baru ditemukan hari ini
+        # (Facebook/TikTok/Twitter, via trend_recommendations) sempat
+        # kepilih task harian platform itu sendiri di hari yang sama.
+        "search-topic-rescan-daily": {
+            "task": "workers.search_topics.daily_rescan",
+            "schedule": crontab(
+                hour=settings.search_topic_rescan_schedule_hour,
+                minute=settings.search_topic_rescan_schedule_minute,
+            ),
         },
         # Viral discovery: Claude (web_search) cari topik+akun Instagram viral
         # hari ini, submit ke trend_recommendations. Jalan 2 jam SEBELUM

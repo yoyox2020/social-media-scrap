@@ -144,6 +144,22 @@ class Settings(BaseSettings):
     instagram_trend_scrape_schedule_hour: int = 9
     instagram_trend_scrape_schedule_minute: int = 0
 
+    # Smart Search (app/services/search_topics/) — jadwal pemindaian ulang
+    # harian (lihat app/services/search_topics/rescan_service.py) + cooldown
+    # per platform sebelum boleh panggil Apify/Firecrawl lagi utk keyword yang
+    # sama. cooldown_hours_expensive dipakai Instagram/News (tidak ada jalur
+    # "refresh akun murah" seperti Facebook/TikTok/Twitter).
+    search_topic_rescan_schedule_hour: int = 6
+    search_topic_rescan_schedule_minute: int = 0
+    search_topic_rescan_cooldown_hours: int = 24
+    search_topic_rescan_cooldown_hours_expensive: int = 72
+
+    # Jatah minimum terjamin utk submission Smart Search (source diawali
+    # "smart_search_") di trend_recommendations, dari 20 slot/hari yang sama
+    # dipakai AI viral-discovery + pencarian interaktif tiap platform. Lihat
+    # _pick_eviction_candidate() di app/services/trend_recommendations/service.py.
+    smart_search_reserved_slots: int = 5
+
     # YouTube Data API v3 (fallback saat EnsembleData quota habis)
     youtube_data_api_key: str = ""
 

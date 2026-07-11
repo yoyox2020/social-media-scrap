@@ -16,6 +16,32 @@ MAX_PER_DAY = 20
 # pernah berhasil (invalid/kosong permanen). Gampang diubah: cuma angka ini.
 FAILED_PERMANENT_THRESHOLD = 3
 
+# Smart Search (app/services/search_topics/) dapat jatah TERPROTEKSI dari
+# MAX_PER_DAY yang sama -- baris ber-source diawali prefix ini TIDAK bisa
+# digusur oleh submission LAIN (AI viral-discovery/pencarian interaktif
+# platform) selama jumlahnya masih <= SMART_SEARCH_RESERVED_SLOTS. Ini
+# JATAH MINIMUM TERJAMIN, bukan batas maksimum -- baris smart_search_* tetap
+# bisa tumbuh lebih banyak kalau skornya cukup tinggi utk menang kompetisi
+# normal. TIDAK aktif (tidak berubah perilaku) di hari-hari tanpa aktivitas
+# Smart Search sama sekali -- lihat _pick_eviction_candidate().
+_RESERVED_SOURCE_PREFIX = "smart_search_"
+
+
+def _is_reserved_source(source: str) -> bool:
+    return source.startswith(_RESERVED_SOURCE_PREFIX)
+
+
+def _pick_eviction_candidate(active_rows: list[TrendRecommendation], reserved_slots: int) -> TrendRecommendation:
+    """Skor terendah yang digusur kalau slot MAX_PER_DAY penuh -- tapi
+    hormati jatah reserved Smart Search selama masih di bawah/sama dengan
+    reserved_slots (lihat catatan _RESERVED_SOURCE_PREFIX di atas)."""
+    if reserved_slots > 0:
+        reserved_rows = [r for r in active_rows if _is_reserved_source(r.source)]
+        non_reserved_rows = [r for r in active_rows if not _is_reserved_source(r.source)]
+        if len(reserved_rows) <= reserved_slots and non_reserved_rows:
+            return min(non_reserved_rows, key=lambda r: r.score)
+    return min(active_rows, key=lambda r: r.score)
+
 
 async def submit_recommendations(
     db: AsyncSession,
@@ -27,8 +53,13 @@ async def submit_recommendations(
     - Topik yang sudah ada di hari itu -> update score/related_accounts.
     - Topik baru & slot masih tersedia -> insert.
     - Topik baru & slot penuh -> gantikan topik dengan score terendah kalau
-      score baru lebih tinggi, kalau tidak -> ditolak.
+      score baru lebih tinggi, kalau tidak -> ditolak. Baris ber-source
+      'smart_search_*' dapat jatah terproteksi dari penggusuran ini, lihat
+      _pick_eviction_candidate()/_RESERVED_SOURCE_PREFIX di atas.
     """
+    from app.shared.config import settings
+
+    reserved_slots = getattr(settings, "smart_search_reserved_slots", 0)
     reco_date = body.recommendation_date or date.today()
 
     existing_rows = (
@@ -77,7 +108,7 @@ async def submit_recommendations(
             created.append(item.topic)
             continue
 
-        lowest = min(active_rows, key=lambda r: r.score)
+        lowest = _pick_eviction_candidate(active_rows, reserved_slots)
         if item.score > lowest.score:
             active_rows.remove(lowest)
             existing_by_topic.pop(lowest.topic, None)

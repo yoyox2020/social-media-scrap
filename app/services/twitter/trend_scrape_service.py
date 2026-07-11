@@ -204,7 +204,9 @@ async def get_twitter_trend_scrape_summary(db: AsyncSession, recent_limit: int =
     }
 
 
-async def discover_twitter_topic_by_keyword(db: AsyncSession, keyword: str, max_results: int = 10) -> dict:
+async def discover_twitter_topic_by_keyword(
+    db: AsyncSession, keyword: str, max_results: int = 10, source: str = "manual_twitter_search",
+) -> dict:
     """
     Search Twitter/X LANGSUNG by keyword (Apify `danek/twitter-scraper`, mode
     search) — TIDAK ada AI menebak akun. Akun diambil langsung dari field
@@ -216,11 +218,13 @@ async def discover_twitter_topic_by_keyword(db: AsyncSession, keyword: str, max_
     ada di `screen_name` TOP-LEVEL, BUKAN nested `author.screen_name` (field
     `author` tidak ada sama sekali di hasil search, diganti `user_info`).
 
-    Hasil disubmit ke trend_recommendations (source='manual_twitter_search')
-    lewat submit_recommendations() yang SUDAH ADA — topiknya ikut antrian
-    budget harian run_daily_trend_scrape_twitter() seperti topik AI biasa.
-    Dipakai baik oleh tingkat-3 search_twitter_posts() MAUPUN
-    POST /twitter/discover (trigger manual, cari topik BARU).
+    Hasil disubmit ke trend_recommendations (source=`source` param, default
+    'manual_twitter_search') lewat submit_recommendations() yang SUDAH ADA —
+    topiknya ikut antrian budget harian run_daily_trend_scrape_twitter()
+    seperti topik AI biasa. Dipakai baik oleh tingkat-3 search_twitter_posts()
+    MAUPUN POST /twitter/discover (trigger manual, cari topik BARU) MAUPUN
+    app/services/search_topics/discovery.py (Smart Search, source=
+    'smart_search_twitter').
     """
     from app.integrations.apify.twitter import search_twitter_by_keyword
     from app.domain.trend_recommendations.schemas import TrendRecommendationBatchCreate, TrendRecommendationItem
@@ -270,7 +274,7 @@ async def discover_twitter_topic_by_keyword(db: AsyncSession, keyword: str, max_
 
     body = TrendRecommendationBatchCreate(
         items=[TrendRecommendationItem(topic=keyword, score=DISCOVER_DEFAULT_SCORE, related_accounts=accounts)],
-        source="manual_twitter_search",
+        source=source,
     )
     result = await submit_recommendations(db, body)
 

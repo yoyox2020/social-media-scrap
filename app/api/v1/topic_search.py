@@ -1,12 +1,40 @@
 """
-Universal Topic-Based Search API.
+Universal Topic-Based Search API ("Smart Search").
 
 Topik dan keyword-nya disimpan ke DB sehingga bisa ditampilkan di dashboard.
 Setiap topik bisa punya banyak keyword, dan satu keyword bisa masuk banyak topik.
+
+**Alur pencarian (3 tingkat), sama persis dengan pola /posts/search yang
+sudah ada di Facebook/Instagram/TikTok/Twitter, cuma di sini lintas SEMUA
+platform sekaligus per topik:**
+1. Tier-1: cari di DB (`posts.content`/`comments.content` ILIKE, lewat
+   app/services/search_topics/tier_search.py) -- BUKAN `Post.keyword_id`,
+   karena field itu cuma pernah diisi pipeline YouTube (lihat catatan di
+   tier_search.py) dan akan diam-diam melewatkan hampir semua konten
+   platform lain kalau dipakai.
+2. Tier-2: (opsional, dipakai rescan_service.py utk jadwal berkala -- lihat
+   file itu) cek trend_recommendations utk akun yang sudah pernah ketemu.
+3. Tier-3: search LANGSUNG ke third-party (Apify utk Facebook/Instagram/
+   TikTok/Twitter, Firecrawl utk News, YouTube Data API/EnsembleData utk
+   YouTube) lewat app/services/search_topics/discovery.py -- TANPA AI/LLM,
+   reuse fungsi yang SUDAH ADA & terbukti dipakai endpoint /posts/search
+   interaktif tiap platform.
+
+**Pencarian berkala (opsional):** `enable_recurring=true` + `schedule_duration_days`
+menjadwalkan topik utk di-scan ulang tiap hari (Celery task
+workers.search_topics.daily_rescan, lihat rescan_service.py) selama N hari
+dari SEKARANG (bukan dari created_at topik) -- bisa diaktifkan/diubah
+durasinya kapan saja lewat POST /search/topics/{id}/schedule TANPA perlu
+search ulang dari awal.
+
+**Hapus topik TIDAK menghapus data.** DELETE /search/topics/{id} cuma
+soft-delete (`is_active=False`) -- keyword & post/comment yang sudah
+ditemukan tetap tersimpan permanen, dan otomatis berhenti diambil jadwal
+berkala (task harian filter `is_active==True`).
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
@@ -14,12 +42,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.keywords.models import Keyword
-from app.domain.posts.models import Post
 from app.domain.search_topics.models import SearchTopic, SearchTopicKeyword
 from app.domain.users.models import User
 from app.infrastructure.database.connection import get_db
 from app.infrastructure.logging.logger import get_logger
 from app.services.auth.dependencies import get_current_user
+from app.services.search_topics import discovery, tier_search
 from app.shared.utils import build_success_response
 
 router = APIRouter(prefix="/search", tags=["topic-search"])
@@ -38,13 +66,20 @@ class TopicItem(BaseModel):
 
 class TopicSearchRequest(BaseModel):
     topics: list[TopicItem] = Field(..., min_length=1)
-    platforms: list[str] = Field(default=["youtube"], description="Platform: youtube, tiktok, instagram, news")
+    platforms: list[str] = Field(default=["youtube"], description="Platform: youtube, instagram, facebook, tiktok, twitter, news")
     limit_per_keyword: int = Field(default=10, ge=1, le=100)
     include_sentiment: bool = Field(default=True)
     include_comments: bool = Field(default=False)
-    auto_crawl: bool = Field(default=True, description="Crawl otomatis jika data belum ada")
-    scheduled_hour: int | None = Field(default=None, ge=0, le=23, description="Jam crawl harian otomatis (0-23)")
+    auto_crawl: bool = Field(default=True, description="Cari ke third-party otomatis jika data belum ada (tier-3)")
+    scheduled_hour: int | None = Field(default=None, ge=0, le=23, description="TIDAK DIPAKAI -- field lama, dibiarkan apa adanya. Lihat enable_recurring.")
     save_topic: bool = Field(default=True, description="Simpan konfigurasi topik ke DB untuk dashboard")
+    enable_recurring: bool = Field(default=False, description="Jadwalkan pencarian berkala harian utk topik ini")
+    schedule_duration_days: int = Field(default=7, ge=1, le=90, description="Berapa hari jadwal berkala berjalan, dihitung dari SEKARANG")
+
+
+class TopicScheduleRequest(BaseModel):
+    enabled: bool = Field(..., description="Aktif/nonaktifkan pencarian berkala")
+    duration_days: int | None = Field(default=None, ge=1, le=90, description="Ubah durasi (hari), dihitung ulang dari SEKARANG. Kosong = pakai durasi yang sudah ada / default 7")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -67,88 +102,47 @@ async def _find_keyword(db: AsyncSession, q: str) -> Keyword | None:
     return kw
 
 
-async def _get_posts(db: AsyncSession, keyword_id: uuid.UUID, platforms: list[str], limit: int) -> list[dict]:
-    filters = [Post.keyword_id == keyword_id]
-    if platforms:
-        filters.append(Post.platform.in_(platforms))
-    rows = (await db.scalars(
-        select(Post).where(*filters).order_by(Post.collected_at.desc()).limit(limit)
-    )).all()
+async def _get_or_create_keyword(db: AsyncSession, keyword_text: str) -> Keyword | None:
+    """`SearchTopicKeyword.keyword_id` wajib diisi (FK, bagian primary key) --
+    jadi tetap butuh baris `Keyword` NYATA per topic-keyword, WALAU
+    pencarian isinya sendiri sekarang pakai ILIKE (tier_search.py), bukan
+    `keyword_id`. Reuse baris yang sudah ada kalau cocok (`_find_keyword`),
+    baru bikin baru kalau genuinely belum ada."""
+    existing = await _find_keyword(db, keyword_text)
+    if existing:
+        return existing
 
-    results = []
-    for p in rows:
-        meta = p.metadata_ or {}
-        raw_views = meta.get("views", meta.get("view_count", 0))
-        try:
-            view_count = int(str(raw_views).replace(",", "").split()[0]) if raw_views else 0
-        except (ValueError, IndexError):
-            view_count = 0
-        results.append({
-            "id": str(p.id),
-            "platform": p.platform,
-            "title": p.content,
-            "author": p.author,
-            "url": p.url,
-            "view_count": view_count,
-            "published_at": p.published_at.isoformat() if p.published_at else None,
-            "collected_at": p.collected_at.isoformat() if p.collected_at else None,
-            "thumbnail_url": meta.get("thumbnail", meta.get("thumbnail_url", "")),
-        })
-    return results
-
-
-async def _get_sentiment_summary(db: AsyncSession, keyword_id: uuid.UUID) -> dict:
-    from app.domain.youtube_analysis.models import LexiconAnalysis
-    from app.domain.comments.models import Comment
-
-    rows = await db.execute(
-        select(LexiconAnalysis.label, func.count(LexiconAnalysis.id))
-        .join(Comment, LexiconAnalysis.comment_id == Comment.id)
-        .join(Post, Comment.post_id == Post.id)
-        .where(Post.keyword_id == keyword_id)
-        .group_by(LexiconAnalysis.label)
-    )
-    summary = {"positif": 0, "negatif": 0, "netral": 0}
-    total = 0
-    for label, count in rows.all():
-        if label in summary:
-            summary[label] = count
-            total += count
-    if total > 0:
-        dominant = max(summary, key=summary.get)
-        return {
-            "total_analyzed": total,
-            "positif": {"count": summary["positif"], "pct": round(summary["positif"] * 100 / total, 1)},
-            "negatif": {"count": summary["negatif"], "pct": round(summary["negatif"] * 100 / total, 1)},
-            "netral":  {"count": summary["netral"],  "pct": round(summary["netral"]  * 100 / total, 1)},
-            "dominant": dominant,
-        }
-    return {"total_analyzed": 0}
-
-
-async def _queue_crawl(db: AsyncSession, keyword_text: str, platforms: list[str]) -> dict:
     from app.domain.projects.models import Project
     project = await db.scalar(select(Project).limit(1))
     if not project:
-        return {"status": "error", "message": "Tidak ada project di DB"}
+        return None
 
     kw = Keyword(project_id=project.id, keyword=keyword_text, is_active=True)
     db.add(kw)
     await db.flush()
     await db.refresh(kw)
+    return kw
 
-    if "youtube" in platforms:
-        from app.workers.youtube_worker import collect_youtube_pipeline_task
-        collect_youtube_pipeline_task.apply_async(
-            kwargs={"keyword_id": str(kw.id), "max_pages": 2, "max_comment_pages": 2, "max_comments_per_video": 50},
-            queue="default",
-        )
 
+def _resolve_schedule_fields(enable_recurring: bool, duration_days: int | None) -> dict:
+    """Hitung schedule_started_at/schedule_expires_at SEKALI saat recurring
+    di-(re)aktifkan -- durasi dihitung dari SEKARANG, bukan dari created_at
+    topik, supaya "aktifkan tracking hari ini utk 7 hari" selalu berarti
+    7 hari dari hari ini walau topik-nya sudah lama ada."""
+    if not enable_recurring:
+        return {
+            "schedule_recurring": False,
+            "schedule_duration_days": None,
+            "schedule_started_at": None,
+            "schedule_expires_at": None,
+        }
+    now = datetime.now(timezone.utc)
+    days = duration_days or 7
     return {
-        "status": "crawling",
-        "keyword_id": str(kw.id),
-        "message": f"Keyword '{keyword_text}' dibuat dan crawl dimulai di background",
-        "poll_url": f"/api/v1/youtube/status?keyword_id={kw.id}",
+        "schedule_recurring": True,
+        "schedule_duration_days": days,
+        "schedule_started_at": now,
+        "schedule_expires_at": now + timedelta(days=days),
     }
 
 
@@ -156,10 +150,12 @@ async def _save_topic(
     db: AsyncSession,
     topic_name: str,
     description: str | None,
-    keyword_objects: list[tuple[str, Keyword]],
+    keyword_objects: list[tuple[str, Keyword | None]],
     platforms: list[str],
     scheduled_hour: int | None,
     auto_crawl: bool,
+    enable_recurring: bool,
+    schedule_duration_days: int,
 ) -> SearchTopic:
     """Simpan atau update topik ke DB. Jika nama sudah ada, update keyword-nya."""
     from sqlalchemy.orm import selectinload
@@ -169,12 +165,19 @@ async def _save_topic(
         .where(func.lower(SearchTopic.name) == topic_name.strip().lower()).limit(1)
     )
 
+    schedule_fields = _resolve_schedule_fields(enable_recurring, schedule_duration_days)
+
     if existing:
-        # Update platforms dan scheduled_hour jika berubah
         existing.platforms = platforms
         existing.scheduled_hour = scheduled_hour
         existing.auto_crawl = auto_crawl
         existing.updated_at = datetime.now(timezone.utc)
+        if enable_recurring:
+            # Cuma timpa jadwal kalau request ini MEMANG mengaktifkan recurring --
+            # kalau enable_recurring=False di request ini, jangan matikan jadwal
+            # yang sudah aktif dari request sebelumnya secara tidak sengaja.
+            for k, v in schedule_fields.items():
+                setattr(existing, k, v)
         topic = existing
     else:
         topic = SearchTopic(
@@ -183,14 +186,12 @@ async def _save_topic(
             platforms=platforms,
             scheduled_hour=scheduled_hour,
             auto_crawl=auto_crawl,
+            **schedule_fields,
         )
         db.add(topic)
         await db.flush()
 
-    # Ambil keyword_id yang sudah terhubung
     existing_kw_ids = {stk.keyword_id for stk in topic.topic_keywords}
-
-    # Tambah keyword baru yang belum terhubung
     for kw_text, kw_obj in keyword_objects:
         if kw_obj and kw_obj.id not in existing_kw_ids:
             link = SearchTopicKeyword(topic_id=topic.id, keyword_id=kw_obj.id, keyword_text=kw_text)
@@ -213,10 +214,11 @@ async def search_by_topics(
     Cari data berdasarkan topik + kata kunci, dikelompokkan per topik.
     Jika `save_topic=true` (default), topik dan keyword-nya disimpan ke DB untuk dashboard.
 
-    **Alur:**
-    - Cari setiap keyword di DB (LIKE match)
+    **Alur (tier-1 -> tier-3, lihat docstring modul):**
+    - Cari setiap keyword di `posts`/`comments` (ILIKE, lintas SEMUA platform diminta)
     - Jika ada data → kembalikan posts + sentimen
-    - Jika belum ada + auto_crawl=true → buat keyword + crawl otomatis
+    - Jika belum ada + auto_crawl=true → search LANGSUNG ke third-party tiap
+      platform (Apify/Firecrawl/YouTube API, TANPA AI/LLM)
     - Topik disimpan ke DB → tampil di `GET /search/topics/list`
     """
     logger.info("topic_search", topics=[t.name for t in body.topics], user=str(current_user.id))
@@ -230,7 +232,7 @@ async def search_by_topics(
         keyword_objects: list[tuple[str, Keyword | None]] = []
 
         for kw_text in topic.keywords:
-            keyword = await _find_keyword(db, kw_text)
+            keyword = await _get_or_create_keyword(db, kw_text)
             kw_result: dict = {
                 "keyword": kw_text,
                 "keyword_id": str(keyword.id) if keyword else None,
@@ -239,44 +241,33 @@ async def search_by_topics(
                 "posts": [],
             }
 
-            if keyword:
-                posts = await _get_posts(db, keyword.id, body.platforms, body.limit_per_keyword)
-                total = len(posts)
-                topic_total_posts += total
-                kw_result.update({"status": "found" if total > 0 else "empty", "total": total, "posts": posts})
+            posts = await tier_search.find_posts_by_keyword(db, kw_text, body.platforms, body.limit_per_keyword)
+            total = len(posts)
+            topic_total_posts += total
+            kw_result.update({"status": "found" if total > 0 else "empty", "total": total, "posts": posts})
 
-                if body.include_sentiment and total > 0:
-                    kw_result["sentiment"] = await _get_sentiment_summary(db, keyword.id)
+            if body.include_sentiment and total > 0:
+                kw_result["sentiment"] = await tier_search.get_sentiment_summary_by_keyword(db, kw_text, body.platforms)
 
-                if total == 0 and body.auto_crawl:
-                    # Keyword sudah ada, langsung queue crawl dengan ID yang existing
-                    if "youtube" in body.platforms:
-                        from app.workers.youtube_worker import collect_youtube_pipeline_task
-                        collect_youtube_pipeline_task.apply_async(
-                            kwargs={"keyword_id": str(keyword.id), "max_pages": 2, "max_comment_pages": 2, "max_comments_per_video": 50},
-                            queue="default",
-                        )
-                    crawl_info = {
-                        "status": "crawling",
-                        "keyword_id": str(keyword.id),
-                        "message": f"Keyword '{kw_text}' sudah ada, crawl dimulai di background",
-                        "poll_url": f"/api/v1/youtube/status?keyword_id={keyword.id}",
-                    }
-                    kw_result["crawl"] = crawl_info
-                    kw_result["status"] = "crawling"
-                    crawling_keywords.append(kw_text)
-
-            else:
-                if body.auto_crawl:
-                    crawl_info = await _queue_crawl(db, kw_text, body.platforms)
-                    kw_result.update({"status": "crawling", "crawl": crawl_info})
-                    crawling_keywords.append(kw_text)
-                    keyword = await _find_keyword(db, kw_text)
+            if total == 0 and body.auto_crawl:
+                crawl_results = {}
+                for platform in body.platforms:
+                    if platform not in discovery.ALL_SMART_SEARCH_PLATFORMS:
+                        crawl_results[platform] = {"error": f"platform '{platform}' tidak didukung"}
+                        continue
+                    source_tag = (
+                        f"smart_search_{platform}" if platform in discovery.ACCOUNT_DISCOVERY_PLATFORMS else None
+                    )
+                    crawl_results[platform] = await discovery.run_tier3_discovery(
+                        db, platform, kw_text, max_results=body.limit_per_keyword, source_tag=source_tag,
+                    )
+                kw_result["crawl"] = crawl_results
+                kw_result["status"] = "crawling"
+                crawling_keywords.append(kw_text)
 
             keyword_objects.append((kw_text, keyword))
             keyword_results.append(kw_result)
 
-        # Simpan topik ke DB
         if body.save_topic:
             saved_topic = await _save_topic(
                 db=db,
@@ -286,6 +277,8 @@ async def search_by_topics(
                 platforms=body.platforms,
                 scheduled_hour=body.scheduled_hour,
                 auto_crawl=body.auto_crawl,
+                enable_recurring=body.enable_recurring,
+                schedule_duration_days=body.schedule_duration_days,
             )
             topic_id = str(saved_topic.id)
         else:
@@ -316,7 +309,7 @@ async def search_by_topics(
         "platforms": body.platforms,
         "total_topics": len(topic_results),
         "crawling_keywords": crawling_keywords,
-        "note": "Keyword dengan status 'crawling' sedang diproses di background." if crawling_keywords else None,
+        "note": "Keyword dengan status 'crawling' sedang dicari ke third-party di background." if crawling_keywords else None,
         "topics": topic_results,
     })
 
@@ -348,25 +341,12 @@ async def list_saved_topics(
 
     items = []
     for topic in topics:
-        # Hitung statistik per topik
-        keyword_ids = [stk.keyword_id for stk in topic.topic_keywords]
-
         total_posts = 0
         total_comments = 0
-        if keyword_ids:
-            total_posts = (await db.scalar(
-                select(func.count(Post.id)).where(
-                    Post.keyword_id.in_(keyword_ids),
-                    Post.platform.in_(topic.platforms),
-                )
-            )) or 0
-
-            from app.domain.comments.models import Comment
-            total_comments = (await db.scalar(
-                select(func.count(Comment.id))
-                .join(Post, Comment.post_id == Post.id)
-                .where(Post.keyword_id.in_(keyword_ids))
-            )) or 0
+        for stk in topic.topic_keywords:
+            p, c = await tier_search.count_posts_and_comments_by_keyword(db, stk.keyword_text, topic.platforms)
+            total_posts += p
+            total_comments += c
 
         items.append({
             "topic_id": str(topic.id),
@@ -377,9 +357,11 @@ async def list_saved_topics(
             "total_keywords": len(topic.topic_keywords),
             "total_posts": total_posts,
             "total_comments": total_comments,
-            "scheduled_hour": topic.scheduled_hour,
             "auto_crawl": topic.auto_crawl,
             "is_active": topic.is_active,
+            "schedule_recurring": topic.schedule_recurring,
+            "schedule_duration_days": topic.schedule_duration_days,
+            "schedule_expires_at": topic.schedule_expires_at.isoformat() if topic.schedule_expires_at else None,
             "created_at": topic.created_at.isoformat(),
             "updated_at": topic.updated_at.isoformat(),
         })
@@ -419,19 +401,16 @@ async def get_topic_detail(
 
     keyword_details = []
     for stk in topic.topic_keywords:
-        keyword = await db.scalar(select(Keyword).where(Keyword.id == stk.keyword_id))
-        if not keyword:
-            continue
-
-        posts = await _get_posts(db, keyword.id, topic.platforms, limit_per_keyword)
+        posts = await tier_search.find_posts_by_keyword(db, stk.keyword_text, topic.platforms, limit_per_keyword)
         detail: dict = {
             "keyword": stk.keyword_text,
-            "keyword_id": str(keyword.id),
+            "keyword_id": str(stk.keyword_id),
             "total_posts": len(posts),
             "posts": posts,
+            "last_rescanned_at": stk.last_rescanned_at.isoformat() if stk.last_rescanned_at else None,
         }
         if include_sentiment and posts:
-            detail["sentiment"] = await _get_sentiment_summary(db, keyword.id)
+            detail["sentiment"] = await tier_search.get_sentiment_summary_by_keyword(db, stk.keyword_text, topic.platforms)
 
         keyword_details.append(detail)
 
@@ -443,9 +422,53 @@ async def get_topic_detail(
         "total_keywords": len(keyword_details),
         "total_posts": sum(k["total_posts"] for k in keyword_details),
         "keyword_details": keyword_details,
-        "scheduled_hour": topic.scheduled_hour,
+        "auto_crawl": topic.auto_crawl,
+        "schedule_recurring": topic.schedule_recurring,
+        "schedule_duration_days": topic.schedule_duration_days,
+        "schedule_started_at": topic.schedule_started_at.isoformat() if topic.schedule_started_at else None,
+        "schedule_expires_at": topic.schedule_expires_at.isoformat() if topic.schedule_expires_at else None,
         "created_at": topic.created_at.isoformat(),
         "updated_at": topic.updated_at.isoformat(),
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: Atur Jadwal Pencarian Berkala
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/topics/{topic_id}/schedule", response_model=dict)
+async def set_topic_schedule(
+    topic_id: uuid.UUID,
+    body: TopicScheduleRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Aktifkan/nonaktifkan atau ubah durasi pencarian berkala TANPA perlu
+    search ulang dari awal. Durasi selalu dihitung dari SEKARANG (saat
+    endpoint ini dipanggil), bukan dari kapan topik pertama kali dibuat.
+    """
+    topic = await db.scalar(select(SearchTopic).where(SearchTopic.id == topic_id))
+    if not topic:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError(f"Topik {topic_id} tidak ditemukan")
+
+    schedule_fields = _resolve_schedule_fields(
+        body.enabled,
+        body.duration_days or topic.schedule_duration_days,
+    )
+    for k, v in schedule_fields.items():
+        setattr(topic, k, v)
+    topic.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    return build_success_response({
+        "topic_id": str(topic.id),
+        "name": topic.name,
+        "schedule_recurring": topic.schedule_recurring,
+        "schedule_duration_days": topic.schedule_duration_days,
+        "schedule_started_at": topic.schedule_started_at.isoformat() if topic.schedule_started_at else None,
+        "schedule_expires_at": topic.schedule_expires_at.isoformat() if topic.schedule_expires_at else None,
     })
 
 
@@ -459,7 +482,9 @@ async def delete_topic(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Nonaktifkan topik (soft delete — data tidak hilang)."""
+    """Nonaktifkan topik (soft delete — data tidak hilang). Otomatis
+    berhenti diambil jadwal pencarian berkala (task harian filter
+    is_active==True) -- tidak perlu langkah tambahan apa pun."""
     topic = await db.scalar(
         select(SearchTopic).where(SearchTopic.id == topic_id)
     )

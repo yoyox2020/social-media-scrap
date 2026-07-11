@@ -201,16 +201,21 @@ async def get_tiktok_trend_scrape_summary(db: AsyncSession, recent_limit: int = 
 DISCOVER_DEFAULT_SCORE = 0.9  # sama seperti Facebook, lihat komentar di sana
 
 
-async def discover_tiktok_topic_by_keyword(db: AsyncSession, keyword: str, max_results: int = 10) -> dict:
+async def discover_tiktok_topic_by_keyword(
+    db: AsyncSession, keyword: str, max_results: int = 10, source: str = "manual_tiktok_search",
+) -> dict:
     """
     Search TikTok LANGSUNG by keyword (Apify `clockworks/tiktok-scraper`,
     mode search) — TIDAK ada AI menebak akun. LEBIH SIMPEL dari versi
     Facebook: akun diambil langsung dari `authorMeta.name` (data terstruktur),
     tidak perlu extract dari URL post.
 
-    Hasil disubmit ke trend_recommendations (source='manual_tiktok_search')
-    lewat submit_recommendations() yang SUDAH ADA, ikut antrian budget harian
-    seperti topik AI biasa — BUKAN langsung discrape saat itu juga.
+    Hasil disubmit ke trend_recommendations (source=`source` param, default
+    'manual_tiktok_search') lewat submit_recommendations() yang SUDAH ADA,
+    ikut antrian budget harian seperti topik AI biasa — BUKAN langsung
+    discrape saat itu juga. Param `source` opsional dipakai
+    app/services/search_topics/discovery.py (Smart Search) utk tag
+    'smart_search_tiktok' tanpa ubah perilaku default caller lain.
     """
     from app.integrations.apify.tiktok import search_tiktok_by_keyword
     from app.domain.trend_recommendations.schemas import TrendRecommendationBatchCreate, TrendRecommendationItem
@@ -247,7 +252,7 @@ async def discover_tiktok_topic_by_keyword(db: AsyncSession, keyword: str, max_r
 
     body = TrendRecommendationBatchCreate(
         items=[TrendRecommendationItem(topic=keyword, score=DISCOVER_DEFAULT_SCORE, related_accounts=accounts)],
-        source="manual_tiktok_search",
+        source=source,
     )
     result = await submit_recommendations(db, body)
 
