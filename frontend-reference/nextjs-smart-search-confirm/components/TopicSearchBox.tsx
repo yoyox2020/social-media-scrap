@@ -27,7 +27,11 @@ import {
 } from "../lib/smart-search-api";
 
 const POLL_INTERVAL_MS = 8000;
-const POLL_TIMEOUT_MS = 5 * 60 * 1000; // berhenti polling otomatis setelah 5 menit
+// Batas maksimal BROWSER menunggu -- ini BUKAN batas proses di server (server
+// tetap jalan sampai tuntas terlepas dari ini, lihat FLOW.md poin 5). 2 menit
+// sudah kasih buffer wajar drpd platform paling lambat yg teruji (News/
+// Firecrawl ~90 detik).
+const POLL_TIMEOUT_MS = 2 * 60 * 1000;
 
 type ViewState =
   | { phase: "idle" }
@@ -35,6 +39,11 @@ type ViewState =
   | { phase: "needs_confirmation"; data: TopicSearchResponse["data"] }
   | { phase: "queued"; topicId: string; queuedKeywords: string[] }
   | { phase: "done"; totalPosts: number; results: PostItem[] }
+  // "stopped" -- polling berhenti TANPA hasil (timeout ATAU user klik
+  // "Hentikan"), beda dari "queued" (masih aktif menunggu) supaya UI tidak
+  // nyangkut selamanya kelihatan "masih jalan" padahal backend sudah selesai
+  // (bisa saja hasilnya genuinely nol, itu BUKAN error).
+  | { phase: "stopped"; topicId: string }
   | { phase: "error"; message: string };
 
 export function TopicSearchBox({ authToken }: { authToken: string }) {
@@ -43,6 +52,10 @@ export function TopicSearchBox({ authToken }: { authToken: string }) {
   const [keywords, setKeywords] = useState<string[]>([]);
   const [state, setState] = useState<ViewState>({ phase: "idle" });
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Keyword yang benar2 dipakai di request pertama -- dipakai ulang PERSIS
+  // SAMA di request konfirmasi kedua, supaya tidak mismatch kalau user
+  // sempat menambah keyword lain di kolom input sebelum klik "Ya".
+  const lastSearchedKeywords = useRef<string[]>([]);
 
   useEffect(() => {
     return () => {
@@ -62,11 +75,22 @@ export function TopicSearchBox({ authToken }: { authToken: string }) {
 
   // Langkah 1+2: kirim pencarian, TANPA confirm_third_party dulu.
   async function handleSearch() {
-    if (!topicName.trim() || keywords.length === 0) return;
+    // Kalau user ketik keyword tapi lupa/belum tekan Enter, masukkan
+    // otomatis -- sebelumnya di sini langsung `return` diam-diam kalau
+    // keywords[] masih kosong, tombol jadi terlihat "tidak bereaksi".
+    const pending = keywordInput.trim();
+    const effectiveKeywords = pending && !keywords.includes(pending) ? [...keywords, pending] : keywords;
+    if (pending) {
+      setKeywords(effectiveKeywords);
+      setKeywordInput("");
+    }
+    if (!topicName.trim() || effectiveKeywords.length === 0) return;
+
+    lastSearchedKeywords.current = effectiveKeywords;
     setState({ phase: "searching" });
     try {
       const res = await searchTopics(authToken, {
-        topics: [{ name: topicName, keywords }],
+        topics: [{ name: topicName, keywords: effectiveKeywords }],
         // platforms sengaja tidak dikirim -> otomatis SEMUA platform
         save_topic: true,
         confirm_third_party: false,
@@ -89,7 +113,7 @@ export function TopicSearchBox({ authToken }: { authToken: string }) {
     setState({ phase: "searching" });
     try {
       const res = await searchTopics(authToken, {
-        topics: [{ name: topicName, keywords }],
+        topics: [{ name: topicName, keywords: lastSearchedKeywords.current }],
         save_topic: true,
         confirm_third_party: true,
       });
@@ -112,6 +136,16 @@ export function TopicSearchBox({ authToken }: { authToken: string }) {
     setState({ phase: "idle" });
   }
 
+  // Tombol "Hentikan" -- berhenti MEMANTAU dari sisi browser. TIDAK
+  // membatalkan proses di server (server tidak punya cara dibatalkan paksa
+  // di tengah jalan, dan biasanya sudah keburu selesai/hampir selesai krn
+  // tiap item cuma perlu 8-90 detik) -- ini cuma menghentikan browser
+  // supaya berhenti bertanya-tanya terus.
+  function handleStopWatching(topicId: string) {
+    if (pollTimer.current) clearInterval(pollTimer.current);
+    setState({ phase: "stopped", topicId });
+  }
+
   // Langkah 5: polling GET /search/topics/{id} sampai semua keyword yang
   // di-queue sudah punya data, atau timeout.
   function startPolling(topicId: string, queuedKeywords: string[]) {
@@ -119,6 +153,10 @@ export function TopicSearchBox({ authToken }: { authToken: string }) {
     pollTimer.current = setInterval(async () => {
       if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
         if (pollTimer.current) clearInterval(pollTimer.current);
+        // Timeout browser TIDAK berarti pencarian di server gagal -- bisa
+        // saja masih jalan (jarang, krn tiap item biasanya <90 detik) atau
+        // sudah selesai dgn hasil nol (genuinely tidak ketemu, bukan error).
+        setState({ phase: "stopped", topicId });
         return;
       }
       try {
@@ -179,9 +217,19 @@ export function TopicSearchBox({ authToken }: { authToken: string }) {
       )}
 
       {state.phase === "queued" && (
+        <div>
+          <p>
+            Sedang dicari satu-per-satu di background untuk: {state.queuedKeywords.join(", ")}. Halaman
+            ini otomatis diperbarui setiap {POLL_INTERVAL_MS / 1000} detik.
+          </p>
+          <button onClick={() => handleStopWatching(state.topicId)}>Hentikan pemantauan</button>
+        </div>
+      )}
+
+      {state.phase === "stopped" && (
         <p>
-          Sedang dicari satu-per-satu di background untuk: {state.queuedKeywords.join(", ")}. Halaman
-          ini otomatis diperbarui setiap {POLL_INTERVAL_MS / 1000} detik.
+          Berhenti memantau. Proses pencarian di server (kalau masih berjalan) tetap tuntas sendiri --
+          panggil GET /search/topics/{state.topicId} lagi nanti untuk lihat hasilnya kalau ada.
         </p>
       )}
 

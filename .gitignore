@@ -37,3 +37,10 @@ Thumbs.db
 # Docker volumes (if mounted locally)
 postgres_data/
 redis_data/
+
+# Node/Next.js scaffold (frontend-reference/ -- percobaan frontend, repo ini
+# backend Python murni, jangan sampai node_modules/.next ke-commit lagi)
+node_modules/
+.next/
+.env.local
+next-env.d.ts

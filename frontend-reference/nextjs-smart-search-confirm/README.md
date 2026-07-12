@@ -1,17 +1,29 @@
 # Smart Search — Contoh Alur Konfirmasi + Verifikasi (Next.js)
 
+**Dokumentasi lengkap (diagram alur, semua API, logika, pemetaan ke UI
+existing) ada di [`FLOW.md`](./FLOW.md) — baca itu dulu.** File ini cuma
+ringkasan singkat + cara menjalankan ulang verifikasi kalau perlu.
+
 Referensi implementasi frontend untuk `POST /search/topics` (lihat
 `app/api/v1/topic_search.py`). Bukan project Next.js yang bisa langsung
 `npm run dev` — cuma file untuk disalin ke project Next.js yang sudah
 ada (`lib/smart-search-api.ts` + `components/TopicSearchBox.tsx`).
 
-Sudah dibuktikan jalan: `TopicSearchBox.tsx` sempat di-render lewat
-Next.js dev server sungguhan (compile 0 error), dan seluruh alur
-search→needs_confirmation→confirm→queued→polling sudah dijalankan
-end-to-end lewat `simulate-flow.ts` melawan API produksi -- 7 artikel
-berita asli ditemukan ~88 detik setelah konfirmasi. Scaffold Next.js-nya
-(package.json/node_modules/.next) sudah dihapus lagi setelah terbukti
-jalan, cuma source reference yang disisakan di sini.
+Sudah dibuktikan jalan lewat 2 jalur terpisah: (1) `TopicSearchBox.tsx`
+sempat di-render lewat Next.js dev server sungguhan via proxy server-side
+(compile 0 error, token TIDAK PERNAH masuk bundle browser -- di-scan
+manual, 0 kecocokan), dan (2) seluruh alur
+search→needs_confirmation→confirm→queued→polling dijalankan end-to-end
+lewat `simulate-flow.ts` melawan API produksi -- video YouTube & artikel
+berita asli ditemukan (8 detik s/d ~88 detik tergantung platform).
+Ditemukan juga 1 bug nyata lewat pengujian manual di browser (polling
+tidak bisa membedakan "masih dicari" dari "sudah selesai dicari, hasil
+nol") -- sudah diperbaiki di `TopicSearchBox.tsx` (timeout 2 menit +
+tombol "Hentikan pemantauan", lihat FLOW.md poin 5).
+
+Scaffold Next.js-nya (package.json/node_modules/.next/app/) sudah
+dihapus lagi setelah semua terbukti jalan -- cuma source reference yang
+disisakan di folder ini.
 
 ## Cara verifikasi ulang sendiri (opsional)
 
@@ -49,7 +61,10 @@ di terminal/server, bukan di browser.
    diproses satu-per-satu di background).
 5. **Polling** — panggil `getTopicDetail(token, topicId)` berkala (default
    tiap 8 detik) sampai semua keyword yang di-queue sudah punya
-   `total_posts > 0`, atau timeout (default 5 menit).
+   `total_posts > 0`, atau timeout browser (2 menit) / user klik "Hentikan
+   pemantauan". Timeout/stop TIDAK berarti pencarian di server gagal --
+   bisa saja sudah selesai dgn hasil nol (genuinely tidak ketemu), lihat
+   FLOW.md poin 5.
 
 ## Endpoint terkait
 
