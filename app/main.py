@@ -55,6 +55,7 @@ from app.api.v1 import (
     topics,
     trend_recommendations,
     trends,
+    users,
 )
 # Import semua domain models agar SQLAlchemy mapper bisa resolve relationship
 import app.domain.users.models  # noqa: F401
@@ -1404,6 +1405,7 @@ setInterval(() => {
 API_PREFIX = "/api/v1"
 
 app.include_router(auth.router, prefix=API_PREFIX)
+app.include_router(users.router, prefix=API_PREFIX)
 app.include_router(keywords.router, prefix=API_PREFIX)
 app.include_router(collectors.router, prefix=API_PREFIX)
 app.include_router(processing.router, prefix=API_PREFIX)
