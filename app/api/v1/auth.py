@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +21,7 @@ from app.services.auth.schemas import (
     TokenResponse,
 )
 from app.services.auth.service import AuthService
+from app.shared.exceptions import AppException
 from app.shared.utils import build_success_response
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -47,8 +48,16 @@ async def login_swagger(
     form_data: OAuth2PasswordRequestForm = Depends(),
     service: AuthService = Depends(_service),
 ):
-    """Endpoint khusus untuk Swagger UI OAuth2 form — username = email."""
-    tokens = await service.login(form_data.username, form_data.password)
+    """Endpoint khusus untuk Swagger UI OAuth2 form — username = email.
+
+    Error di-raise sebagai HTTPException(detail=...) alih-alih format
+    {success,error} biasa -- Swagger UI cuma paham shape {"detail": "..."}
+    untuk OAuth2 authorize, kalau tidak pesannya jadi "[object Object]".
+    """
+    try:
+        tokens = await service.login(form_data.username, form_data.password)
+    except AppException as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     return {"access_token": tokens.access_token, "token_type": "bearer"}
 
 
