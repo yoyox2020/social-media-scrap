@@ -14,7 +14,9 @@ class User(Base, UUIDMixin, TimestampMixin):
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     username: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
-    role: Mapped[str] = mapped_column(String(50), nullable=False, default="user")
+    # Default sementara "admin" (bukan "user") biar semua akun langsung punya akses
+    # penuh selama fase testing di server -- balikin ke "user" saat RBAC disesuaikan lagi.
+    role: Mapped[str] = mapped_column(String(50), nullable=False, default="admin")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_superuser: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 

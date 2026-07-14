@@ -16,7 +16,7 @@ class AdminUserCreate(BaseModel):
     email: EmailStr
     username: str
     password: str = Field(..., min_length=8)
-    role: str = "user"
+    role: str = "admin"
     is_active: bool = True
 
 
