@@ -77,7 +77,7 @@ async def run_daily_search_topic_ai_discovery(db: AsyncSession) -> dict:
         triggered_by="celery_beat", started_at=started_at,
     )
     db.add(summary_run)
-    await db.flush()
+    await db.commit()  # commit (bukan flush) -- lihat catatan created_at di bawah
 
     considered = 0
     called = 0
@@ -123,7 +123,19 @@ async def run_daily_search_topic_ai_discovery(db: AsyncSession) -> dict:
                 triggered_by="celery_beat", started_at=topic_started,
             )
             db.add(topic_run)
-            await db.flush()
+            # commit (bukan flush) SEBELUM panggilan AI yang bisa 1-10+ menit --
+            # kalau cuma flush, transaksi ini tetap terbuka sepanjang panggilan
+            # AI, dan Postgres `now()` (dipakai server_default created_at di
+            # trend_recommendations lewat submit_recommendations() nanti) itu
+            # transaction_timestamp() -- TETAP di awal transaksi, BUKAN waktu
+            # statement itu benar-benar jalan. Kalau transaksi ini tidak
+            # ditutup dulu, created_at baris trend_recommendations yang
+            # disubmit nanti (setelah AI selesai) akan ikut mundur ke SEBELUM
+            # AI dipanggil -- meleset dari jendela waktu yang dipakai
+            # get_search_topic_ai_discovery_trace() utk mencocokkan sub-topik
+            # ke run ini (ditemukan lewat tes live: found_subtopics kosong
+            # padahal datanya ada, krn created_at < topic_run.started_at).
+            await db.commit()
 
             try:
                 items = await find_topic_scoped_updates(
