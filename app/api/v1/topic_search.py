@@ -58,7 +58,7 @@ Alur konfirmasi tier-3 SAMA PERSIS.
 """
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
@@ -648,6 +648,77 @@ async def get_topic_detail(
         "ai_discovery_history": ai_discovery_history,
         "created_at": topic.created_at.isoformat(),
         "updated_at": topic.updated_at.isoformat(),
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: Grafik Tren N Hari (post + sentimen + sub-topik AI discovery)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/topics/{topic_id}/trend-graph", response_model=dict)
+async def get_topic_trend_graph(
+    topic_id: uuid.UUID,
+    days: int = Query(default=7, ge=1, le=30),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Grafik tren `days` hari terakhir (default 7) utk 1 topik: volume post per
+    hari per platform + sentimen komentar per hari (`lexicon_analyses` --
+    TERISI, beda dari tabel `sentiments`/IndoBERT yang nyaris kosong) +
+    sub-topik BARU yang ditemukan AI-context discovery per hari (kalau topik
+    ini pernah/sedang schedule_recurring). Gabungan 3 sumber data yang SUDAH
+    ADA, TIDAK ada tabel/kolom baru.
+
+    Hari tanpa post/sentimen/sub-topik tetap muncul di array `days` dengan
+    angka 0/list kosong -- supaya grafik di frontend selalu genap `days`
+    titik, tidak perlu isi celah sendiri.
+    """
+    from sqlalchemy.orm import selectinload
+
+    from app.services.search_topics.ai_discovery_service import get_topic_ai_discovery_history
+
+    topic = await db.scalar(
+        select(SearchTopic)
+        .options(selectinload(SearchTopic.topic_keywords))
+        .where(SearchTopic.id == topic_id)
+    )
+    if not topic:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError(f"Topik {topic_id} tidak ditemukan")
+
+    keywords = [stk.keyword_text for stk in topic.topic_keywords]
+    today = date.today()
+    day_list = [today - timedelta(days=i) for i in range(days - 1, -1, -1)]  # oldest -> terbaru
+
+    post_counts = await tier_search.get_daily_post_counts(db, keywords, topic.platforms, days)
+    sentiment_counts = await tier_search.get_daily_sentiment_counts(db, keywords, topic.platforms, days)
+
+    # Sub-topik baru per hari dari riwayat AI-context discovery topik ini --
+    # `ai_call_started_at` sudah ISO datetime, ambil 10 karakter pertama (YYYY-MM-DD)
+    # utk dikelompokkan per hari yang sama seperti post_counts/sentiment_counts.
+    ai_history = await get_topic_ai_discovery_history(db, topic.name, limit=days * 2)
+    subtopics_by_day: dict[str, list[str]] = {}
+    for entry in ai_history:
+        day_key = entry["ai_call_started_at"][:10]
+        subtopics_by_day.setdefault(day_key, []).extend(s["subtopic"] for s in entry["found_subtopics"])
+
+    days_out = []
+    for d in day_list:
+        day_key = d.isoformat()
+        by_platform = post_counts.get(day_key, {})
+        days_out.append({
+            "date": day_key,
+            "total_posts": sum(by_platform.values()),
+            "by_platform": by_platform,
+            "sentiment": sentiment_counts.get(day_key, {}),
+            "new_subtopics_found": subtopics_by_day.get(day_key, []),
+        })
+
+    return build_success_response({
+        "topic_id": str(topic.id),
+        "name": topic.name,
+        "days": days_out,
     })
 
 

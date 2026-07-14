@@ -231,3 +231,84 @@ async def count_posts_and_comments_by_keyword(
     """), comment_params)).scalar() or 0
 
     return total_posts, total_comments
+
+
+def _multi_keyword_or_clause(column: str, keywords: list[str], params: dict) -> str:
+    """OR antar BEBERAPA keyword (topik bisa punya >1 keyword), tiap keyword
+    sendiri tetap AND per-kata lewat _word_and_clause -- dipakai grafik tren
+    harian (get_daily_post_counts/get_daily_sentiment_counts) yang perlu
+    menghitung SEMUA keyword topik sekaligus, bukan satu-satu."""
+    clauses = [_word_and_clause(column, kw, params, f"kw{i}") for i, kw in enumerate(keywords)]
+    return "(" + " OR ".join(clauses) + ")"
+
+
+async def get_daily_post_counts(
+    db: AsyncSession,
+    keywords: list[str],
+    platforms: list[str] | None,
+    days: int = 7,
+) -> dict[str, dict[str, int]]:
+    """Jumlah post per hari per platform, `days` hari terakhir (termasuk hari
+    ini), utk SEMUA keyword topik sekaligus (OR antar keyword) -- dipakai
+    GET /search/topics/{id}/trend-graph. Return {tanggal_iso: {platform: count}},
+    hari yang genuinely 0 post TIDAK muncul sebagai key (pemanggil isi 0
+    sendiri saat menyusun array 7 hari penuh)."""
+    if not keywords:
+        return {}
+    platform_clause = "AND platform = ANY(:platforms)" if platforms else ""
+    params: dict = {"days": days}
+    match_clause = _multi_keyword_or_clause("content", keywords, params)
+    if platforms:
+        params["platforms"] = platforms
+
+    rows = (await db.execute(text(f"""
+        SELECT date_trunc('day', collected_at)::date AS day, platform, count(*) AS cnt
+        FROM posts
+        WHERE {match_clause}
+          {platform_clause}
+          AND collected_at >= (CURRENT_DATE - (:days - 1) * INTERVAL '1 day')
+        GROUP BY day, platform
+        ORDER BY day
+    """), params)).mappings().all()
+
+    result: dict[str, dict[str, int]] = {}
+    for r in rows:
+        result.setdefault(r["day"].isoformat(), {})[r["platform"]] = r["cnt"]
+    return result
+
+
+async def get_daily_sentiment_counts(
+    db: AsyncSession,
+    keywords: list[str],
+    platforms: list[str] | None,
+    days: int = 7,
+) -> dict[str, dict[str, int]]:
+    """Sentimen komentar (`lexicon_analyses` -- INI yang genuinely terisi,
+    99%+ komentar, BEDA dari tabel `sentiments`/IndoBERT yang nyaris kosong,
+    lihat get_sentiment_summary_by_keyword() di atas) per hari, `days` hari
+    terakhir, utk SEMUA keyword topik sekaligus. Return
+    {tanggal_iso: {label: count}}."""
+    if not keywords:
+        return {}
+    platform_clause = "AND p.platform = ANY(:platforms)" if platforms else ""
+    params: dict = {"days": days}
+    match_clause = _multi_keyword_or_clause("p.content", keywords, params)
+    if platforms:
+        params["platforms"] = platforms
+
+    rows = (await db.execute(text(f"""
+        SELECT date_trunc('day', la.created_at)::date AS day, la.label, count(*) AS cnt
+        FROM lexicon_analyses la
+        JOIN comments c ON c.id = la.comment_id
+        JOIN posts p ON p.id = c.post_id
+        WHERE {match_clause}
+          {platform_clause}
+          AND la.created_at >= (CURRENT_DATE - (:days - 1) * INTERVAL '1 day')
+        GROUP BY day, la.label
+        ORDER BY day
+    """), params)).mappings().all()
+
+    result: dict[str, dict[str, int]] = {}
+    for r in rows:
+        result.setdefault(r["day"].isoformat(), {})[r["label"]] = r["cnt"]
+    return result
