@@ -2391,8 +2391,20 @@ async def scrape_monitor_public(
             "message":        ed_message,
             "last_error_at":  last_err_at.isoformat()    if last_err_at    else None,
             "last_success_at": ed_success_at.isoformat() if ed_success_at  else None,
-            "affects":        ["youtube", "instagram"],
-            "recovery":       "Otomatis pulih saat subscription diperbarui. Celery Beat: Instagram 09:00, YouTube 12:00 WIB.",
+            # HANYA YouTube -- EnsembleData provider UTAMA di sana (fallback
+            # YouTube Data API v3 kalau expired/quota). Instagram TIDAK
+            # dimasukkan lagi di sini: sejak provider abstraction Apify+fallback
+            # EnsembleData (lihat app/services/instagram/providers/registry.py,
+            # docs/analisa-gap-instagram.md), Apify adalah provider UTAMA
+            # Instagram -- expired-nya EnsembleData cuma menghilangkan
+            # fallback-nya, BUKAN penyebab utama Instagram macet (cek
+            # `apify_quota` di atas utk status provider utama Instagram).
+            "affects":        ["youtube"],
+            "recovery":       "Otomatis pulih saat subscription diperbarui. Celery Beat: YouTube 12:00 WIB.",
+            "instagram_note": (
+                "EnsembleData cuma fallback utk Instagram (Apify tetap provider utama sejak migrasi) -- "
+                "expired di sini TIDAK otomatis berarti Instagram macet. Cek `apify_quota` utk status provider utama Instagram."
+            ),
         },
         "instagram": {
             "total_posts":     ig_posts_total,
