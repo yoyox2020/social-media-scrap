@@ -1,9 +1,10 @@
 """
 Celery task untuk Smart Search — pemindaian berkala harian + antrian
-pencarian yang di-konfirmasi user secara langsung.
+pencarian yang di-konfirmasi user secara langsung + AI-context discovery.
 
 Beat schedule (di celery_app.py):
-  search-topic-rescan-daily → search_topics_daily_rescan_task
+  search-topic-rescan-daily      → search_topics_daily_rescan_task
+  search-topic-ai-discovery-daily → search_topics_ai_discovery_daily_task
 
 Dipicu on-demand (dari app/api/v1/topic_search.py saat tier-1 kosong & auto_crawl=true):
   workers.search_topics.process_confirmed_queue → process_confirmed_search_queue_task
@@ -42,6 +43,36 @@ def search_topics_daily_rescan_task(self):
         return result
     except Exception as exc:
         logger.error("search_topics_daily_rescan error: %s", exc)
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(
+    name="workers.search_topics.ai_discovery_daily",
+    bind=True,
+    max_retries=1,
+    default_retry_delay=300,
+)
+def search_topics_ai_discovery_daily_task(self):
+    """
+    Task harian: AI dipandu topik+keyword SearchTopic recurring sbg konteks,
+    cari perkembangan/sub-topik BARU terkait, lihat
+    app/services/search_topics/ai_discovery_service.py. `max_retries=1`
+    (bukan 2 seperti rescan literal) krn task ini panggil AI berbayar --
+    retry penuh akan mengulang biaya semua topik yang sudah dicoba.
+    """
+    from app.infrastructure.database.connection import AsyncSessionLocal
+    from app.services.search_topics.ai_discovery_service import run_daily_search_topic_ai_discovery
+
+    async def _run():
+        async with AsyncSessionLocal() as db:
+            return await run_daily_search_topic_ai_discovery(db)
+
+    try:
+        result = asyncio.run(_run())
+        logger.info("search_topics_ai_discovery_daily done: %s", result)
+        return result
+    except Exception as exc:
+        logger.error("search_topics_ai_discovery_daily error: %s", exc)
         raise self.retry(exc=exc)
 
 

@@ -105,6 +105,22 @@ celery_app.conf.update(
                 minute=settings.viral_discovery_schedule_minute,
             ),
         },
+        # Smart Search AI-context discovery ("Subsistem A2", lihat
+        # app/services/search_topics/ai_discovery_service.py): AI dipandu
+        # topik+keyword yang SUDAH disimpan user (SearchTopic recurring) sbg
+        # konteks, cari perkembangan/sub-topik BARU terkait -- BUKAN blind
+        # sweep (viral-discovery-daily di atas), BUKAN rescan literal
+        # (search-topic-rescan-daily). Jalan SETELAH keduanya (06:00, 07:00)
+        # supaya cek "sudah tercover" lihat hasil keduanya, tapi masih
+        # SEBELUM konsumer harian Instagram 09:00 supaya sub-topik yang
+        # ditemukan sempat kepilih hari yang sama.
+        "search-topic-ai-discovery-daily": {
+            "task": "workers.search_topics.ai_discovery_daily",
+            "schedule": crontab(
+                hour=settings.smart_search_ai_discovery_schedule_hour,
+                minute=settings.smart_search_ai_discovery_schedule_minute,
+            ),
+        },
         # Instagram: scrape topik trend_recommendations (via Apify), jadwal via .env
         # Maks settings.instagram_trend_daily_budget topik/hari, lihat docs/trend-recommendations.md
         "instagram-trend-recommendation-daily": {

@@ -47,21 +47,26 @@ from app.services.search_topics import discovery, tier_search
 logger = logging.getLogger(__name__)
 
 
-async def _has_related_account_today(db: AsyncSession, keyword_text: str, platform: str) -> bool:
-    """Cek apakah trend_recommendations SUDAH punya entri keyword ini dgn
-    akun platform ini HARI INI -- kalau ya, jangan panggil tier-3 lagi
-    (biarkan task harian platform itu sendiri yang scrape akunnya)."""
+async def has_related_account_today(db: AsyncSession, keyword_texts: list[str], platform: str) -> bool:
+    """Cek apakah trend_recommendations SUDAH punya entri utk SALAH SATU
+    keyword ini dgn akun platform ini HARI INI -- kalau ya, jangan panggil
+    tier-3 lagi (biarkan task harian platform itu sendiri yang scrape
+    akunnya). Generalisasi dari versi single-keyword lama (`keyword_text`
+    tunggal) supaya dipakai bersama oleh rescan literal di file ini DAN
+    app/services/search_topics/ai_discovery_service.py (AI-context discovery,
+    cek per-topik lintas semua keyword topik itu sekaligus)."""
     from app.domain.trend_recommendations.models import TrendRecommendation
 
-    row = await db.scalar(
+    rows = (await db.scalars(
         select(TrendRecommendation).where(
-            TrendRecommendation.topic == keyword_text,
+            TrendRecommendation.topic.in_(keyword_texts),
             TrendRecommendation.recommendation_date == date.today(),
         )
+    )).all()
+    return any(
+        a.get("platform") == platform
+        for row in rows for a in (row.related_accounts or [])
     )
-    if not row:
-        return False
-    return any(a.get("platform") == platform for a in (row.related_accounts or []))
 
 
 async def run_daily_search_topic_rescan(db: AsyncSession) -> dict:
@@ -119,7 +124,7 @@ async def run_daily_search_topic_rescan(db: AsyncSession) -> dict:
 
                     source_tag = None
                     if platform in discovery.ACCOUNT_DISCOVERY_PLATFORMS:
-                        if await _has_related_account_today(db, stk.keyword_text, platform):
+                        if await has_related_account_today(db, [stk.keyword_text], platform):
                             skipped_pending += 1
                             continue
                         source_tag = f"smart_search_{platform}"

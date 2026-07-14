@@ -187,7 +187,7 @@ def _extract_items(raw_items: list[dict], max_topics: int, search_text: str | No
     return found
 
 
-def _system_prompt(max_topics: int, has_web_search: bool) -> str:
+def _system_prompt(max_topics: int, has_web_search: bool, focus_context: str | None = None) -> str:
     today = datetime.now(timezone.utc).strftime("%d %B %Y")
     browsing_note = (
         f"gunakan web_search untuk menemukan (query HARUS spesifik dan menyertakan "
@@ -212,6 +212,28 @@ def _system_prompt(max_topics: int, has_web_search: bool) -> str:
         "Facebook (platform='facebook'), TikTok (platform='tiktok'), DAN/ATAU "
         "Twitter/X (platform='twitter') — yang mendorong viralitasnya untuk tiap topik."
     )
+
+    if focus_context:
+        # Dipakai find_topic_scoped_updates() -- BEDA dari sapuan buta: AI
+        # diberi topik+keyword yang SUDAH disimpan user sebagai KONTEKS, tugasnya
+        # cari PERKEMBANGAN/SUB-TOPIK BARU terkait tema itu (bukan echo keyword
+        # yang sama), supaya rescan literal (ILIKE/Apify keyword search, sudah
+        # ada terpisah) dan AI ini saling melengkapi bukan tumpang tindih.
+        task_intro = (
+            f"Kamu adalah AI trend-analyst. Hari ini tanggal {today}. User SUDAH memantau "
+            f"{focus_context}. Tugasmu HARI INI: {browsing_note} PERKEMBANGAN atau SUB-TOPIK "
+            "BARU yang benar-benar terjadi HARI INI terkait tema tersebut -- BUKAN mengulang "
+            "keyword yang sudah dipantau user apa adanya (kalau tidak ada perkembangan baru, "
+            "JANGAN mengarang, submit list kosong lewat tool tanpa item)."
+        )
+        return (
+            f"{task_intro} {account_rule} Kalau tidak menemukan akun Instagram, Facebook, "
+            f"TikTok, MAUPUN Twitter/X sama sekali untuk suatu sub-topik, jangan sertakan "
+            f"sub-topik itu. Maksimal {max_topics} sub-topik BARU, jangan mengarang untuk "
+            "mencapai jumlah itu — kalau cuma menemukan lebih sedikit (termasuk nol), "
+            f"submit yang nyata saja. Setelah menemukan data nyata, panggil tool {_TOOL_NAME}."
+        )
+
     return (
         f"Kamu adalah AI trend-analyst. Hari ini tanggal {today}. Tugasmu HARI INI: "
         f"{browsing_note} topik/isu yang BENAR-BENAR sedang viral di berita Indonesia "
@@ -225,6 +247,12 @@ def _system_prompt(max_topics: int, has_web_search: bool) -> str:
     )
 
 
+def _build_user_message(focus_context: str | None) -> str:
+    if focus_context:
+        return f"Cari perkembangan/sub-topik BARU hari ini terkait {focus_context}."
+    return "Cari topik/akun yang sedang viral hari ini (berita + Instagram/Facebook/TikTok publik Indonesia)."
+
+
 async def find_daily_viral_topics() -> list[dict]:
     """
     Sapuan terbuka harian untuk topik+akun Instagram/Facebook/TikTok yang
@@ -232,22 +260,64 @@ async def find_daily_viral_topics() -> list[dict]:
     (anthropic/openai/ollama/auto). Return list item siap dipakai
     `TrendRecommendationItem` (topic/score/related_accounts).
     """
+    return await _dispatch(focus_context=None, max_topics=None)
+
+
+async def find_topic_scoped_updates(
+    topic_name: str, keywords: list[str], target_platforms: list[str], max_subtopics: int,
+) -> list[dict]:
+    """
+    Dipakai app/services/search_topics/ai_discovery_service.py -- BEDA dari
+    find_daily_viral_topics() (sapuan buta, tidak tahu topik user sama
+    sekali): di sini AI diberi topik+keyword yang SUDAH disimpan user
+    (Smart Search, schedule_recurring=true) sebagai KONTEKS, diminta cari
+    PERKEMBANGAN/SUB-TOPIK BARU terkait tema itu -- BUKAN re-search literal
+    keyword yang sama (itu tugas rescan_service.py yang terpisah, tanpa AI).
+
+    Hasil di-filter 2 lapis TAMBAHAN di luar _extract_items() (yang tetap
+    jalan di dalam _dispatch()):
+      1. Tolak item yang topic-nya PERSIS SAMA (case-insensitive) dengan
+         salah satu keyword yang sudah dipantau -- tanda AI cuma echo balik
+         keyword lama, bukan genuinely menemukan sub-topik baru.
+      2. Buang related_accounts yang platform-nya BUKAN target_platforms
+         (topik ini mungkin sudah tercover sebagian platform, cuma platform
+         yang belum tercover yang diminta ke AI -- lihat has_related_account_today
+         di rescan_service.py).
+    """
+    focus_context = (
+        f"topik '{topic_name}' (keyword yang dipantau: {', '.join(keywords)}), "
+        f"akun di platform: {', '.join(target_platforms)}"
+    )
+    items = await _dispatch(focus_context=focus_context, max_topics=max_subtopics)
+
+    kw_lower = {k.strip().lower() for k in keywords}
+    filtered: list[dict] = []
+    for item in items:
+        if item["topic"].strip().lower() in kw_lower:
+            continue
+        accounts = [a for a in item["related_accounts"] if a["platform"] in target_platforms]
+        if accounts:
+            filtered.append({**item, "related_accounts": accounts})
+    return filtered
+
+
+async def _dispatch(focus_context: str | None, max_topics: int | None) -> list[dict]:
     provider = settings.ai_discovery_provider
 
     if provider == "auto":
-        return await _find_via_auto_switch()
+        return await _find_via_auto_switch(focus_context, max_topics)
     if provider == "anthropic":
-        return await _find_via_anthropic()
+        return await _find_via_anthropic(focus_context, max_topics)
     if provider == "openai":
-        return await _find_via_openai()
+        return await _find_via_openai(focus_context, max_topics)
     if provider == "ollama":
-        return await _find_via_ollama()
+        return await _find_via_ollama(focus_context, max_topics)
 
     logger.warning("find_daily_viral_topics: ai_discovery_provider tidak dikenal: %s", provider)
     return []
 
 
-async def _find_via_auto_switch() -> list[dict]:
+async def _find_via_auto_switch(focus_context: str | None = None, max_topics: int | None = None) -> list[dict]:
     """
     Auto-switch Anthropic -> Ollama, STATELESS (tidak nyimpen status "lagi
     down" di mana pun). Tiap run SELALU coba Anthropic dulu (kalau
@@ -264,7 +334,7 @@ async def _find_via_auto_switch() -> list[dict]:
     """
     if settings.anthropic_api_key:
         try:
-            items = await _find_via_anthropic()
+            items = await _find_via_anthropic(focus_context, max_topics)
             if items:
                 return items
             logger.warning("find_daily_viral_topics[auto]: Anthropic 0 topik, fallback ke Ollama")
@@ -273,14 +343,14 @@ async def _find_via_auto_switch() -> list[dict]:
     else:
         logger.info("find_daily_viral_topics[auto]: ANTHROPIC_API_KEY kosong, langsung pakai Ollama")
 
-    return await _find_via_ollama()
+    return await _find_via_ollama(focus_context, max_topics)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Provider: Anthropic (Claude) — satu-satunya yang punya web_search bawaan
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _find_via_anthropic() -> list[dict]:
+async def _find_via_anthropic(focus_context: str | None = None, max_topics: int | None = None) -> list[dict]:
     if not settings.anthropic_api_key:
         logger.warning("find_daily_viral_topics[anthropic]: ANTHROPIC_API_KEY belum di-set, dilewati")
         return []
@@ -288,7 +358,7 @@ async def _find_via_anthropic() -> list[dict]:
     import anthropic
 
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-    max_topics = settings.viral_discovery_max_topics
+    effective_max_topics = max_topics or settings.viral_discovery_max_topics
 
     tools = [
         {"type": "web_search_20260209", "name": "web_search", "max_uses": 5},
@@ -296,7 +366,7 @@ async def _find_via_anthropic() -> list[dict]:
     ]
 
     messages: list[dict] = [
-        {"role": "user", "content": "Cari topik/akun yang sedang viral hari ini (berita + Instagram/Facebook/TikTok publik Indonesia)."}
+        {"role": "user", "content": _build_user_message(focus_context)}
     ]
     found_items: list[dict] = []
 
@@ -304,7 +374,7 @@ async def _find_via_anthropic() -> list[dict]:
         response = client.messages.create(
             model=settings.anthropic_model,
             max_tokens=4096,
-            system=_system_prompt(max_topics, has_web_search=True),
+            system=_system_prompt(effective_max_topics, has_web_search=True, focus_context=focus_context),
             thinking={"type": "adaptive"},
             tools=tools,
             messages=messages,
@@ -325,7 +395,7 @@ async def _find_via_anthropic() -> list[dict]:
         tool_results = []
         for block in tool_uses:
             items = block.input.get("items", [])
-            found_items.extend(_extract_items(items, max_topics))
+            found_items.extend(_extract_items(items, effective_max_topics))
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -334,7 +404,7 @@ async def _find_via_anthropic() -> list[dict]:
         messages.append({"role": "user", "content": tool_results})
         break  # cukup satu putaran submit, tidak perlu lanjut agentic loop
 
-    found_items = found_items[:max_topics]
+    found_items = found_items[:effective_max_topics]
     logger.info("find_daily_viral_topics[anthropic]: ditemukan %d topik (dengan akun instagram)", len(found_items))
     return found_items
 
@@ -343,7 +413,7 @@ async def _find_via_anthropic() -> list[dict]:
 # Provider: OpenAI — function calling saja, TIDAK ADA browsing bawaan
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _find_via_openai() -> list[dict]:
+async def _find_via_openai(focus_context: str | None = None, max_topics: int | None = None) -> list[dict]:
     if not settings.openai_api_key:
         logger.warning("find_daily_viral_topics[openai]: OPENAI_API_KEY belum di-set, dilewati")
         return []
@@ -351,15 +421,15 @@ async def _find_via_openai() -> list[dict]:
     from openai import OpenAI
 
     client = OpenAI(api_key=settings.openai_api_key)
-    max_topics = settings.viral_discovery_max_topics
+    effective_max_topics = max_topics or settings.viral_discovery_max_topics
 
     tools = [{
         "type": "function",
         "function": {"name": _TOOL_NAME, "description": _TOOL_DESCRIPTION, "parameters": _TOOL_PARAMETERS},
     }]
     messages: list[dict] = [
-        {"role": "system", "content": _system_prompt(max_topics, has_web_search=False)},
-        {"role": "user", "content": "Cari topik/akun yang sedang viral hari ini (berita + Instagram/Facebook/TikTok publik Indonesia)."},
+        {"role": "system", "content": _system_prompt(effective_max_topics, has_web_search=False, focus_context=focus_context)},
+        {"role": "user", "content": _build_user_message(focus_context)},
     ]
 
     found_items: list[dict] = []
@@ -370,10 +440,10 @@ async def _find_via_openai() -> list[dict]:
         if call.function.name != _TOOL_NAME:
             continue
         args = json.loads(call.function.arguments)
-        found_items.extend(_extract_items(args.get("items", []), max_topics))
+        found_items.extend(_extract_items(args.get("items", []), effective_max_topics))
 
     logger.info("find_daily_viral_topics[openai]: ditemukan %d topik (TANPA browsing — cek akurasi)", len(found_items))
-    return found_items[:max_topics]
+    return found_items[:effective_max_topics]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -522,12 +592,12 @@ async def _web_search(query: str, max_results: int = 5) -> str:
     return "Web search tidak tersedia (FIRECRAWL_API_KEY/TAVILY_API_KEY belum di-set)."
 
 
-async def _find_via_ollama() -> list[dict]:
+async def _find_via_ollama(focus_context: str | None = None, max_topics: int | None = None) -> list[dict]:
     from openai import OpenAI
 
     base_url = f"{settings.ollama_base_url}/v1"
     client = OpenAI(base_url=base_url, api_key="ollama")  # api_key diabaikan Ollama, tapi wajib diisi
-    max_topics = settings.viral_discovery_max_topics
+    effective_max_topics = max_topics or settings.viral_discovery_max_topics
     has_web_search = bool(settings.firecrawl_api_key or settings.tavily_api_key)
 
     if not has_web_search:
@@ -550,8 +620,8 @@ async def _find_via_ollama() -> list[dict]:
         })
 
     messages: list[dict] = [
-        {"role": "system", "content": _system_prompt(max_topics, has_web_search=has_web_search)},
-        {"role": "user", "content": "Cari topik/akun yang sedang viral hari ini (berita + Instagram/Facebook/TikTok publik Indonesia)."},
+        {"role": "system", "content": _system_prompt(effective_max_topics, has_web_search=has_web_search, focus_context=focus_context)},
+        {"role": "user", "content": _build_user_message(focus_context)},
     ]
 
     found_items: list[dict] = []
@@ -604,7 +674,7 @@ async def _find_via_ollama() -> list[dict]:
             # search_text=None kalau has_web_search=False -- grounding check
             # di-skip total (lihat docstring _extract_items), bukan menolak semua.
             search_text = " ".join(accumulated_search_text) if has_web_search else None
-            accepted = _extract_items(items, max_topics, search_text=search_text)
+            accepted = _extract_items(items, effective_max_topics, search_text=search_text)
             found_items.extend(accepted)
             messages.append({
                 "role": "tool", "tool_call_id": call.id,
@@ -623,7 +693,7 @@ async def _find_via_ollama() -> list[dict]:
         if not search_calls:
             break  # tool_call tidak dikenali sama sekali, hindari infinite loop
 
-    found_items = found_items[:max_topics]
+    found_items = found_items[:effective_max_topics]
     logger.info(
         "find_daily_viral_topics[ollama]: ditemukan %d topik (web_search=%s)",
         len(found_items), has_web_search,

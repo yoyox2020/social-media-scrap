@@ -160,6 +160,19 @@ class Settings(BaseSettings):
     # _pick_eviction_candidate() di app/services/trend_recommendations/service.py.
     smart_search_reserved_slots: int = 5
 
+    # Smart Search AI-context discovery (app/services/search_topics/ai_discovery_service.py)
+    # -- AI dipandu SearchTopic recurring (name+keywords) utk cari perkembangan
+    # BARU terkait, BEDA dari blind sweep (viral_discovery_max_topics) DAN
+    # literal tier-3 (discovery.py, tanpa AI). Dua budget terpisah: berapa
+    # TOPIK dapat panggilan AI/hari (kontrol biaya utama) vs berapa sub-topik
+    # baru/panggilan. Jadwal jalan SETELAH rescan literal (06:00) & blind sweep
+    # (07:00) supaya cek "sudah tercover" lihat hasil keduanya, tapi masih
+    # sebelum konsumer harian Instagram (09:00) supaya sempat kepilih hari itu.
+    smart_search_ai_discovery_max_topics_per_run: int = 5
+    smart_search_ai_discovery_max_subtopics_per_topic: int = 3
+    smart_search_ai_discovery_schedule_hour: int = 8
+    smart_search_ai_discovery_schedule_minute: int = 0
+
     # YouTube Data API v3 (fallback saat EnsembleData quota habis)
     youtube_data_api_key: str = ""
 

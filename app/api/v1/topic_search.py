@@ -541,6 +541,45 @@ async def list_all_searched_keywords(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: Status AI-Context Discovery ("Subsistem A2")
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/topics/ai-discovery/status", response_model=dict)
+async def get_ai_discovery_status(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Status run TERAKHIR AI-context discovery -- AI dipandu topik+keyword
+    SearchTopic recurring sbg konteks, cari perkembangan/sub-topik BARU
+    terkait (lihat app/services/search_topics/ai_discovery_service.py).
+    Setara get_viral_discovery_trace() (Subsistem A) tapi per-topik, untuk
+    Smart Search sendiri (Subsistem A2).
+    """
+    from app.services.search_topics.ai_discovery_service import (
+        TARGET_PLATFORMS,
+        get_search_topic_ai_discovery_trace,
+    )
+    from app.shared.config import settings
+
+    trace = await get_search_topic_ai_discovery_trace(db)
+
+    return build_success_response({
+        "config": {
+            "provider": settings.ai_discovery_provider,
+            "schedule": (
+                f"{settings.smart_search_ai_discovery_schedule_hour:02d}:"
+                f"{settings.smart_search_ai_discovery_schedule_minute:02d} WIB otomatis (Celery Beat)"
+            ),
+            "max_topics_per_run": settings.smart_search_ai_discovery_max_topics_per_run,
+            "max_subtopics_per_topic": settings.smart_search_ai_discovery_max_subtopics_per_topic,
+            "target_platforms": sorted(TARGET_PLATFORMS),
+        },
+        **trace,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ENDPOINT: Detail Satu Topik
 # ─────────────────────────────────────────────────────────────────────────────
 

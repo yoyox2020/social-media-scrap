@@ -30,6 +30,12 @@ class SearchTopic(Base):
     schedule_duration_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     schedule_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     schedule_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    # Kapan topik ini TERAKHIR benar-benar dapat panggilan AI-context discovery
+    # (app/services/search_topics/ai_discovery_service.py) -- HANYA di-update
+    # saat AI beneran dipanggil (bukan saat di-skip krn sudah tercover), dipakai
+    # urutkan rotasi ASC NULLS FIRST supaya topik yang belum/paling lama
+    # dipanggil menang duluan saat budget harian terbatas.
+    last_ai_discovery_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
 
