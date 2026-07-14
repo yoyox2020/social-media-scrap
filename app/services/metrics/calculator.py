@@ -21,14 +21,18 @@ from app.domain.keywords.models import Keyword
 from app.domain.posts.models import Post
 from app.domain.youtube_analysis.models import LexiconAnalysis
 from app.services.metrics.adapters.base import PlatformAdapter
+from app.services.metrics.adapters.tiktok import TikTokAdapter
+from app.services.metrics.adapters.twitter import TwitterAdapter
 from app.services.metrics.adapters.youtube import YouTubeAdapter
 
 # ── Registry: tambah platform baru di sini ───────────────────────────────────
 ADAPTER_REGISTRY: dict[str, PlatformAdapter] = {
     "youtube": YouTubeAdapter(),
-    # "tiktok":    TikTokAdapter(),
-    # "instagram": InstagramAdapter(),
-    # "news":      NewsAdapter(),
+    "tiktok":  TikTokAdapter(),
+    "twitter": TwitterAdapter(),
+    # "instagram": InstagramAdapter(),  # belum -- views/shares tidak tersedia dari provider (lihat analisa engagement)
+    # "facebook":  FacebookAdapter(),   # belum -- views/shares tidak tersedia dari provider (lihat analisa engagement)
+    # "news":      NewsAdapter(),       # belum relevan -- artikel tidak punya konsep engagement sosial
 }
 
 
