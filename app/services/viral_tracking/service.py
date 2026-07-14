@@ -176,6 +176,12 @@ async def run_daily_channel_scrape(db: AsyncSession, tracker_id: uuid.UUID) -> i
                 existing = await post_repo.get_existing_external_ids(ext_ids, "youtube")
                 new_posts = [p for p in posts if p.external_id not in existing]
 
+                if new_posts:
+                    # Isi views/likes/comments yang selalu 0 dari hasil search --
+                    # lihat docstring enrich_youtube_statistics() di normalizer.py.
+                    from app.services.processing.normalizer import enrich_youtube_statistics
+                    await enrich_youtube_statistics(new_posts)
+
                 for post in new_posts:
                     meta = post.metadata_ or {}
                     meta["tracker_id"] = str(tracker_id)
@@ -419,6 +425,12 @@ async def run_daily_keyword_scrape(db: AsyncSession, tracker_id: uuid.UUID) -> i
             ext_ids = [p.external_id for p in posts]
             existing_set = await post_repo.get_existing_external_ids(ext_ids, "youtube")
             new_posts = [p for p in posts if p.external_id not in existing_set]
+
+            if new_posts:
+                # Isi views/likes/comments yang selalu 0 dari hasil search --
+                # lihat docstring enrich_youtube_statistics() di normalizer.py.
+                from app.services.processing.normalizer import enrich_youtube_statistics
+                await enrich_youtube_statistics(new_posts)
 
             for post in new_posts:
                 meta = post.metadata_ or {}
