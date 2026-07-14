@@ -105,6 +105,17 @@ async def run_daily_search_topic_ai_discovery(db: AsyncSession) -> dict:
                 skipped_no_platform += 1
                 continue
 
+            # AI ini submit sub-topik dgn TEKS BARU (bukan keyword asli), jadi
+            # has_related_account_today() di bawah (yang cocokkan topic==keyword
+            # asli) TIDAK PERNAH menganggap topik ini "sudah tercover" oleh
+            # panggilan AI sebelumnya di hari yang sama -- cek terpisah ini
+            # yang mencegahnya (ditemukan lewat tes live: re-trigger 2x hari
+            # yang sama sama-sama memanggil AI, padahal panggilan pertama
+            # sudah sukses menemukan sub-topik).
+            if topic.last_ai_discovery_at and topic.last_ai_discovery_at.date() == started_at.date():
+                skipped_covered += 1
+                continue
+
             uncovered = [
                 p for p in target_platforms
                 if not await has_related_account_today(db, keywords, p)
