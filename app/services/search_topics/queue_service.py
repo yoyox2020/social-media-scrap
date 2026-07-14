@@ -1,7 +1,7 @@
 """
-Smart Search -- pemrosesan antrian tier-3 yang di-KONFIRMASI user
-(confirm_third_party=true di POST /search/topics atau
-POST /search/topics/{id}/search), dijalankan di BACKGROUND (Celery task
+Smart Search -- pemrosesan antrian tier-3 yang OTOMATIS terdaftar begitu
+tier-1 kosong (POST /search/topics atau POST /search/topics/{id}/search,
+TANPA konfirmasi tambahan), dijalankan di BACKGROUND (Celery task
 workers.search_topics.process_confirmed_queue, lihat
 app/workers/search_topics_worker.py) -- BUKAN menunggu di request HTTP
 yang sama.

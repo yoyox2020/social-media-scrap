@@ -5,7 +5,7 @@ pencarian yang di-konfirmasi user secara langsung.
 Beat schedule (di celery_app.py):
   search-topic-rescan-daily → search_topics_daily_rescan_task
 
-Dipicu on-demand (dari app/api/v1/topic_search.py saat confirm_third_party=true):
+Dipicu on-demand (dari app/api/v1/topic_search.py saat tier-1 kosong & auto_crawl=true):
   workers.search_topics.process_confirmed_queue → process_confirmed_search_queue_task
 """
 import asyncio
@@ -53,8 +53,8 @@ def search_topics_daily_rescan_task(self):
 )
 def process_confirmed_search_queue_task(self, items: list[dict], topic_id: str | None = None):
     """
-    Dipicu SAAT ITU JUGA (bukan jadwal) saat user confirm_third_party=true
-    di POST /search/topics atau POST /search/topics/{id}/search -- proses
+    Dipicu SAAT ITU JUGA (bukan jadwal) saat POST /search/topics atau
+    POST /search/topics/{id}/search menemukan tier-1 kosong -- proses
     `items` (keyword+platform yang perlu dicari ke third-party) SATU PER
     SATU berurutan, lihat app/services/search_topics/queue_service.py.
     Endpoint pemanggil TIDAK menunggu task ini -- langsung balas "queued"

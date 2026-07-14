@@ -18,23 +18,21 @@ platform sekaligus per topik:**
    TikTok/Twitter, Firecrawl utk News, YouTube Data API/EnsembleData utk
    YouTube) lewat app/services/search_topics/discovery.py -- TANPA AI/LLM,
    reuse fungsi yang SUDAH ADA & terbukti dipakai endpoint /posts/search
-   interaktif tiap platform. **BUTUH KONFIRMASI EKSPLISIT** (lihat
-   `confirm_third_party` di bawah) -- kalau data tidak ada di DB, endpoint
-   TIDAK langsung crawl, cuma melapor status 'needs_confirmation' dulu.
-   Ini HANYA berlaku utk request interaktif lewat endpoint ini; pemindaian
-   berkala (`schedule_recurring=true`, lihat rescan_service.py) TETAP jalan
-   otomatis tanpa konfirmasi ulang tiap hari -- user sudah memberi izin di
-   muka saat mengaktifkan `enable_recurring=true`.
+   interaktif tiap platform. **OTOMATIS, TANPA KONFIRMASI** -- kalau data
+   tidak ada di DB (tier-1 kosong) DAN `auto_crawl=true` (default), keyword
+   itu langsung didaftarkan ke antrian tier-3 (status 'queued'), dibatasi
+   `limit_per_keyword` per keyword (keputusan eksplisit user -- konfirmasi
+   manual dihapus, biar tier-3 selalu jalan otomatis begitu tier-1 kosong).
 
-   **Tier-3 yang dikonfirmasi TIDAK jalan sinkron di request ini** --
-   Apify/Firecrawl bisa 15-60+ detik per panggilan, kalau ada beberapa
-   keyword sekaligus gampang melebihi timeout browser/reverse-proxy.
-   Begitu `confirm_third_party=true`, endpoint cuma DAFTARKAN keyword yang
-   perlu dicari ke antrian Celery (workers.search_topics.process_confirmed_queue,
-   lihat queue_service.py) lalu LANGSUNG balas status 'queued' -- proses
-   sebenarnya jalan di background SATU KEYWORD PER SATU KEYWORD berurutan.
-   Cek hasilnya belakangan lewat GET /search/topics/{id} (posts baru
-   otomatis kehitung begitu tersimpan, tidak perlu endpoint status baru).
+   **Tier-3 TIDAK jalan sinkron di request ini** -- Apify/Firecrawl bisa
+   15-60+ detik per panggilan, kalau ada beberapa keyword sekaligus gampang
+   melebihi timeout browser/reverse-proxy. Endpoint cuma DAFTARKAN keyword
+   yang perlu dicari ke antrian Celery
+   (workers.search_topics.process_confirmed_queue, lihat queue_service.py)
+   lalu LANGSUNG balas status 'queued' -- proses sebenarnya jalan di
+   background SATU KEYWORD PER SATU KEYWORD berurutan. Cek hasilnya
+   belakangan lewat GET /search/topics/{id} (posts baru otomatis kehitung
+   begitu tersimpan, tidak perlu endpoint status baru).
 
 **Pencarian berkala (opsional):** `enable_recurring=true` + `schedule_duration_days`
 menjadwalkan topik utk di-scan ulang tiap hari (Celery task
@@ -96,8 +94,7 @@ class TopicSearchRequest(BaseModel):
     limit_per_keyword: int = Field(default=10, ge=1, le=100)
     include_sentiment: bool = Field(default=True)
     include_comments: bool = Field(default=False)
-    auto_crawl: bool = Field(default=True, description="Izinkan pencarian ke third-party (tier-3) utk topik ini kalau data belum ada -- tetap butuh confirm_third_party=true di request yang sama utk BENAR-BENAR jalan, lihat confirm_third_party")
-    confirm_third_party: bool = Field(default=False, description="WAJIB true baru tier-3 (Apify/Firecrawl/YouTube API) benar-benar dipanggil. Kalau false (default) & data tidak ketemu di DB, endpoint cuma melapor status 'needs_confirmation' TANPA memanggil third-party apa pun -- kirim ulang request yang SAMA (topics+platforms sama persis) dengan confirm_third_party=true setelah user/frontend setuju utk lanjut.")
+    auto_crawl: bool = Field(default=True, description="Izinkan pencarian ke third-party (tier-3) utk topik ini kalau data belum ada di DB -- begitu tier-1 kosong, langsung diantrekan ke background, TANPA konfirmasi tambahan. Set false kalau cuma mau simpan definisi topik / cari di DB saja.")
     scheduled_hour: int | None = Field(default=None, ge=0, le=23, description="TIDAK DIPAKAI -- field lama, dibiarkan apa adanya. Lihat enable_recurring.")
     save_topic: bool = Field(default=True, description="Simpan konfigurasi topik ke DB untuk dashboard")
     enable_recurring: bool = Field(default=False, description="Jadwalkan pencarian berkala harian utk topik ini")
@@ -117,7 +114,6 @@ class SavedTopicSearchRequest(BaseModel):
     'pilih topik tersimpan' + tombol Search."""
     limit_per_keyword: int = Field(default=10, ge=1, le=100)
     include_sentiment: bool = Field(default=True)
-    confirm_third_party: bool = Field(default=False, description="Sama seperti di POST /search/topics -- wajib true baru tier-3 benar-benar dipanggil.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,19 +196,19 @@ async def _search_keyword_tiered(
     limit_per_keyword: int,
     include_sentiment: bool,
     auto_crawl: bool,
-    confirm_third_party: bool,
 ) -> dict:
-    """Tier-1 (DB) -> tandai utk antrian tier-3 (HANYA kalau confirm_third_party=true)
-    utk SATU keyword. Dipakai search_by_topics() (topik baru/existing lewat
-    nama) DAN search_saved_topic() (topik tersimpan lewat topic_id) --
-    logic-nya identik, cuma beda dari mana kw_text/platforms berasal.
+    """Tier-1 (DB) -> kalau kosong & auto_crawl=true, langsung tandai utk
+    antrian tier-3 (TANPA konfirmasi tambahan -- keputusan eksplisit user).
+    Dipakai search_by_topics() (topik baru/existing lewat nama) DAN
+    search_saved_topic() (topik tersimpan lewat topic_id) -- logic-nya
+    identik, cuma beda dari mana kw_text/platforms berasal.
 
-    TIDAK memanggil third-party APAPUN di sini -- kalau confirm_third_party=true
-    & data kosong, cuma menyusun `queue_items` (dict siap dipakai Celery task
-    workers.search_topics.process_confirmed_queue). Pemanggil yang gabungkan
-    queue_items dari semua keyword lalu dispatch SATU task di background --
-    supaya request HTTP tidak menunggu Apify/Firecrawl (15-60+ detik per
-    panggilan), lihat app/services/search_topics/queue_service.py."""
+    TIDAK memanggil third-party APAPUN di sini -- cuma menyusun `queue_items`
+    (dict siap dipakai Celery task workers.search_topics.process_confirmed_queue),
+    dibatasi `limit_per_keyword`. Pemanggil yang gabungkan queue_items dari
+    semua keyword lalu dispatch SATU task di background -- supaya request
+    HTTP tidak menunggu Apify/Firecrawl (15-60+ detik per panggilan), lihat
+    app/services/search_topics/queue_service.py."""
     kw_result: dict = {"keyword": kw_text, "status": "not_found", "total": 0, "posts": [], "queue_items": []}
 
     posts = await tier_search.find_posts_by_keyword(db, kw_text, platforms, limit_per_keyword)
@@ -222,13 +218,7 @@ async def _search_keyword_tiered(
     if include_sentiment and total > 0:
         kw_result["sentiment"] = await tier_search.get_sentiment_summary_by_keyword(db, kw_text, platforms)
 
-    if total == 0 and auto_crawl and not confirm_third_party:
-        kw_result["status"] = "needs_confirmation"
-        kw_result["confirmation_message"] = (
-            f"Data '{kw_text}' tidak ditemukan di database. Cari ke third-party "
-            f"({', '.join(platforms)})? Kirim ulang dengan confirm_third_party=true untuk melanjutkan."
-        )
-    elif total == 0 and auto_crawl and confirm_third_party:
+    if total == 0 and auto_crawl:
         kw_result["status"] = "queued"
         kw_result["queue_items"] = [
             {
@@ -314,11 +304,10 @@ async def search_by_topics(
     **Alur (tier-1 -> tier-3, lihat docstring modul):**
     - Cari setiap keyword di `posts`/`comments` (ILIKE, lintas SEMUA platform diminta)
     - Jika ada data → kembalikan posts + sentimen (status "found")
-    - Jika belum ada + auto_crawl=true + confirm_third_party=false (default)
-      → status "needs_confirmation", TIDAK memanggil third-party apa pun
-    - Jika belum ada + auto_crawl=true + confirm_third_party=true → keyword
-      masuk ANTRIAN background (Celery, status "queued"), diproses SATU PER
-      SATU berurutan (bukan sinkron di request ini -- Apify/Firecrawl bisa
+    - Jika belum ada + auto_crawl=true (default) → keyword LANGSUNG masuk
+      ANTRIAN background (Celery, status "queued"), TANPA konfirmasi
+      tambahan, dibatasi `limit_per_keyword`. Diproses SATU PER SATU
+      berurutan (bukan sinkron di request ini -- Apify/Firecrawl bisa
       15-60+ detik per panggilan, lihat queue_service.py). Cek hasil lewat
       GET /search/topics/{id} atau /list setelah beberapa saat.
     - Topik disimpan ke DB → tampil di `GET /search/topics/list`
@@ -328,7 +317,6 @@ async def search_by_topics(
     platforms = _resolve_platforms(body.platforms)
     topic_results = []
     queued_keywords = []
-    needs_confirmation_keywords = []
 
     for topic in body.topics:
         keyword_results = []
@@ -341,14 +329,12 @@ async def search_by_topics(
 
             kw_result = await _search_keyword_tiered(
                 db, kw_text, platforms, body.limit_per_keyword, body.include_sentiment,
-                body.auto_crawl, body.confirm_third_party,
+                body.auto_crawl,
             )
             kw_result["keyword_id"] = str(keyword.id) if keyword else None
             topic_total_posts += kw_result["total"]
 
-            if kw_result["status"] == "needs_confirmation":
-                needs_confirmation_keywords.append(kw_text)
-            elif kw_result["status"] == "queued":
+            if kw_result["status"] == "queued":
                 queued_keywords.append(kw_text)
                 topic_queue_items.extend(kw_result["queue_items"])
 
@@ -395,7 +381,6 @@ async def search_by_topics(
             },
             "results": [p for kd in keyword_results for p in kd.get("posts", [])],
             "queued": [kd["keyword"] for kd in keyword_results if kd["status"] == "queued"],
-            "needs_confirmation": [kd["keyword"] for kd in keyword_results if kd["status"] == "needs_confirmation"],
         })
 
     await db.commit()
@@ -403,8 +388,6 @@ async def search_by_topics(
     has_data = any(t["total_posts"] > 0 for t in topic_results)
     if queued_keywords:
         overall = "partial" if has_data else "queued"
-    elif needs_confirmation_keywords:
-        overall = "partial_needs_confirmation" if has_data else "needs_confirmation"
     else:
         overall = "ready"
 
@@ -414,18 +397,12 @@ async def search_by_topics(
             "Keyword dengan status 'queued' sedang dicari ke third-party SATU PER SATU di background "
             "(Apify/Firecrawl/YouTube API). Cek lagi lewat GET /search/topics/{topic_id} setelah beberapa saat."
         )
-    elif needs_confirmation_keywords:
-        note = (
-            "Keyword dengan status 'needs_confirmation' tidak ditemukan di database. "
-            "Kirim ulang request yang SAMA dengan confirm_third_party=true untuk mencari ke third-party."
-        )
 
     return build_success_response({
         "status": overall,
         "platforms": platforms,
         "total_topics": len(topic_results),
         "queued_keywords": queued_keywords,
-        "needs_confirmation_keywords": needs_confirmation_keywords,
         "note": note,
         "topics": topic_results,
     })
@@ -639,10 +616,9 @@ async def search_saved_topic(
     ulang name+keywords+platforms (beda dengan POST /search/topics). Cocok
     utk UI 'pilih topik dari dropdown lalu klik Search'.
 
-    Alur SAMA PERSIS dengan POST /search/topics (tier-1 -> butuh
-    confirm_third_party=true baru tier-3 jalan, lihat docstring modul) --
-    cuma di sini scope-nya SATU topik yang sudah ada, bukan bikin/update
-    topik baru.
+    Alur SAMA PERSIS dengan POST /search/topics (tier-1 -> tier-3 otomatis
+    kalau kosong, TANPA konfirmasi, lihat docstring modul) -- cuma di sini
+    scope-nya SATU topik yang sudah ada, bukan bikin/update topik baru.
     """
     from sqlalchemy.orm import selectinload
     topic = await db.scalar(
@@ -657,7 +633,6 @@ async def search_saved_topic(
     platforms = _resolve_platforms(topic.platforms)
     keyword_results = []
     queued_keywords = []
-    needs_confirmation_keywords = []
     queue_items: list[dict] = []
 
     for stk in topic.topic_keywords:
@@ -667,19 +642,15 @@ async def search_saved_topic(
         # cuma mau simpan definisi, bukan cari), topik itu akan PERMANEN tidak
         # pernah bisa ditawari tier-3 lewat endpoint ini lagi -- tidak ada UI
         # utk toggle auto_crawl balik (beda dgn schedule yang punya endpoint
-        # sendiri). confirm_third_party per-request SUDAH jadi gerbang keamanan
-        # yang cukup (persis spirit yang diminta user), jadi endpoint by-id ini
-        # selalu izinkan tier-3 kalau confirm_third_party=true, terlepas dari
-        # auto_crawl yang tersimpan.
+        # sendiri). Endpoint by-id ini selalu izinkan tier-3 otomatis kalau
+        # tier-1 kosong, terlepas dari auto_crawl yang tersimpan.
         kw_result = await _search_keyword_tiered(
             db, stk.keyword_text, platforms, body.limit_per_keyword, body.include_sentiment,
-            True, body.confirm_third_party,
+            True,
         )
         kw_result["keyword_id"] = str(stk.keyword_id)
 
-        if kw_result["status"] == "needs_confirmation":
-            needs_confirmation_keywords.append(stk.keyword_text)
-        elif kw_result["status"] == "queued":
+        if kw_result["status"] == "queued":
             queued_keywords.append(stk.keyword_text)
             queue_items.extend(kw_result["queue_items"])
 
@@ -702,8 +673,6 @@ async def search_saved_topic(
     has_data = total_posts > 0
     if queued_keywords:
         status = "partial" if has_data else "queued"
-    elif needs_confirmation_keywords:
-        status = "partial_needs_confirmation" if has_data else "needs_confirmation"
     else:
         status = "ready"
 
@@ -712,11 +681,6 @@ async def search_saved_topic(
         note = (
             "Keyword dengan status 'queued' sedang dicari ke third-party SATU PER SATU di background "
             "(Apify/Firecrawl/YouTube API). Cek lagi lewat GET /search/topics/{topic_id} setelah beberapa saat."
-        )
-    elif needs_confirmation_keywords:
-        note = (
-            "Keyword dengan status 'needs_confirmation' tidak ditemukan di database. "
-            "Panggil ulang endpoint ini dengan confirm_third_party=true untuk mencari ke third-party."
         )
 
     return build_success_response({
@@ -731,7 +695,6 @@ async def search_saved_topic(
         },
         "results": [p for kd in keyword_results for p in kd.get("posts", [])],
         "queued_keywords": queued_keywords,
-        "needs_confirmation_keywords": needs_confirmation_keywords,
         "note": note,
     })
 
