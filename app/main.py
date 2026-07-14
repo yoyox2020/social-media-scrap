@@ -387,6 +387,17 @@ async def scraping_status_page():
   </div>
 </div>
 
+<div id="apify-banner" class="ed-banner unknown">
+  <span class="alive-dot off" id="apify-dot"></span>
+  <div>
+    <span class="ed-banner-title">Kuota Apify (Facebook/Instagram/TikTok/Twitter/Smart Search) &mdash;</span>
+    <span id="apify-status-text" style="margin-left:4px">Memuat...</span>
+  </div>
+  <div style="margin-left:auto;text-align:right;font-size:0.75rem;color:#475569;max-width:420px">
+    <div id="apify-detail">-</div>
+  </div>
+</div>
+
 <div class="grid">
   <div class="card"><div class="label">Status</div><div class="value" id="worker-status">-</div></div>
   <div class="card"><div class="label">Sedang Jalan</div><div class="value blue" id="running">-</div></div>
@@ -1158,6 +1169,29 @@ async function load() {
     }
     edLastErr.textContent = ed.last_error_at  ? `Error terakhir: ${fmt(ed.last_error_at)}` : '';
     edLastOk.textContent  = ed.last_success_at ? `Sukses terakhir: ${fmt(ed.last_success_at)}` : '';
+
+    // ── Apify quota banner (Facebook/Instagram/TikTok/Twitter/Smart Search) ──
+    const apifyQ = d.apify_quota || {};
+    const apifyBanner = document.getElementById('apify-banner');
+    const apifyDot  = document.getElementById('apify-dot');
+    const apifyText = document.getElementById('apify-status-text');
+    const apifyDetail = document.getElementById('apify-detail');
+    if (!apifyQ.checked) {
+      apifyBanner.className = 'ed-banner unknown';
+      apifyDot.className = 'alive-dot off';
+      apifyText.innerHTML = '<span style="color:#64748b">TIDAK BISA DICEK</span>';
+      apifyDetail.textContent = apifyQ.message || '';
+    } else if (apifyQ.exhausted) {
+      apifyBanner.className = 'ed-banner expired';
+      apifyDot.className = 'alive-dot off';
+      apifyText.innerHTML = '<span class="red">KUOTA HABIS</span>';
+      apifyDetail.textContent = apifyQ.message || '';
+    } else {
+      apifyBanner.className = 'ed-banner active';
+      apifyDot.className = 'alive-dot on';
+      apifyText.innerHTML = `<span class="green">TERSEDIA</span> (${apifyQ.plan || '-'})`;
+      apifyDetail.textContent = apifyQ.message || '';
+    }
 
     // ── Instagram statistik ───────────────────────────────────────────────
     const ig = d.instagram || {};

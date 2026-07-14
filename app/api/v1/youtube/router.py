@@ -2344,6 +2344,7 @@ async def scrape_monitor_public(
     from app.services.twitter.trend_scrape_service import get_twitter_trend_scrape_summary
     from app.services.news.trend_scrape_service import get_news_trend_scrape_summary
     from app.services.search_topics.ai_discovery_service import get_search_topic_ai_discovery_trace
+    from app.shared.apify_errors import get_apify_account_status
     from app.shared.config import settings
 
     search_topics_ai_discovery = await get_search_topic_ai_discovery_trace(db)
@@ -2351,6 +2352,7 @@ async def scrape_monitor_public(
         f"{settings.smart_search_ai_discovery_schedule_hour:02d}:"
         f"{settings.smart_search_ai_discovery_schedule_minute:02d} WIB otomatis (Celery Beat)"
     )
+    apify_quota = await get_apify_account_status()
 
     return build_success_response({
         "worker_alive": is_alive,
@@ -2403,6 +2405,7 @@ async def scrape_monitor_public(
         "twitter_trend_scrape": await get_twitter_trend_scrape_summary(db, recent_limit=15),
         "news_trend_scrape": await get_news_trend_scrape_summary(db, recent_limit=15),
         "search_topics_ai_discovery": search_topics_ai_discovery,
+        "apify_quota": apify_quota,
         "runs_pagination": {
             "page": runs_page,
             "limit": runs_limit,

@@ -56,3 +56,56 @@ def tag_if_quota_error(message: str, exc: BaseException | None = None) -> str:
     if not message or not is_quota_error(exc=exc, message=message):
         return message
     return f"{QUOTA_ERROR_PREFIX} {message}"
+
+
+async def get_apify_account_status() -> dict:
+    """
+    Cek status akun Apify LANGSUNG dari API resminya (`GET /v2/users/me`) --
+    BEDA dari is_quota_error() di atas yang cuma menebak dari teks error
+    SETELAH sebuah panggilan gagal. Ini cek proaktif "apakah kuota Apify
+    genuinely habis SEKARANG", dipakai dashboard /scraping-status supaya
+    user tahu penyebab data Facebook/Instagram/TikTok/Twitter kosong itu
+    kuota habis, bukan "topiknya memang tidak ada di sana".
+
+    `effectivePlatformFeatures.ACTORS.isEnabled == false` dgn
+    `disabledReasonType == "MONTHLY_TOTAL_USAGE_HARD_LIMIT_EXCEEDED"` berarti
+    SEMUA actor run (scraping apa pun lewat Apify) akan gagal sampai kuota
+    bulanan reset atau plan di-upgrade -- ini status paling akurat yang bisa
+    dicek tanpa menunggu sebuah scrape run gagal duluan.
+    """
+    import httpx
+
+    from app.shared.config import settings
+
+    if not settings.apify_api_token:
+        return {"checked": False, "exhausted": False, "message": "APIFY_API_TOKEN belum di-set"}
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://api.apify.com/v2/users/me",
+                params={"token": settings.apify_api_token},
+            )
+            resp.raise_for_status()
+            data = resp.json()["data"]
+    except Exception as exc:
+        return {"checked": False, "exhausted": False, "message": f"Gagal cek status Apify: {exc}"}
+
+    plan = data.get("plan", {})
+    actors_feature = (data.get("effectivePlatformFeatures") or {}).get("ACTORS", {})
+    exhausted = not actors_feature.get("isEnabled", True)
+
+    return {
+        "checked": True,
+        "exhausted": exhausted,
+        "plan": plan.get("id"),
+        "monthly_limit_usd": plan.get("maxMonthlyUsageUsd"),
+        "message": (
+            f"Kuota Apify ({plan.get('id', '?')}, ${plan.get('maxMonthlyUsageUsd', '?')}/bulan) "
+            f"SUDAH HABIS -- {actors_feature.get('disabledReason', 'semua actor run akan gagal')}. "
+            "Facebook/Instagram/TikTok/Twitter/Smart Search tier-3 tidak akan dapat data baru "
+            "sampai kuota reset bulan depan atau plan di-upgrade."
+            if exhausted else
+            f"Kuota Apify ({plan.get('id', '?')}) masih tersedia."
+        ),
+    }
