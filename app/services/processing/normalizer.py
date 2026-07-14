@@ -196,6 +196,53 @@ class YouTubeNormalizer:
         )
 
 
+async def enrich_youtube_statistics(posts: list[Post]) -> None:
+    """
+    Isi views/likes/comments video YouTube yang SEBELUMNYA selalu 0 -- baik
+    dari hasil search EnsembleData (videoRenderer) maupun YouTube Data API v3
+    (search.list), DUA-DUANYA endpoint search yang secara STRUKTURAL tidak
+    menyertakan statistics sama sekali (beda dari endpoint videos.list).
+    Root cause asli: pipeline ini cuma pernah pakai endpoint search, tidak
+    pernah manggil videos.list?part=statistics sama sekali -- bukan
+    keterbatasan provider (lihat YouTubeDataAPIClient.get_videos_statistics()).
+
+    Mutasi `posts` IN PLACE (aman -- objek ini belum di-add/commit ke session
+    manapun saat dipanggil dari CollectorService, jadi tidak ada isu
+    SQLAlchemy change-tracking). No-op diam-diam kalau YOUTUBE_DATA_API_KEY
+    belum di-set atau panggilannya gagal -- ini ENRICHMENT, kegagalannya
+    TIDAK boleh menggagalkan penyimpanan post itu sendiri (post tetap
+    tersimpan, cuma likes/comments-nya tetap 0 seperti sebelumnya).
+    """
+    from app.shared.config import settings
+
+    if not settings.youtube_data_api_key or not posts:
+        return
+
+    import logging
+
+    from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
+
+    logger = logging.getLogger(__name__)
+    video_ids = [p.external_id for p in posts if p.external_id]
+    if not video_ids:
+        return
+
+    try:
+        client = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
+        stats_by_id = await client.get_videos_statistics(video_ids)
+    except Exception as exc:
+        logger.warning("enrich_youtube_statistics: gagal ambil statistics (%s), likes/comments tetap 0", exc)
+        return
+
+    for post in posts:
+        stats = stats_by_id.get(post.external_id)
+        if not stats:
+            continue
+        post.metadata_["views"] = stats["views"]
+        post.metadata_["likes"] = stats["likes"]
+        post.metadata_["comments"] = stats["comments"]
+
+
 # ── Instagram ─────────────────────────────────────────────────────────────────
 
 class InstagramNormalizer:

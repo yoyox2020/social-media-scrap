@@ -84,6 +84,38 @@ class YouTubeDataAPIClient:
         resp = await _get("videos", params)
         return resp.json()
 
+    async def get_videos_statistics(self, video_ids: list[str]) -> dict[str, dict[str, int]]:
+        """
+        Ambil views/likes/comments utk banyak video sekaligus
+        (`videos.list?part=statistics`, maks 50 ID per call -- batasan resmi
+        YouTube Data API v3). Dipakai utk ENRICH hasil `search.list`/EnsembleData
+        videoRenderer (yang secara STRUKTURAL tidak menyertakan statistics sama
+        sekali -- beda endpoint dari `videos.list`), lihat
+        app/services/processing/normalizer.py::YouTubeNormalizer yang
+        sebelumnya hardcode likes/comments=0 karena ini.
+
+        Return {video_id: {"views": int, "likes": int, "comments": int}} --
+        video yang sudah dihapus/di-private/komentar dimatikan otomatis TIDAK
+        muncul di dict hasil (bukan exception), pemanggil cukup `.get(id, {})`.
+        """
+        stats_by_id: dict[str, dict[str, int]] = {}
+        for i in range(0, len(video_ids), 50):
+            chunk = video_ids[i:i + 50]
+            params = {
+                "part": "statistics",
+                "id": ",".join(chunk),
+                "key": self.api_key,
+            }
+            resp = await _get("videos", params)
+            for item in resp.json().get("items") or []:
+                stats = item.get("statistics") or {}
+                stats_by_id[item["id"]] = {
+                    "views": int(stats.get("viewCount", 0) or 0),
+                    "likes": int(stats.get("likeCount", 0) or 0),
+                    "comments": int(stats.get("commentCount", 0) or 0),
+                }
+        return stats_by_id
+
     async def search_videos_by_channel(
         self,
         channel_id: str,

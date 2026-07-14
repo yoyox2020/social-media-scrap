@@ -143,6 +143,14 @@ class CollectorService:
                         page + 1, len(posts), len(new_posts), len(posts) - len(new_posts),
                     )
 
+                    if platform == "youtube" and new_posts:
+                        # Isi views/likes/comments yang selalu 0 dari hasil search --
+                        # lihat docstring enrich_youtube_statistics() utk detail root cause.
+                        # Cuma utk new_posts (bukan posts) supaya tidak buang kuota API
+                        # utk video yang sudah ada di DB.
+                        from app.services.processing.normalizer import enrich_youtube_statistics
+                        await enrich_youtube_statistics(new_posts)
+
                     if new_posts:
                         inserted = await post_repo.bulk_create(new_posts)
                         result.new_posts += inserted
