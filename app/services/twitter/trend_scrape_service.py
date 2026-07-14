@@ -157,8 +157,14 @@ async def get_twitter_trend_scrape_summary(db: AsyncSession, recent_limit: int =
         .order_by(ScrapeRun.started_at.desc())
     )).all()
 
+    # SAMA PERSIS dgn get_trend_scrape_summary() Instagram -- lihat catatan
+    # di get_facebook_trend_scrape_summary().
+    from app.services.trend_recommendations.viral_discovery_scrape_service import get_viral_discovery_trace
+    viral_discovery_trace = await get_viral_discovery_trace(db)
+
     return {
         "daily_budget": settings.twitter_trend_daily_budget,
+        "viral_discovery_trace": viral_discovery_trace,
         "schedule": (
             f"{settings.twitter_trend_scrape_schedule_hour:02d}:"
             f"{settings.twitter_trend_scrape_schedule_minute:02d} WIB otomatis (Celery Beat)"

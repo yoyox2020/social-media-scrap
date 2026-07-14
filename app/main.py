@@ -577,6 +577,29 @@ async def scraping_status_page():
   <tbody id="fts-pending-table"></tbody>
 </table>
 
+<div class="section-title" style="margin-top:24px">Alur Pipeline Live — Subsistem A (AI Discovery) &rarr; Subsistem B (Scrape Worker Facebook)</div>
+<div class="pf-legend">
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#4ade80;background:rgba(74,222,128,0.15)"></span> Sukses</div>
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#f87171;background:rgba(248,113,113,0.15)"></span> Gagal / Berhenti Di Sini</div>
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#fbbf24;background:rgba(251,191,36,0.15)"></span> Menunggu</div>
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#334155"></span> Belum Ada Data</div>
+</div>
+<div class="pipeline-flow" id="fb-pipeline-flow"></div>
+<table class="pf-batch-table" id="fb-pf-batch-wrap" style="display:none">
+  <thead>
+    <tr>
+      <th>Topik (batch AI terakhir)</th>
+      <th>Status Sekarang</th>
+      <th>Discrape Via</th>
+      <th>Durasi</th>
+      <th>Waktu Scrape</th>
+      <th>Error</th>
+    </tr>
+  </thead>
+  <tbody id="fb-pf-batch-table"></tbody>
+</table>
+<div class="pf-empty-hint" id="fb-pf-empty-hint" style="display:none">Belum ada run AI Viral Discovery tercatat — jalan otomatis jam 07:00 WIB, atau trigger manual untuk test.</div>
+
 <div class="section-title" style="margin-top:24px">Riwayat Scrape Facebook (trend_recommendations)</div>
 <table>
   <thead>
@@ -614,6 +637,29 @@ async def scraping_status_page():
   <tbody id="tts-pending-table"></tbody>
 </table>
 
+<div class="section-title" style="margin-top:24px">Alur Pipeline Live — Subsistem A (AI Discovery) &rarr; Subsistem B (Scrape Worker TikTok)</div>
+<div class="pf-legend">
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#4ade80;background:rgba(74,222,128,0.15)"></span> Sukses</div>
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#f87171;background:rgba(248,113,113,0.15)"></span> Gagal / Berhenti Di Sini</div>
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#fbbf24;background:rgba(251,191,36,0.15)"></span> Menunggu</div>
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#334155"></span> Belum Ada Data</div>
+</div>
+<div class="pipeline-flow" id="tt-pipeline-flow"></div>
+<table class="pf-batch-table" id="tt-pf-batch-wrap" style="display:none">
+  <thead>
+    <tr>
+      <th>Topik (batch AI terakhir)</th>
+      <th>Status Sekarang</th>
+      <th>Discrape Via</th>
+      <th>Durasi</th>
+      <th>Waktu Scrape</th>
+      <th>Error</th>
+    </tr>
+  </thead>
+  <tbody id="tt-pf-batch-table"></tbody>
+</table>
+<div class="pf-empty-hint" id="tt-pf-empty-hint" style="display:none">Belum ada run AI Viral Discovery tercatat — jalan otomatis jam 07:00 WIB, atau trigger manual untuk test.</div>
+
 <div class="section-title" style="margin-top:24px">Riwayat Scrape TikTok (trend_recommendations)</div>
 <table>
   <thead>
@@ -650,6 +696,29 @@ async def scraping_status_page():
   </thead>
   <tbody id="twts-pending-table"></tbody>
 </table>
+
+<div class="section-title" style="margin-top:24px">Alur Pipeline Live — Subsistem A (AI Discovery) &rarr; Subsistem B (Scrape Worker Twitter/X)</div>
+<div class="pf-legend">
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#4ade80;background:rgba(74,222,128,0.15)"></span> Sukses</div>
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#f87171;background:rgba(248,113,113,0.15)"></span> Gagal / Berhenti Di Sini</div>
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#fbbf24;background:rgba(251,191,36,0.15)"></span> Menunggu</div>
+  <div class="pf-legend-item"><span class="pf-legend-dot" style="border-color:#334155"></span> Belum Ada Data</div>
+</div>
+<div class="pipeline-flow" id="tw-pipeline-flow"></div>
+<table class="pf-batch-table" id="tw-pf-batch-wrap" style="display:none">
+  <thead>
+    <tr>
+      <th>Topik (batch AI terakhir)</th>
+      <th>Status Sekarang</th>
+      <th>Discrape Via</th>
+      <th>Durasi</th>
+      <th>Waktu Scrape</th>
+      <th>Error</th>
+    </tr>
+  </thead>
+  <tbody id="tw-pf-batch-table"></tbody>
+</table>
+<div class="pf-empty-hint" id="tw-pf-empty-hint" style="display:none">Belum ada run AI Viral Discovery tercatat — jalan otomatis jam 07:00 WIB, atau trigger manual untuk test.</div>
 
 <div class="section-title" style="margin-top:24px">Riwayat Scrape Twitter/X (trend_recommendations)</div>
 <table>
@@ -767,11 +836,12 @@ function pipelineIcon(status) {
 // Melacak batch topik NYATA dari run AI Discovery terakhir ke status scrape
 // masing-masing (viral_discovery_trace dari backend) — bukan status
 // independen tiap subsistem, supaya kelihatan persis di mana alurnya berhenti.
-function renderPipelineFlow(trace) {
-  const flowEl = document.getElementById('pipeline-flow');
-  const batchWrap = document.getElementById('pf-batch-wrap');
-  const batchTbody = document.getElementById('pf-batch-table');
-  const emptyHint = document.getElementById('pf-empty-hint');
+function renderPipelineFlow(trace, idPrefix) {
+  idPrefix = idPrefix || '';
+  const flowEl = document.getElementById(idPrefix + 'pipeline-flow');
+  const batchWrap = document.getElementById(idPrefix + 'pf-batch-wrap');
+  const batchTbody = document.getElementById(idPrefix + 'pf-batch-table');
+  const emptyHint = document.getElementById(idPrefix + 'pf-empty-hint');
   if (!flowEl) return;
 
   const aiRun = trace && trace.ai_run;
@@ -1226,6 +1296,7 @@ async function load() {
     // ── Facebook trend-scrape (trend_recommendations) ────────────────────────
     const fts = d.facebook_trend_scrape || {};
     const ftsSummary = fts.summary || {};
+    renderPipelineFlow(fts.viral_discovery_trace, 'fb-');
     document.getElementById('fts-pending').textContent  = ftsSummary.pending_with_facebook_account || 0;
     document.getElementById('fts-used').textContent     = ftsSummary.used_with_facebook_account || 0;
     document.getElementById('fts-failed-permanent').textContent = ftsSummary.failed_permanent_with_facebook_account || 0;
@@ -1268,6 +1339,7 @@ async function load() {
     // ── TikTok trend-scrape (trend_recommendations) ──────────────────────────
     const tts = d.tiktok_trend_scrape || {};
     const ttsSummary = tts.summary || {};
+    renderPipelineFlow(tts.viral_discovery_trace, 'tt-');
     document.getElementById('tts-pending').textContent  = ttsSummary.pending_with_tiktok_account || 0;
     document.getElementById('tts-used').textContent     = ttsSummary.used_with_tiktok_account || 0;
     document.getElementById('tts-failed-permanent').textContent = ttsSummary.failed_permanent_with_tiktok_account || 0;
@@ -1310,6 +1382,7 @@ async function load() {
     // ── Twitter/X trend-scrape (trend_recommendations) ───────────────────────
     const twts = d.twitter_trend_scrape || {};
     const twtsSummary = twts.summary || {};
+    renderPipelineFlow(twts.viral_discovery_trace, 'tw-');
     document.getElementById('twts-pending').textContent  = twtsSummary.pending_with_twitter_account || 0;
     document.getElementById('twts-used').textContent     = twtsSummary.used_with_twitter_account || 0;
     document.getElementById('twts-failed-permanent').textContent = twtsSummary.failed_permanent_with_twitter_account || 0;

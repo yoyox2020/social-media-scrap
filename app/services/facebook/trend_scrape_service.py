@@ -178,8 +178,16 @@ async def get_facebook_trend_scrape_summary(db: AsyncSession, recent_limit: int 
         .order_by(ScrapeRun.started_at.desc())
     )).all()
 
+    # SAMA PERSIS dgn get_trend_scrape_summary() Instagram -- AI Discovery
+    # (Subsistem A) TIDAK per-platform, satu run yang sama bisa hasilkan akun
+    # Instagram/Facebook/TikTok/Twitter sekaligus, jadi trace-nya relevan
+    # ditampilkan di dashboard platform manapun, tidak cuma Instagram.
+    from app.services.trend_recommendations.viral_discovery_scrape_service import get_viral_discovery_trace
+    viral_discovery_trace = await get_viral_discovery_trace(db)
+
     return {
         "daily_budget": settings.facebook_trend_daily_budget,
+        "viral_discovery_trace": viral_discovery_trace,
         "schedule": (
             f"{settings.facebook_trend_scrape_schedule_hour:02d}:"
             f"{settings.facebook_trend_scrape_schedule_minute:02d} WIB otomatis (Celery Beat)"
