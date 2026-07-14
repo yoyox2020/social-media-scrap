@@ -456,6 +456,7 @@ async def list_saved_topics(
             "schedule_recurring": topic.schedule_recurring,
             "schedule_duration_days": topic.schedule_duration_days,
             "schedule_expires_at": topic.schedule_expires_at.isoformat() if topic.schedule_expires_at else None,
+            "last_ai_discovery_at": topic.last_ai_discovery_at.isoformat() if topic.last_ai_discovery_at else None,
             "created_at": topic.created_at.isoformat(),
             "updated_at": topic.updated_at.isoformat(),
         })
@@ -592,10 +593,15 @@ async def get_topic_detail(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Detail satu topik: semua keyword + data posts + sentimen.
+    Detail satu topik: semua keyword + data posts + sentimen + riwayat
+    AI-context discovery (kalau topik ini pernah/sedang dipantau berkesinambungan
+    oleh Subsistem A2, lihat app/services/search_topics/ai_discovery_service.py).
     Dipanggil saat user klik topik di dashboard.
     """
     from sqlalchemy.orm import selectinload
+
+    from app.services.search_topics.ai_discovery_service import get_topic_ai_discovery_history
+
     topic = await db.scalar(
         select(SearchTopic)
         .options(selectinload(SearchTopic.topic_keywords))
@@ -620,6 +626,11 @@ async def get_topic_detail(
 
         keyword_details.append(detail)
 
+    # Tidak digate ke schedule_recurring -- kalau recurring-nya SUDAH dimatikan
+    # tapi topik ini PERNAH dipantau AI discovery sebelumnya, riwayatnya tetap
+    # relevan ditampilkan (bukan cuma status "sedang aktif" sekarang).
+    ai_discovery_history = await get_topic_ai_discovery_history(db, topic.name)
+
     return build_success_response({
         "topic_id": str(topic.id),
         "name": topic.name,
@@ -633,6 +644,8 @@ async def get_topic_detail(
         "schedule_duration_days": topic.schedule_duration_days,
         "schedule_started_at": topic.schedule_started_at.isoformat() if topic.schedule_started_at else None,
         "schedule_expires_at": topic.schedule_expires_at.isoformat() if topic.schedule_expires_at else None,
+        "last_ai_discovery_at": topic.last_ai_discovery_at.isoformat() if topic.last_ai_discovery_at else None,
+        "ai_discovery_history": ai_discovery_history,
         "created_at": topic.created_at.isoformat(),
         "updated_at": topic.updated_at.isoformat(),
     })

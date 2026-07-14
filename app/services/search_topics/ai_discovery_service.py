@@ -204,6 +204,60 @@ async def run_daily_search_topic_ai_discovery(db: AsyncSession) -> dict:
     return result
 
 
+async def _build_topic_run_trace(db: AsyncSession, run: ScrapeRun) -> dict:
+    """
+    Helper: bangun 1 entri trace (sub-topik yang ditemukan + status scrape-nya
+    di Subsistem B) utk 1 ScrapeRun panggilan AI-context discovery per-topik.
+    Dipakai get_search_topic_ai_discovery_trace() (lintas topik, cuma run
+    global TERAKHIR) DAN get_topic_ai_discovery_history() (SATU topik
+    spesifik, SEMUA run historis) -- logic pencocokan sub-topiknya identik,
+    cuma beda dari mana `run` berasal.
+    """
+    sub_window_end = (run.finished_at or run.started_at) + timedelta(seconds=5)
+    found = (await db.scalars(
+        select(TrendRecommendation)
+        .where(
+            TrendRecommendation.source == _SOURCE_TAG,
+            TrendRecommendation.created_at >= run.started_at,
+            TrendRecommendation.created_at <= sub_window_end,
+        )
+        .order_by(TrendRecommendation.score.desc())
+    )).all()
+
+    subtopics = []
+    for item in found:
+        # Lacak apakah Subsistem B (konsumer harian tiap platform) sudah
+        # scrape sub-topik ini -- ScrapeRun dgn keyword_text SAMA PERSIS
+        # dibuat oleh run_daily_trend_scrape_facebook()/tiktok/twitter/dst.
+        b_run = (await db.scalars(
+            select(ScrapeRun)
+            .where(ScrapeRun.keyword_text == item.topic, ScrapeRun.started_at > run.started_at)
+            .order_by(ScrapeRun.started_at.desc())
+            .limit(1)
+        )).first()
+        subtopics.append({
+            "subtopic": item.topic,
+            "score": item.score,
+            "related_accounts": item.related_accounts,
+            "current_status": item.status,
+            "scrape_attempt": {
+                "status": b_run.status,
+                "api_source": b_run.api_source,
+                "started_at": b_run.started_at.isoformat(),
+                "duration_seconds": round(b_run.duration_seconds, 2) if b_run.duration_seconds is not None else None,
+                "error_message": b_run.error_message,
+            } if b_run else None,
+        })
+
+    return {
+        "ai_call_status": run.status,
+        "ai_call_started_at": run.started_at.isoformat(),
+        "duration_seconds": round(run.duration_seconds, 2) if run.duration_seconds is not None else None,
+        "error_message": run.error_message,
+        "found_subtopics": subtopics,
+    }
+
+
 async def get_search_topic_ai_discovery_trace(db: AsyncSession) -> dict:
     """
     Lacak run TERAKHIR AI-context discovery: per topik yang DIPANGGIL (bukan
@@ -236,55 +290,15 @@ async def get_search_topic_ai_discovery_trace(db: AsyncSession) -> dict:
 
     topics_traced = []
     for run in topic_runs:
-        sub_window_end = (run.finished_at or run.started_at) + timedelta(seconds=5)
-        found = (await db.scalars(
-            select(TrendRecommendation)
-            .where(
-                TrendRecommendation.source == _SOURCE_TAG,
-                TrendRecommendation.created_at >= run.started_at,
-                TrendRecommendation.created_at <= sub_window_end,
-            )
-            .order_by(TrendRecommendation.score.desc())
-        )).all()
-
-        subtopics = []
-        for item in found:
-            # Lacak apakah Subsistem B (konsumer harian tiap platform) sudah
-            # scrape sub-topik ini -- ScrapeRun dgn keyword_text SAMA PERSIS
-            # dibuat oleh run_daily_trend_scrape_facebook()/tiktok/twitter/dst.
-            b_run = (await db.scalars(
-                select(ScrapeRun)
-                .where(ScrapeRun.keyword_text == item.topic, ScrapeRun.started_at > run.started_at)
-                .order_by(ScrapeRun.started_at.desc())
-                .limit(1)
-            )).first()
-            subtopics.append({
-                "subtopic": item.topic,
-                "score": item.score,
-                "related_accounts": item.related_accounts,
-                "current_status": item.status,
-                "scrape_attempt": {
-                    "status": b_run.status,
-                    "api_source": b_run.api_source,
-                    "started_at": b_run.started_at.isoformat(),
-                    "duration_seconds": round(b_run.duration_seconds, 2) if b_run.duration_seconds is not None else None,
-                    "error_message": b_run.error_message,
-                } if b_run else None,
-            })
-
+        trace = await _build_topic_run_trace(db, run)
         # Best-effort -- topik bisa saja sudah diganti nama/dihapus sejak run ini
         ctx_topic = (await db.scalars(
             select(SearchTopic).where(SearchTopic.name == run.keyword_text).limit(1)
         )).first()
-
         topics_traced.append({
             "context_topic_id": str(ctx_topic.id) if ctx_topic else None,
             "context_topic_name": run.keyword_text,
-            "ai_call_status": run.status,
-            "ai_call_started_at": run.started_at.isoformat(),
-            "duration_seconds": round(run.duration_seconds, 2) if run.duration_seconds is not None else None,
-            "error_message": run.error_message,
-            "found_subtopics": subtopics,
+            **trace,
         })
 
     return {
@@ -299,3 +313,22 @@ async def get_search_topic_ai_discovery_trace(db: AsyncSession) -> dict:
         },
         "topics": topics_traced,
     }
+
+
+async def get_topic_ai_discovery_history(db: AsyncSession, topic_name: str, limit: int = 10) -> list[dict]:
+    """
+    Riwayat SEMUA panggilan AI-context discovery utk SATU topik spesifik
+    (bukan cuma run global TERAKHIR seperti get_search_topic_ai_discovery_trace())
+    -- dipakai GET /search/topics/{id} supaya bisa lihat "topik ini lagi
+    dipantau berkesinambungan oleh AI discovery atau tidak" langsung dari
+    detail topiknya, tidak perlu gabung manual dari endpoint status terpisah.
+    Urut terbaru dulu, dibatasi `limit` panggilan terakhir. Fungsi baca-saja.
+    """
+    topic_runs = (await db.scalars(
+        select(ScrapeRun)
+        .where(ScrapeRun.platform == _TOPIC_RUN_PLATFORM, ScrapeRun.keyword_text == topic_name)
+        .order_by(ScrapeRun.started_at.desc())
+        .limit(limit)
+    )).all()
+
+    return [await _build_topic_run_trace(db, run) for run in topic_runs]
