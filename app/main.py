@@ -690,6 +690,27 @@ async def scraping_status_page():
   <tbody id="news-runs-table"></tbody>
 </table>
 
+<div class="section-title" style="margin-top:24px">Smart Search — AI-Context Discovery (Subsistem A2)</div>
+<div class="ig-grid">
+  <div class="ig-card"><div class="label">Provider Aktif</div><div class="value" id="std-provider" style="font-size:1rem">-</div><div class="sub">anthropic/ollama/auto</div></div>
+  <div class="ig-card"><div class="label">Jadwal</div><div class="value" id="std-schedule" style="font-size:0.9rem">-</div><div class="sub">Celery Beat</div></div>
+  <div class="ig-card"><div class="label">Topik Dipertimbangkan</div><div class="value" id="std-considered">-</div><div class="sub">run terakhir</div></div>
+  <div class="ig-card"><div class="label">Topik Dipanggil AI</div><div class="value" id="std-called">-</div><div class="sub">run terakhir</div></div>
+</div>
+<table>
+  <thead>
+    <tr>
+      <th>Topik (Smart Search)</th>
+      <th>Status Panggilan AI</th>
+      <th>Durasi</th>
+      <th>Sub-topik Baru Ditemukan</th>
+      <th>Waktu Panggilan</th>
+      <th>Error</th>
+    </tr>
+  </thead>
+  <tbody id="std-topics-table"></tbody>
+</table>
+
 <div class="section-title" style="margin-top:24px">Riwayat Scraping Keyword</div>
 <table>
   <thead>
@@ -1329,6 +1350,33 @@ async function load() {
           <td style="color:#94a3b8">${r.duration_seconds ?? '-'}s</td>
           <td style="color:#94a3b8;font-size:.75rem">${fmt(r.started_at)}</td>
           <td class="error-text" title="${r.error_message||''}">${r.error_message || '-'}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    // ── Smart Search AI-Context Discovery (Subsistem A2) ─────────────────────
+    const std = d.search_topics_ai_discovery || {};
+    const stdLastRun = std.last_run || {};
+    document.getElementById('std-provider').textContent   = stdLastRun.api_source || '-';
+    document.getElementById('std-schedule').textContent   = std.schedule || '-';
+    document.getElementById('std-considered').textContent = stdLastRun.topics_considered ?? '-';
+    document.getElementById('std-called').textContent     = stdLastRun.topics_called ?? '-';
+
+    const stdTopicsTbody = document.getElementById('std-topics-table');
+    const stdTopics = std.topics || [];
+    if (stdTopics.length === 0) {
+      stdTopicsTbody.innerHTML = '<tr><td colspan="6" style="color:#475569;font-style:italic;padding:12px">Belum ada topik yang dipanggil AI discovery</td></tr>';
+    } else {
+      stdTopicsTbody.innerHTML = stdTopics.map(t => {
+        const pillClass = t.ai_call_status === 'success' ? 'pill-success' : (t.ai_call_status === 'failed' ? 'pill-failed' : 'pill-running');
+        const subtopics = (t.found_subtopics || []).map(s => s.subtopic).join('<br>') || '-';
+        return `<tr>
+          <td>${t.context_topic_name}</td>
+          <td><span class="pill ${pillClass}">${t.ai_call_status}</span></td>
+          <td style="color:#94a3b8">${t.duration_seconds ?? '-'}s</td>
+          <td style="font-size:.78rem">${subtopics}</td>
+          <td style="color:#94a3b8;font-size:.75rem">${fmt(t.ai_call_started_at)}</td>
+          <td class="error-text" title="${t.error_message||''}">${t.error_message || '-'}</td>
         </tr>`;
       }).join('');
     }
