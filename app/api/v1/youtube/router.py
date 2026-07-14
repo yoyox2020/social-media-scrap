@@ -533,6 +533,8 @@ async def list_videos(
       - title     : judul video
       - author    : nama channel
       - view_count: jumlah views
+      - like_count: jumlah likes
+      - comment_count: jumlah komentar
       - thumbnail : URL thumbnail
       - keyword   : keyword yang dipakai untuk scraping
       - collected_at: kapan di-scrape
@@ -604,6 +606,8 @@ async def list_videos(
             "channel": row["author"],
             "thumbnail_url": meta.get("thumbnail", meta.get("thumbnail_url", "")),
             "view_count": meta.get("views", meta.get("view_count", 0)),
+            "like_count": meta.get("likes", 0),
+            "comment_count": meta.get("comments", 0),
             "description": meta.get("description", ""),
             "duration": meta.get("duration", ""),
             "keyword": row["keyword"],

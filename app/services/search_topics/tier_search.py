@@ -102,6 +102,8 @@ async def find_posts_by_keyword(
             "url": p["url"],
             "view_count": _extract_view_count(meta),
             "likes": meta.get("likes", 0),
+            "comments": meta.get("comments", 0),
+            "shares": meta.get("shares", meta.get("retweets", 0)),
             "published_at": p["published_at"].isoformat() if p["published_at"] else None,
             "collected_at": p["collected_at"].isoformat() if p["collected_at"] else None,
             "thumbnail_url": meta.get("thumbnail") or meta.get("photo_url") or meta.get("image_url") or "",
