@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.comments.models import Comment
@@ -132,6 +132,54 @@ def calc_mention_growth(current: int, previous: int) -> float:
 
 # ── DB Query Helpers ──────────────────────────────────────────────────────────
 
+# Platform yang keyword_id-nya bisa diandalkan (FK terisi saat post disimpan).
+# Non-anggota (tiktok/twitter/instagram/facebook/news) SEMUA keyword_id-nya
+# NULL -- Smart Search menghubungkan post<->keyword lewat ILIKE teks saat
+# QUERY (lihat app/services/search_topics/tier_search.py), bukan FK saat
+# simpan. Ini fakta arsitektur yang sudah ada sebelumnya, bukan bug baru.
+KEYWORD_ID_RELIABLE_PLATFORMS: frozenset[str] = frozenset({"youtube"})
+
+
+def _needs_text_match(platforms: list[str]) -> bool:
+    """True kalau ada platform non-reliable diminta (atau platform tidak
+    difilter sama sekali, yg berarti bisa mencakup platform non-reliable)."""
+    if not platforms:
+        return True
+    return any(p not in KEYWORD_ID_RELIABLE_PLATFORMS for p in platforms)
+
+
+async def _keyword_condition(
+    db: AsyncSession,
+    keyword_ids: list[uuid.UUID],
+    platforms: list[str],
+):
+    """Kondisi filter keyword. Kalau semua platform yg diminta reliable
+    (saat ini cuma YouTube), cabang ini IDENTIK dgn `Post.keyword_id.in_(...)`
+    lama -- tidak ada query tambahan, perilaku existing tidak berubah.
+    Kalau ada platform lain, tambahkan pencocokan ILIKE (pola AND-per-kata
+    sama dgn tier_search._word_and_clause) khusus utk platform non-reliable,
+    sementara platform reliable tetap disaring lewat keyword_id asli."""
+    if not keyword_ids:
+        return None
+    if not _needs_text_match(platforms):
+        return Post.keyword_id.in_(keyword_ids)
+
+    texts = [k for k in (await db.scalars(
+        select(Keyword.keyword).where(Keyword.id.in_(keyword_ids))
+    )).all() if k]
+    if not texts:
+        return Post.keyword_id.in_(keyword_ids)
+
+    text_match = or_(*[
+        and_(*[Post.content.ilike(f"%{w}%") for w in (t.split() or [t])])
+        for t in texts
+    ])
+    return or_(
+        and_(Post.platform.in_(KEYWORD_ID_RELIABLE_PLATFORMS), Post.keyword_id.in_(keyword_ids)),
+        and_(~Post.platform.in_(KEYWORD_ID_RELIABLE_PLATFORMS), text_match),
+    )
+
+
 async def fetch_post_stats(
     db: AsyncSession,
     keyword_ids: list[uuid.UUID],
@@ -141,8 +189,9 @@ async def fetch_post_stats(
 ) -> list[RawPostStats]:
     """Ambil semua post beserta jumlah komentar per post."""
     filters = []
-    if keyword_ids:
-        filters.append(Post.keyword_id.in_(keyword_ids))
+    kw_cond = await _keyword_condition(db, keyword_ids, platforms)
+    if kw_cond is not None:
+        filters.append(kw_cond)
     if platforms:
         filters.append(Post.platform.in_(platforms))
     if date_from:
@@ -184,8 +233,9 @@ async def fetch_sentiment_counts(
 ) -> SentimentCounts:
     """Ambil jumlah positif/negatif/netral dari lexicon_analyses."""
     post_filter = []
-    if keyword_ids:
-        post_filter.append(Post.keyword_id.in_(keyword_ids))
+    kw_cond = await _keyword_condition(db, keyword_ids, platforms)
+    if kw_cond is not None:
+        post_filter.append(kw_cond)
     if platforms:
         post_filter.append(Post.platform.in_(platforms))
     if date_from:
@@ -219,8 +269,9 @@ async def fetch_mention_count(
     date_to: datetime | None,
 ) -> int:
     filters = []
-    if keyword_ids:
-        filters.append(Post.keyword_id.in_(keyword_ids))
+    kw_cond = await _keyword_condition(db, keyword_ids, platforms)
+    if kw_cond is not None:
+        filters.append(kw_cond)
     if platforms:
         filters.append(Post.platform.in_(platforms))
     if date_from:

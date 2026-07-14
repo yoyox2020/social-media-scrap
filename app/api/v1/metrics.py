@@ -22,7 +22,13 @@ from app.domain.search_topics.models import SearchTopic, SearchTopicKeyword
 from app.domain.users.models import User
 from app.infrastructure.database.connection import get_db
 from app.services.auth.dependencies import get_current_user
-from app.services.metrics.calculator import compute_metrics, fetch_mention_count
+from app.services.metrics.calculator import (
+    KEYWORD_ID_RELIABLE_PLATFORMS,
+    compute_metrics,
+    fetch_mention_count,
+    _needs_text_match,
+)
+from app.services.search_topics.tier_search import _multi_keyword_or_clause
 from app.shared.exceptions import NotFoundError
 from app.shared.utils import build_success_response
 
@@ -309,10 +315,34 @@ async def get_mention_trend(
     params: dict = {"df": date_from, "dt": date_to}
 
     if keyword_ids:
-        kw_placeholders = ", ".join([f":kw{i}" for i in range(len(keyword_ids))])
-        filters_sql.append(f"posts.keyword_id IN ({kw_placeholders})")
+        kwid_placeholders = ", ".join([f":kwid{i}" for i in range(len(keyword_ids))])
         for i, kid in enumerate(keyword_ids):
-            params[f"kw{i}"] = str(kid)
+            params[f"kwid{i}"] = str(kid)
+        by_keyword_id = f"posts.keyword_id IN ({kwid_placeholders})"
+
+        if not _needs_text_match(platforms):
+            # Cabang IDENTIK dgn kode lama -- semua platform yg diminta
+            # reliable (keyword_id terisi), tidak perlu ILIKE tambahan.
+            filters_sql.append(by_keyword_id)
+        else:
+            texts = [k for k in (await db.scalars(
+                select(Keyword.keyword).where(Keyword.id.in_(keyword_ids))
+            )).all() if k]
+            if not texts:
+                filters_sql.append(by_keyword_id)
+            else:
+                # Platform reliable (YouTube) tetap disaring via keyword_id asli;
+                # platform lain (keyword_id NULL) disaring via ILIKE teks --
+                # pola sama dgn tier_search._multi_keyword_or_clause.
+                text_match = _multi_keyword_or_clause("posts.content", texts, params)
+                reliable = list(KEYWORD_ID_RELIABLE_PLATFORMS)
+                rp_placeholders = ", ".join([f":rp{i}" for i in range(len(reliable))])
+                for i, rp in enumerate(reliable):
+                    params[f"rp{i}"] = rp
+                filters_sql.append(
+                    f"((posts.platform IN ({rp_placeholders}) AND {by_keyword_id}) "
+                    f"OR (posts.platform NOT IN ({rp_placeholders}) AND {text_match}))"
+                )
 
     if platforms:
         pl_placeholders = ", ".join([f":pl{i}" for i in range(len(platforms))])
