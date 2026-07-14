@@ -39,6 +39,8 @@ class PlatformAdapter:
     field_map: PlatformFieldMap = PlatformFieldMap()
 
     def extract_views(self, metadata: dict[str, Any]) -> int:
+        if "views" in self.field_map.unavailable:
+            return 0
         val = metadata.get(self.field_map.views, 0)
         return self._to_int(val)
 
