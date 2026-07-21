@@ -19,6 +19,10 @@ class SearchTopic(Base):
     scheduled_hour: Mapped[int | None] = mapped_column(Integer, nullable=True)
     auto_crawl: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Agent (dari tabel agent_registry/agent_key_pool, mis. "agent_youtube")
+    # yg bertugas memproses topik ini -- ditambahkan 2026-07-22 (API v2).
+    # Nullable: topik lama/belum ditugaskan tetap valid, tidak WAJIB diisi.
+    agent_name: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     # Smart Search — jadwal pencarian berkala (Celery task workers.search_topics.daily_rescan,
     # lihat app/services/search_topics/rescan_service.py). BEDA dari scheduled_hour di atas
     # (field lama, tidak pernah dibaca worker manapun -- dibiarkan apa adanya, tidak dipakai
