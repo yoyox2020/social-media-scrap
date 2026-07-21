@@ -23,13 +23,19 @@ from app.domain.users.models import User
 from app.infrastructure.database.connection import get_db
 from app.services.auth.dependencies import get_current_user
 from app.services.metrics.calculator import (
+    ADAPTER_REGISTRY,
     KEYWORD_ID_RELIABLE_PLATFORMS,
+    SORTABLE_ENGAGEMENT_COMPONENTS,
     compute_metrics,
+    fetch_keyword_texts,
     fetch_mention_count,
+    fetch_post_detail_page,
+    fetch_reach_detail_page,
+    fetch_sentiment_detail_page,
     _needs_text_match,
 )
 from app.services.search_topics.tier_search import _multi_keyword_or_clause
-from app.shared.exceptions import NotFoundError
+from app.shared.exceptions import NotFoundError, ValidationError
 from app.shared.utils import build_success_response
 
 router = APIRouter(prefix="/metrics", tags=["metrics"])
@@ -49,11 +55,18 @@ def _prev_period(date_from: datetime, date_to: datetime) -> tuple[datetime, date
     return date_from - duration, date_from
 
 
+def _platforms_label(platforms: list[str]) -> list[str]:
+    """`platforms=[]` (default, TANPA filter query) tetap dilaporkan sbg
+    daftar platform yg TERDAFTAR di response -- supaya frontend tidak lihat
+    array kosong yg ambigu ("kosong = semua" tidak jelas tanpa baca kode)."""
+    return platforms if platforms else list(ADAPTER_REGISTRY.keys())
+
+
 # ── Endpoint 1: Summary Global ────────────────────────────────────────────────
 
 @router.get("/summary", response_model=dict)
 async def get_metrics_summary(
-    platforms: list[str] = Query(default=["youtube"]),
+    platforms: list[str] = Query(default=[], description="Kosong (default) = SEMUA platform, tanpa filter. Isi eksplisit utk batasi ke platform tertentu."),
     date_from: datetime | None = Query(default=None, description="ISO format, default 30 hari lalu"),
     date_to: datetime | None = Query(default=None, description="ISO format, default sekarang"),
     include_growth: bool = Query(default=True, description="Hitung Mention Growth vs periode sebelumnya"),
@@ -84,7 +97,7 @@ async def get_metrics_summary(
 
     return build_success_response({
         "scope": "global",
-        "platforms": platforms,
+        "platforms": _platforms_label(platforms),
         "period": {"from": date_from.isoformat(), "to": date_to.isoformat()},
         "metrics": result,
     })
@@ -95,7 +108,7 @@ async def get_metrics_summary(
 @router.get("/keyword/{keyword_id}", response_model=dict)
 async def get_keyword_metrics(
     keyword_id: uuid.UUID,
-    platforms: list[str] = Query(default=["youtube"]),
+    platforms: list[str] = Query(default=[], description="Kosong (default) = SEMUA platform, tanpa filter. Isi eksplisit utk batasi ke platform tertentu."),
     date_from: datetime | None = Query(default=None),
     date_to: datetime | None = Query(default=None),
     include_growth: bool = Query(default=True),
@@ -130,9 +143,90 @@ async def get_keyword_metrics(
     return build_success_response({
         "scope": "keyword",
         "keyword": {"id": str(keyword.id), "text": keyword.keyword},
-        "platforms": platforms,
+        "platforms": _platforms_label(platforms),
         "period": {"from": date_from.isoformat(), "to": date_to.isoformat()},
         "metrics": result,
+    })
+
+
+# ── Endpoint 2b: Drill-down -- data MENTAH di balik satu metrik ──────────────
+# Permintaan user 2026-07-18: "user menyorot mention harus jelas sumber
+# datanya darimana dan bisa diarahkan ke detail mention" -- endpoint ini
+# dipanggil saat user klik salah satu angka (Mentions/Reach/Exposure/
+# Engagement/Sentiment) di kartu platform, balikin daftar post/komentar
+# MENTAH (bukan cuma angka) yg menyusun angka itu, tiap item bawa `id`
+# (+`url` platform asli) yg bisa diklik lanjut oleh frontend.
+
+VALID_DETAIL_METRICS = {"mentions", "exposure", "engagement", "reach", "sentiment"}
+
+
+@router.get("/keyword/{keyword_id}/detail", response_model=dict)
+async def get_keyword_metric_detail(
+    keyword_id: uuid.UUID,
+    metric: str = Query(..., description=f"Salah satu dari: {sorted(VALID_DETAIL_METRICS)}"),
+    platform: str | None = Query(default=None, description="Satu platform (kosong = semua platform digabung)"),
+    sentiment_label: str | None = Query(default=None, description="Filter khusus metric='sentiment': positif/negatif/netral"),
+    sort_by: str | None = Query(
+        default=None,
+        description="HANYA berlaku metric=mentions/exposure/engagement. Kosong = published_at terbaru dulu. "
+                    f"Isi salah satu dari {sorted(SORTABLE_ENGAGEMENT_COMPONENTS)} utk urut post PALING BANYAK dulu "
+                    "(mis. klik segmen 'Likes' di grafik komposisi -> sort_by=likes).",
+    ),
+    date_from: datetime | None = Query(default=None),
+    date_to: datetime | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Drill-down: daftar data MENTAH (post/komentar) di balik salah satu
+    angka metrik keyword ini -- SAMA PERSIS filter keyword+platform+periode
+    yg dipakai /metrics/keyword/{id} utk hitung angka summary-nya, jadi
+    daftar ini DIJAMIN konsisten dgn angka yg ditampilkan di kartu.
+
+    - metric=mentions|exposure|engagement -> daftar POST (id, url, author,
+      published_at, views, engagement breakdown)
+    - metric=reach -> daftar AKUN UNIK (author, platform, jumlah post)
+    - metric=sentiment -> daftar KOMENTAR (label, konten, post asal)
+    """
+    if metric not in VALID_DETAIL_METRICS:
+        raise ValidationError(f"metric harus salah satu dari {sorted(VALID_DETAIL_METRICS)}")
+    if sort_by is not None and sort_by not in SORTABLE_ENGAGEMENT_COMPONENTS:
+        raise ValidationError(f"sort_by harus salah satu dari {sorted(SORTABLE_ENGAGEMENT_COMPONENTS)}")
+
+    keyword = await db.scalar(select(Keyword).where(Keyword.id == keyword_id))
+    if not keyword:
+        raise NotFoundError(f"Keyword {keyword_id} tidak ditemukan")
+
+    if not date_from or not date_to:
+        date_from, date_to = _default_period()
+
+    platforms = [platform] if platform else []
+    keyword_texts = await fetch_keyword_texts(db, [keyword_id])
+
+    if metric == "reach":
+        items, total = await fetch_reach_detail_page(
+            db, [keyword_id], platforms, date_from, date_to, page, limit, keyword_texts,
+        )
+    elif metric == "sentiment":
+        items, total = await fetch_sentiment_detail_page(
+            db, [keyword_id], platforms, date_from, date_to, page, limit, sentiment_label, keyword_texts,
+        )
+    else:  # mentions | exposure | engagement
+        items, total = await fetch_post_detail_page(
+            db, [keyword_id], platforms, date_from, date_to, page, limit, keyword_texts, sort_by,
+        )
+
+    return build_success_response({
+        "scope": "keyword_detail",
+        "keyword": {"id": str(keyword.id), "text": keyword.keyword},
+        "metric": metric,
+        "sort_by": sort_by or "published_at",
+        "platforms": _platforms_label(platforms),
+        "period": {"from": date_from.isoformat(), "to": date_to.isoformat()},
+        "pagination": {"page": page, "limit": limit, "total": total, "total_pages": max(1, (total + limit - 1) // limit)},
+        "items": items,
     })
 
 
@@ -141,7 +235,7 @@ async def get_keyword_metrics(
 @router.get("/topic/{topic_id}", response_model=dict)
 async def get_topic_metrics(
     topic_id: uuid.UUID,
-    platforms: list[str] = Query(default=["youtube"]),
+    platforms: list[str] = Query(default=[], description="Kosong (default) = SEMUA platform, tanpa filter. Isi eksplisit utk batasi ke platform tertentu."),
     date_from: datetime | None = Query(default=None),
     date_to: datetime | None = Query(default=None),
     include_growth: bool = Query(default=True),
@@ -167,7 +261,7 @@ async def get_topic_metrics(
         return build_success_response({
             "scope": "topic",
             "topic": {"id": str(topic.id), "name": topic.name},
-            "platforms": platforms,
+            "platforms": _platforms_label(platforms),
             "metrics": {},
             "note": "Topik belum punya keyword terhubung",
         })
@@ -177,6 +271,12 @@ async def get_topic_metrics(
 
     compare_from, compare_to = (_prev_period(date_from, date_to) if include_growth else (None, None))
     all_kw_ids = list((await db.scalars(select(Keyword.id).where(Keyword.is_active == True))).all())
+
+    # Fetch teks keyword SEKALI (gabungan kw_ids topik ini + all_kw_ids
+    # global) -- dipakai ULANG di panggilan agregat DAN tiap iterasi
+    # breakdown_per_keyword di bawah, bukan di-fetch ulang tiap kali
+    # (N+1, ditemukan 2026-07-18 saat audit performa).
+    shared_kw_texts = await fetch_keyword_texts(db, list({*kw_ids, *all_kw_ids}))
 
     # Metrik agregat seluruh topik
     result = await compute_metrics(
@@ -188,12 +288,13 @@ async def get_topic_metrics(
         compare_date_from=compare_from,
         compare_date_to=compare_to,
         all_keyword_ids=all_kw_ids,
+        keyword_texts=shared_kw_texts,
     )
 
     response: dict = {
         "scope": "topic",
         "topic": {"id": str(topic.id), "name": topic.name},
-        "platforms": platforms,
+        "platforms": _platforms_label(platforms),
         "period": {"from": date_from.isoformat(), "to": date_to.isoformat()},
         "total_keywords": len(kw_ids),
         "metrics": result,
@@ -212,6 +313,7 @@ async def get_topic_metrics(
                 compare_date_from=compare_from,
                 compare_date_to=compare_to,
                 all_keyword_ids=all_kw_ids,
+                keyword_texts=shared_kw_texts,
             )
             kw_breakdown.append({
                 "keyword": stk.keyword_text,
@@ -228,7 +330,7 @@ async def get_topic_metrics(
 @router.get("/sov", response_model=dict)
 async def get_share_of_voice(
     keyword_ids: list[uuid.UUID] = Query(default=[], description="Kosong = semua keyword aktif"),
-    platforms: list[str] = Query(default=["youtube"]),
+    platforms: list[str] = Query(default=[], description="Kosong (default) = SEMUA platform, tanpa filter. Isi eksplisit utk batasi ke platform tertentu."),
     date_from: datetime | None = Query(default=None),
     date_to: datetime | None = Query(default=None),
     current_user: User = Depends(get_current_user),
@@ -245,18 +347,26 @@ async def get_share_of_voice(
     if not keyword_ids:
         keyword_ids = list((await db.scalars(select(Keyword.id).where(Keyword.is_active == True))).all())
 
-    total_mentions = await fetch_mention_count(db, keyword_ids, platforms, date_from, date_to)
+    # Fetch teks SEMUA keyword SEKALI (dulu: 1 query per keyword di loop
+    # bawah + 1 query lagi di dalam _keyword_condition tiap panggilan
+    # fetch_mention_count = ~3N+1 query total utk N keyword. Sekarang:
+    # 1 query di sini + N query count (tidak bisa dihindari, ILIKE per-
+    # keyword genuinely beda pattern) = N+2. Ditemukan 2026-07-18 saat
+    # audit performa /metrics/*.)
+    kw_texts = await fetch_keyword_texts(db, keyword_ids)
+
+    total_mentions = await fetch_mention_count(db, keyword_ids, platforms, date_from, date_to, kw_texts)
 
     items = []
     for kw_id in keyword_ids:
-        kw = await db.scalar(select(Keyword).where(Keyword.id == kw_id))
-        if not kw:
+        kw_text = kw_texts.get(kw_id)
+        if not kw_text:
             continue
-        kw_mentions = await fetch_mention_count(db, [kw_id], platforms, date_from, date_to)
+        kw_mentions = await fetch_mention_count(db, [kw_id], platforms, date_from, date_to, kw_texts)
         sov_pct = round(kw_mentions / total_mentions * 100, 2) if total_mentions > 0 else 0.0
         items.append({
-            "keyword_id": str(kw.id),
-            "keyword": kw.keyword,
+            "keyword_id": str(kw_id),
+            "keyword": kw_text,
             "mentions": kw_mentions,
             "sov_pct": sov_pct,
         })
@@ -266,7 +376,7 @@ async def get_share_of_voice(
 
     return build_success_response({
         "scope": "sov_comparison",
-        "platforms": platforms,
+        "platforms": _platforms_label(platforms),
         "period": {"from": date_from.isoformat(), "to": date_to.isoformat()},
         "total_mentions": total_mentions,
         "items": items,
@@ -279,7 +389,7 @@ async def get_share_of_voice(
 async def get_mention_trend(
     keyword_ids: list[uuid.UUID] = Query(default=[]),
     topic_id: uuid.UUID | None = Query(default=None),
-    platforms: list[str] = Query(default=["youtube"]),
+    platforms: list[str] = Query(default=[], description="Kosong (default) = SEMUA platform, tanpa filter. Isi eksplisit utk batasi ke platform tertentu."),
     date_from: datetime | None = Query(default=None),
     date_to: datetime | None = Query(default=None),
     granularity: str = Query(default="day", description="day / week / month"),
@@ -369,7 +479,7 @@ async def get_mention_trend(
     return build_success_response({
         "scope": "trend",
         "granularity": granularity,
-        "platforms": platforms,
+        "platforms": _platforms_label(platforms),
         "period": {"from": date_from.isoformat(), "to": date_to.isoformat()},
         "series": series,
     })
