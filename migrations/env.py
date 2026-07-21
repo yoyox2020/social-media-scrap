@@ -22,6 +22,7 @@ import app.domain.trends.models  # noqa: F401
 import app.domain.reports.models  # noqa: F401
 import app.domain.threads.models  # noqa: F401
 import app.domain.trend_recommendations.platform_usage_models  # noqa: F401
+import app.domain.agent_registry.models  # noqa: F401
 
 config = context.config
 

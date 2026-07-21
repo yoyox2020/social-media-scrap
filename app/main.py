@@ -41,6 +41,7 @@ def _fix_leading_zeros(s: str) -> str:
     return ''.join(result)
 
 from app.api.v1 import (
+    agent_registry,
     agents,
     apify_pool,
     auth,
@@ -77,6 +78,7 @@ import app.domain.search_topics.models  # noqa: F401
 import app.domain.scrape_runs.models  # noqa: F401
 import app.domain.instagram_trending.models  # noqa: F401
 import app.domain.trend_recommendations.models  # noqa: F401
+import app.domain.agent_registry.models  # noqa: F401
 import app.domain.youtube_discovery.models  # noqa: F401
 import app.domain.youtube_video_metadata.models  # noqa: F401
 
@@ -917,6 +919,36 @@ async def scraping_status_page():
   <div style="margin-left:auto;text-align:right;font-size:0.75rem;color:#475569">
     <div id="bf-progress">-</div>
   </div>
+</div>
+
+<div class="section-title" style="margin-top:24px">Kelola Agent &mdash; katalog semua agent AI (key+model)</div>
+<div style="font-size:0.72rem;color:#64748b;margin-bottom:12px;max-width:760px">
+  Key yang sudah LINKED ke kredensial existing diedit lewat <a href="/manage-api-keys" style="color:#60a5fa">/manage-api-keys</a>
+  atau tab Pengaturan agent masing-masing di bawah. Agent CUSTOM (baru dari form, belum tentu py kode scraping asli)
+  bisa diedit langsung di sini.
+</div>
+<div style="margin-bottom:10px">
+  <button class="retry-btn" onclick="agRegLoad()">Muat / Refresh Daftar Agent</button>
+  <span id="agreg-msg" style="margin-left:10px;font-size:0.82rem;color:#64748b"></span>
+</div>
+<div id="agreg-list" style="margin-bottom:20px">
+  <div style="color:#475569;font-style:italic;font-size:0.82rem">Klik "Muat / Refresh Daftar Agent" utk mulai (butuh token login Bearer, sama dgn tab Discovery Agent di bawah)</div>
+</div>
+
+<div style="max-width:560px;background:#1e293b;border-radius:8px;padding:16px;margin-bottom:24px">
+  <div style="font-size:0.85rem;font-weight:600;margin-bottom:10px">+ Tambah Agent Baru</div>
+  <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:10px">
+    Ini CUMA mencatat nama/key/model agent baru (jadi tercatat rapi) -- TIDAK otomatis membuat kode
+    scraping baru. Agent baru genuinely aktif tetap butuh kode (pola 6-lapis: config-agent-worker-jadwal-endpoint-dashboard).
+  </div>
+  <input type="text" id="agreg-new-name" placeholder="Nama agent (mis. TikTok Discovery Agent)" style="width:100%;margin-bottom:8px;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+  <input type="text" id="agreg-new-category" placeholder="Kategori (mis. TikTok)" style="width:100%;margin-bottom:8px;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+  <input type="text" id="agreg-new-desc" placeholder="Deskripsi singkat (opsional)" style="width:100%;margin-bottom:8px;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+  <input type="text" id="agreg-new-keylabel" placeholder="Label key (mis. OpenRouter)" style="width:100%;margin-bottom:8px;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+  <input type="password" id="agreg-new-apikey" placeholder="API key (opsional)" style="width:100%;margin-bottom:8px;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+  <input type="text" id="agreg-new-model" placeholder="Model (opsional, mis. meta-llama/llama-3.3-70b-instruct:free)" style="width:100%;margin-bottom:10px;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+  <button class="retry-btn" onclick="agRegAddNew()">Tambah Agent</button>
+  <span id="agreg-add-msg" style="margin-left:10px;font-size:0.82rem"></span>
 </div>
 
 <div class="section-title" style="margin-top:24px">YouTube Discovery Agent &mdash; pencarian viral/trending otomatis</div>
@@ -2604,6 +2636,108 @@ function daAuthHeaders() {
   return t ? { 'Authorization': 'Bearer ' + t, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
 }
 
+// ── Kelola Agent -- katalog semua agent AI (2026-07-22) ──
+async function agRegLoad() {
+  const msgEl = document.getElementById('agreg-msg');
+  msgEl.style.color = '#60a5fa';
+  msgEl.textContent = 'Memuat...';
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/agent-registry', { headers: daAuthHeaders() });
+    const j = await r.json();
+    if (!r.ok) {
+      msgEl.style.color = '#f87171';
+      msgEl.textContent = 'Gagal: ' + (j.detail || j.message || 'isi token login dulu');
+      return;
+    }
+    const agents = j.data.agents;
+    document.getElementById('agreg-list').innerHTML = agents.map(a => `
+      <div style="background:#1e293b;border-radius:8px;padding:12px 16px;margin-bottom:10px">
+        <div style="margin-bottom:6px">
+          <b>${a.agent_name}</b>
+          <span class="pill" style="background:#1e3a5f;color:#60a5fa;margin-left:6px">${a.category}</span>
+        </div>
+        <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:8px">${a.description || ''}</div>
+        <table style="width:100%">
+          <thead><tr><th>Key</th><th>Nilai</th><th>Model</th><th>Aksi</th></tr></thead>
+          <tbody>
+          ${a.keys.map(k => `
+            <tr>
+              <td style="font-size:0.78rem">${k.key_label}</td>
+              <td style="font-family:monospace;font-size:0.75rem">${k.masked_value || '-'}</td>
+              <td style="font-size:0.75rem">${k.model || '-'}</td>
+              <td style="font-size:0.72rem;color:#64748b">
+                ${k.editable_here
+                  ? `<input type="password" id="agreg-edit-${k.id}" placeholder="Key baru..." style="width:110px;padding:4px 6px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.7rem">
+                     <button class="retry-btn" style="padding:4px 8px;font-size:0.7rem" onclick="agRegEditCustom('${k.id}')">Ganti</button>`
+                  : (k.note || 'Lihat /manage-api-keys')}
+              </td>
+            </tr>
+          `).join('')}
+          </tbody>
+        </table>
+      </div>
+    `).join('');
+    msgEl.style.color = '#64748b';
+    msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID');
+  } catch (e) {
+    msgEl.style.color = '#f87171';
+    msgEl.textContent = 'Gagal: ' + e.message;
+  }
+}
+
+async function agRegEditCustom(id) {
+  const input = document.getElementById('agreg-edit-' + id);
+  const value = input.value.trim();
+  if (!value) return;
+  if (!daToken()) { alert('Isi token login (Bearer) dulu di tab Discovery Agent di bawah'); return; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/agent-registry/' + id, {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify({ api_key: value }),
+    });
+    const j = await r.json();
+    if (!r.ok) { alert('Gagal: ' + (j.detail || j.message || 'unknown')); return; }
+    input.value = '';
+    agRegLoad();
+  } catch (e) {
+    alert('Gagal: ' + e.message);
+  }
+}
+
+async function agRegAddNew() {
+  const name = document.getElementById('agreg-new-name').value.trim();
+  if (!name) { alert('Nama agent wajib diisi'); return; }
+  if (!daToken()) { alert('Isi token login (Bearer) dulu di tab Discovery Agent di bawah'); return; }
+  const body = {
+    agent_name: name,
+    category: document.getElementById('agreg-new-category').value.trim() || 'Umum',
+    description: document.getElementById('agreg-new-desc').value.trim() || null,
+    key_label: document.getElementById('agreg-new-keylabel').value.trim() || 'API Key',
+    api_key: document.getElementById('agreg-new-apikey').value.trim() || null,
+    model: document.getElementById('agreg-new-model').value.trim() || null,
+  };
+  const msgEl = document.getElementById('agreg-add-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/agent-registry', {
+      method: 'POST', headers: daAuthHeaders(), body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok) {
+      msgEl.style.color = '#f87171';
+      msgEl.textContent = 'Gagal: ' + (j.detail || j.message || 'unknown');
+      return;
+    }
+    msgEl.style.color = '#4ade80';
+    msgEl.textContent = 'Agent ditambahkan!';
+    ['name', 'category', 'desc', 'keylabel', 'apikey', 'model'].forEach(f => {
+      document.getElementById('agreg-new-' + f).value = '';
+    });
+    agRegLoad();
+  } catch (e) {
+    msgEl.style.color = '#f87171';
+    msgEl.textContent = 'Gagal: ' + e.message;
+  }
+}
+
 // ── YouTube API Key -- Monitoring Kuota Semua Agent (2026-07-20) ──
 const YK_STATUS_MAP = {
   ok:             ['OK',            '#4ade80'],
@@ -3713,6 +3847,7 @@ API_PREFIX = "/api/v1"
 app.include_router(auth.router, prefix=API_PREFIX)
 app.include_router(users.router, prefix=API_PREFIX)
 app.include_router(credentials.router, prefix=API_PREFIX)
+app.include_router(agent_registry.router, prefix=API_PREFIX)
 app.include_router(apify_pool.router, prefix=API_PREFIX)
 app.include_router(ensembledata_pool.router, prefix=API_PREFIX)
 app.include_router(keywords.router, prefix=API_PREFIX)
