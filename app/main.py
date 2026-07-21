@@ -38,6 +38,7 @@ import app.domain.instagram_trending.models  # noqa: F401
 import app.domain.trend_recommendations.models  # noqa: F401
 import app.domain.trend_recommendations.platform_usage_models  # noqa: F401
 import app.domain.agent_registry.models  # noqa: F401
+import app.domain.agent_registry.pool_models  # noqa: F401
 import app.domain.youtube_discovery.models  # noqa: F401
 import app.domain.youtube_video_metadata.models  # noqa: F401
 import app.domain.threads.models  # noqa: F401
