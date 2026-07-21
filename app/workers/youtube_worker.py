@@ -299,8 +299,14 @@ async def _run_youtube_pipeline(
                 db=db,
             )
 
-        # Deteksi apakah fallback ke YouTube Data API dipakai
-        if collection_result.errors and any("495" in str(e) for e in collection_result.errors):
+        # Deteksi apakah fallback ke YouTube Data API dipakai -- dari flag
+        # used_fallback (marker `_source` di raw response connector), BUKAN
+        # tebak dari teks error. Bug lama: kalau fallback-nya BERHASIL (tanpa
+        # exception), `errors` kosong jadi cek string "495" di errors tidak
+        # pernah kena, scrape_runs.api_source salah tercatat "ensembledata"
+        # padahal sebenarnya sudah pakai YouTube Data API v3 (ditemukan
+        # 2026-07-16 lewat cross-check posts.metadata->>'source').
+        if collection_result.used_fallback:
             api_source = "youtube_data_api"
         elif collection_result.total_fetched == 0 and collection_result.errors:
             api_source = "unknown"
@@ -441,3 +447,177 @@ async def _run_comments(
 
     await fresh_engine.dispose()
     return data
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  BACKFILL views/likes/comments yang stuck 0 -- ditambahkan 2026-07-16
+#     setelah ditemukan ~5.400 post YouTube ke-stuck views=0 permanen (enrichment
+#     gagal sesaat, tidak pernah dicoba ulang -- root cause dijelaskan di
+#     app/integrations/youtube_data_api/client.py get_videos_statistics(), yang
+#     sekarang sudah dikasih retry supaya tidak terjadi lagi ke depan). Task ini
+#     BUKAN untuk kejadian baru (itu tugas retry-nya) -- ini KHUSUS beresin post
+#     LAMA yang sudah terlanjur stuck.
+#
+#     Dikontrol via flag Redis (bukan Celery Beat/env var) supaya bisa
+#     dinyala/dimatikan LIVE dari dashboard (POST /youtube/backfill-stats/toggle)
+#     tanpa perlu restart apa pun -- lihat app/api/v1/youtube/router.py.
+#     Flag dicek ULANG tiap batch (bukan cuma di awal) supaya toggle OFF
+#     bikin task berhenti AMAN dalam hitungan detik (batch berikutnya), BUKAN
+#     langsung di-terminate paksa di tengah operasi DB (resiko data korup).
+# ─────────────────────────────────────────────────────────────────────────────
+
+BACKFILL_REDIS_KEY = "youtube:backfill:enabled"
+BACKFILL_SCRAPE_KEYWORD = "youtube_backfill_stats"
+BACKFILL_BATCH_SIZE = 50
+
+
+async def _backfill_enabled() -> bool:
+    from app.infrastructure.redis.connection import get_redis
+
+    redis = await get_redis()
+    return (await redis.get(BACKFILL_REDIS_KEY)) == "true"
+
+
+@celery_app.task(name="workers.youtube.backfill_stats", bind=True, max_retries=0)
+def backfill_youtube_stats_task(self):
+    """Dipicu manual via toggle ON (bukan Celery Beat) -- lihat docstring blok di atas."""
+    try:
+        return asyncio.run(_run_backfill())
+    except Exception as exc:
+        logger.error("[Worker/Backfill] error fatal: %s", exc)
+        raise
+
+
+async def _run_backfill() -> dict:
+    from sqlalchemy import func, select, text
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.domain.posts.models import Post
+    from app.domain.scrape_runs.models import ScrapeRun
+    from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
+    from app.shared.config import settings
+
+    if not await _backfill_enabled():
+        logger.info("[Worker/Backfill] flag OFF, tidak jalan (dicek di awal)")
+        return {"status": "disabled", "processed": 0, "updated": 0}
+
+    if not settings.youtube_data_api_key:
+        logger.warning("[Worker/Backfill] YOUTUBE_DATA_API_KEY belum di-set, dibatalkan")
+        return {"status": "no_api_key", "processed": 0, "updated": 0}
+
+    fresh_engine, session_factory = _get_fresh_session()
+    client = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
+    started_at = datetime.now(timezone.utc)
+
+    async with session_factory() as db:
+        total_target = await db.scalar(
+            select(func.count(Post.id)).where(
+                Post.platform == "youtube",
+                text("(metadata->>'views')::bigint = 0"),
+                text("metadata->>'stats_backfill_checked_at' IS NULL"),
+            )
+        ) or 0
+
+        run = ScrapeRun(
+            keyword_text=BACKFILL_SCRAPE_KEYWORD, platform="youtube_backfill",
+            api_source="youtube_data_api", status="running", triggered_by="manual_toggle",
+            started_at=started_at, videos_fetched=total_target, videos_new=0, videos_duplicate=0,
+        )
+        db.add(run)
+        await db.commit()
+        run_id = run.id
+
+    logger.info("[Worker/Backfill] MULAI -- target=%d post", total_target)
+
+    updated_total = 0
+    checked_total = 0
+    stop_reason = "completed"
+
+    while True:
+        if not await _backfill_enabled():
+            stop_reason = "stopped_by_user"
+            logger.info("[Worker/Backfill] flag dimatikan, berhenti aman di batch berikutnya")
+            break
+
+        async with session_factory() as db:
+            batch = list((await db.scalars(
+                select(Post).where(
+                    Post.platform == "youtube",
+                    text("(metadata->>'views')::bigint = 0"),
+                    text("metadata->>'stats_backfill_checked_at' IS NULL"),
+                ).order_by(Post.id).limit(BACKFILL_BATCH_SIZE)
+            )).all())
+
+            if not batch:
+                break
+
+            external_ids = [p.external_id for p in batch if p.external_id]
+            try:
+                stats_by_id = await client.get_videos_statistics(external_ids)
+            except Exception as exc:
+                # Chunk ini gagal walau sudah di-retry 3x (get_videos_statistics) --
+                # JANGAN tandai checked (biar dicoba lagi run berikutnya), stop
+                # run ini supaya tidak infinite-loop kena error yang sama terus.
+                logger.error("[Worker/Backfill] batch gagal total, berhenti: %s", exc)
+                stop_reason = "error"
+                break
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            batch_updated = 0
+            for p in batch:
+                stats = stats_by_id.get(p.external_id)
+                if stats:
+                    p.metadata_["views"] = stats["views"]
+                    p.metadata_["likes"] = stats["likes"]
+                    p.metadata_["comments"] = stats["comments"]
+                    if stats["views"] > 0:
+                        batch_updated += 1
+                p.metadata_["stats_backfill_checked_at"] = now_iso
+                # WAJIB -- SQLAlchemy TIDAK otomatis mendeteksi mutasi in-place
+                # dict JSON pada objek yg SUDAH persisted (beda dari kasus insert
+                # baru di post_repository.bulk_create), tanpa ini UPDATE-nya
+                # senyap tidak pernah ke-commit ke DB.
+                flag_modified(p, "metadata_")
+
+            await db.commit()
+            updated_total += batch_updated
+            checked_total += len(batch)
+
+            # Update progress supaya kelihatan live di dashboard, bukan cuma di akhir
+            run_row = await db.get(ScrapeRun, run_id)
+            if run_row:
+                run_row.videos_new = updated_total
+                run_row.videos_duplicate = checked_total - updated_total
+                await db.commit()
+
+        logger.info(
+            "[Worker/Backfill] batch selesai -- checked_total=%d/%d updated_total=%d",
+            checked_total, total_target, updated_total,
+        )
+        await asyncio.sleep(0.5)  # jeda kecil, jangan hajar API bertubi-tubi
+
+    async with session_factory() as db:
+        run_row = await db.get(ScrapeRun, run_id)
+        if run_row:
+            run_row.status = "success" if stop_reason in ("completed", "stopped_by_user") else "failed"
+            run_row.videos_new = updated_total
+            run_row.videos_duplicate = checked_total - updated_total
+            run_row.error_message = None if stop_reason != "error" else "Batch gagal setelah 3x retry, lihat log worker"
+            run_row.finished_at = datetime.now(timezone.utc)
+            run_row.duration_seconds = (run_row.finished_at - started_at).total_seconds()
+            await db.commit()
+
+        # completed beneran (bukan berhenti manual) -> matikan flag sendiri,
+        # supaya toggle di dashboard otomatis balik "OFF" dan jelas kelihatan
+        # selesai, bukan nyangkut "ON" padahal sudah tidak ada kerjaan.
+        if stop_reason == "completed":
+            from app.infrastructure.redis.connection import get_redis
+            redis = await get_redis()
+            await redis.set(BACKFILL_REDIS_KEY, "false")
+
+    await fresh_engine.dispose()
+    logger.info(
+        "[Worker/Backfill] SELESAI -- reason=%s checked=%d updated=%d",
+        stop_reason, checked_total, updated_total,
+    )
+    return {"status": stop_reason, "processed": checked_total, "updated": updated_total}

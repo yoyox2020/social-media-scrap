@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import uuid
 from collections import Counter
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import extract, func, select
+from sqlalchemy import extract, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.comments.models import Comment
@@ -150,12 +150,18 @@ async def collect_comments_for_video(
     keyword_id: uuid.UUID | None,
     max_comments: int = 50,
     max_pages: int = 1,
+    skip_ensemble: bool = False,
 ) -> CommentCollectionResult:
     """
     Ambil semua halaman komentar untuk satu video, simpan ke DB,
     jalankan lexicon sentiment per komentar baru.
 
     Menggunakan cursor loop — setiap halaman ~20 komentar.
+
+    Args:
+        skip_ensemble: teruskan ke connector.get_video_comments() -- lewati
+            percobaan EnsembleData, langsung YouTube Data API v3. Lihat
+            docstring YouTubeConnector.get_video_comments() utk alasannya.
     """
     post = await db.get(Post, post_id)
     if not post:
@@ -183,7 +189,7 @@ async def collect_comments_for_video(
             all_raw_comments: list[dict] = []
 
             for _page in range(max_pages):
-                raw = await connector.get_video_comments(video_id, cursor=cursor)
+                raw = await connector.get_video_comments(video_id, cursor=cursor, skip_ensemble=skip_ensemble)
                 current_source = raw.get("_source")  # None=EnsembleData, "youtube_data_api"=fallback
                 page_comments = connector.extract_comments(raw)
 
@@ -748,6 +754,206 @@ async def smart_search_youtube(
     return result
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SEARCH VIDEO PALING BARU DIUPLOAD (2026-07-16) -- beda dari smart_search_youtube
+# di atas (order=relevance, tidak peduli kebaruan): fungsi ini KHUSUS cari video
+# ter-upload dalam `hours_back` jam terakhir, urut PALING BARU duluan, lewat
+# YouTube Data API v3 LANGSUNG (search.list?publishedAfter=...&order=date) --
+# BUKAN via EnsembleData/fallback biasa, karena EnsembleData tidak native
+# support filter tanggal upload.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def search_recent_uploads(
+    db: AsyncSession,
+    keyword: str,
+    hours_back: int = 24,
+    max_results: int = 50,
+    analyze_sentiment: bool = True,
+    sentiment_top_n: int = 5,
+    max_comments_per_video: int = 20,
+) -> dict:
+    """
+    Cari video YouTube ter-upload dalam `hours_back` jam terakhir (default 24)
+    utk `keyword`, urut PALING BARU duluan (video umur 1 jam pun HARUS tetap
+    ketemu -- TIDAK ada publishedBefore, sengaja tidak exclude yang paling
+    fresh, lihat YouTubeDataAPIClient.search_recent()). Hasil disimpan sbg
+    Post baru (keyword dibuat/dipakai ulang sama seperti smart_search_youtube),
+    di-enrich views/likes/comments (search.list TIDAK sertakan statistics,
+    lihat enrich_youtube_statistics()).
+
+    Ditambahkan 2026-07-17: kalau `analyze_sentiment=True` (default), setelah
+    post baru tersimpan, `sentiment_top_n` video PALING BARU (bukan semua --
+    tiap video butuh 1 panggilan komentar terpisah, mahal kalau video-nya
+    banyak) langsung diambil komentarnya + dijalankan lexicon sentiment (pola
+    SAMA persis dgn smart_search_youtube), hasilnya disertakan di response
+    `sentiment` supaya bisa langsung dilihat TANPA perlu panggil endpoint
+    terpisah. Untuk sentiment SEMUA post keyword ini (bukan cuma yg baru),
+    lihat GET /youtube/sentiment/distribution?keyword_id=... yang sudah ada.
+
+    CATATAN KUOTA: pakai YouTube Data API v3 LANGSUNG (bukan EnsembleData-first
+    spt pipeline lain) -- search.list = 100 unit/call dari kuota gratis
+    10.000/hari yg SAMA dgn fallback EnsembleData (lihat
+    project_youtube_quota_incident_2026_07 di memory) -- pemakaian intensif
+    endpoint ini ikut mengurangi jatah harian itu.
+    """
+    from app.domain.projects.models import Project
+    from app.domain.users.models import User as UserModel
+    from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
+    from app.repositories.post_repository import PostRepository
+    from app.services.processing.normalizer import YouTubeNormalizer, enrich_youtube_statistics
+    from app.shared.config import settings
+
+    if not settings.youtube_data_api_key:
+        return {"status": "error", "message": "YOUTUBE_DATA_API_KEY belum di-set di server"}
+
+    q_clean = keyword.strip()
+    if not q_clean:
+        return {"status": "error", "message": "Keyword tidak boleh kosong"}
+
+    # ── Get-or-create Keyword (pola sama dgn smart_search_youtube) ───────────
+    kw = await db.scalar(select(Keyword).where(func.lower(Keyword.keyword) == q_clean.lower()).limit(1))
+    if not kw:
+        project_id = await db.scalar(select(Project.id).where(Project.is_active == True).limit(1))  # noqa: E712
+        if not project_id:
+            first_user = await db.scalar(select(UserModel.id).limit(1))
+            if not first_user:
+                return {"status": "error", "message": "Tidak ada user di database. Daftar dulu via /api/v1/auth/register."}
+            default_project = Project(user_id=first_user, name="Default Project", is_active=True)
+            db.add(default_project)
+            await db.flush()
+            project_id = default_project.id
+        kw = Keyword(project_id=project_id, keyword=q_clean, is_active=True)
+        db.add(kw)
+        await db.flush()
+
+    # WAJIB simpan sbg UUID biasa (bukan akses kw.id terus-menerus) --
+    # collect_comments_for_video() di bawah bisa rollback() internal kalau
+    # gagal (provider down dll), yg meng-EXPIRE seluruh objek di session
+    # termasuk `kw`. Akses `kw.id` SETELAH itu bikin AsyncSession coba
+    # auto-refresh secara sinkron -> MissingGreenlet crash (ditemukan
+    # 2026-07-17 lewat test real-DB). `kw_id` sbg uuid.UUID polos kebal
+    # dari masalah ini krn bukan atribut ORM yg bisa expired.
+    kw_id = kw.id
+
+    # ── Cari via YouTube Data API v3 langsung, filter publishedAfter ─────────
+    published_after = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+    client = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
+    raw = await client.search_recent(q_clean, published_after=published_after, max_results=max_results)
+
+    connector = YouTubeConnector(client=None)  # extract_posts() murni parsing, tidak pakai self.client
+    items = connector.extract_posts(raw)
+
+    normalizer = YouTubeNormalizer()
+    posts = normalizer.normalize(items, kw_id)
+
+    post_repo = PostRepository(db)
+    existing = await post_repo.get_existing_external_ids([p.external_id for p in posts], "youtube")
+    new_posts = [p for p in posts if p.external_id not in existing]
+    duplicate_posts = [p for p in posts if p.external_id in existing]
+
+    if new_posts:
+        await enrich_youtube_statistics(new_posts)
+        inserted = await post_repo.bulk_create(new_posts)
+    else:
+        inserted = 0
+    await db.commit()
+
+    # ── Video DUPLIKAT (sudah pernah ditemukan run sebelumnya) -- objek
+    # `p`-nya dibangun ULANG dari nol oleh normalizer TIAP kali fungsi ini
+    # dipanggil (metadata_.views selalu 0 di awal, comment 'diisi
+    # enrich_youtube_statistics()'), tapi enrich_youtube_statistics() di atas
+    # HANYA jalan utk new_posts -- video duplikat TIDAK PERNAH di-enrich lagi
+    # di sini, jadi field `views` di response "videos" selalu 0 utk video
+    # lama walau datanya SUDAH ada di DB. Fix: ambil angka NYATA dari DB --
+    # prioritaskan youtube_video_metadata (paling akurat, dijaga Views Refresh
+    # Agent) drpd posts.metrics (bisa basi/belum pernah di-enrich sejak awal).
+    if duplicate_posts:
+        dup_ids = [p.external_id for p in duplicate_posts]
+        real_stats_rows = (await db.execute(text("""
+            SELECT p.external_id, p.metrics,
+                   m.views AS meta_views, m.likes AS meta_likes
+            FROM posts p
+            LEFT JOIN youtube_video_metadata m ON m.post_id = p.id
+            WHERE p.platform = 'youtube' AND p.external_id = ANY(:ids)
+        """), {"ids": dup_ids})).mappings().all()
+        real_stats_by_id = {}
+        for row in real_stats_rows:
+            metrics = row["metrics"] or {}
+            real_stats_by_id[row["external_id"]] = {
+                "views": row["meta_views"] if row["meta_views"] is not None else metrics.get("views", 0),
+                "likes": row["meta_likes"] if row["meta_likes"] is not None else metrics.get("likes", 0),
+            }
+        for p in duplicate_posts:
+            real = real_stats_by_id.get(p.external_id)
+            if real:
+                p.metadata_["views"] = real["views"]
+                p.metadata_["likes"] = real["likes"]
+
+    # ── Fetch komentar + lexicon sentiment utk N video PALING BARU ───────────
+    # (bukan semua -- tiap video = 1 panggilan komentar terpisah, mahal kalau
+    # video-nya banyak). new_posts sudah terurut sama seperti hasil Google
+    # (paling baru duluan), jadi new_posts[:sentiment_top_n] otomatis video
+    # yg paling baru diupload.
+    sentiment_results: list[dict] = []
+    if analyze_sentiment and new_posts:
+        for post in new_posts[:sentiment_top_n]:
+            try:
+                cr = await collect_comments_for_video(
+                    db=db, post_id=post.id, keyword_id=kw_id,
+                    max_comments=max_comments_per_video, max_pages=1,
+                )
+                label_rows = (await db.scalars(
+                    select(LexiconAnalysis.label)
+                    .join(Comment, Comment.id == LexiconAnalysis.comment_id)
+                    .where(Comment.post_id == post.id)
+                )).all()
+                counter = Counter(label_rows)
+                sentiment_results.append({
+                    "video_id": post.external_id,
+                    "comments_fetched": cr.comments_fetched,
+                    "comments_analyzed": cr.comments_analyzed,
+                    "positif": counter.get("positif", 0),
+                    "negatif": counter.get("negatif", 0),
+                    "netral": counter.get("netral", 0),
+                    "errors": cr.errors,
+                })
+            except Exception as exc:
+                sentiment_results.append({"video_id": post.external_id, "error": str(exc)})
+
+    return {
+        "status": "ok",
+        "keyword": q_clean,
+        "keyword_id": str(kw_id),
+        "hours_back": hours_back,
+        "found": len(posts),
+        "new": inserted,
+        "duplicate": len(posts) - len(new_posts),
+        "window": {
+            "from": published_after.isoformat(),
+            "to": datetime.now(timezone.utc).isoformat(),
+        },
+        "sentiment": sentiment_results,
+        "sentiment_note": (
+            f"Komentar+sentiment cuma diambil utk {sentiment_top_n} video PALING BARU dari yg baru ditemukan "
+            "(hemat kuota/waktu) -- utk sentiment SEMUA post keyword ini, pakai "
+            "GET /youtube/sentiment/distribution?keyword_id=" + str(kw_id)
+        ),
+        "videos": [
+            {
+                "video_id": p.external_id,
+                "title": p.content,
+                "channel": p.author,
+                "url": p.url,
+                "thumbnail": p.metadata_.get("thumbnail", ""),
+                "views": p.metadata_.get("views", 0),
+                "likes": p.metadata_.get("likes", 0),
+                "published_at": p.published_at.isoformat() if p.published_at else None,
+            }
+            for p in posts
+        ],
+    }
+
+
 async def _build_smart_search_result(db: AsyncSession, keyword: Keyword) -> dict:
     """Bangun response lengkap dari data DB yang sudah ada."""
     # Videos (terbaru 20)
@@ -787,17 +993,21 @@ async def _build_smart_search_result(db: AsyncSession, keyword: Keyword) -> dict
             "id": str(comment.id),
             "content": comment.content,
             "author": comment.author,
-            "sentiment": analysis.label if analysis else None,
+            # final_label (mayoritas Sentiment Agent) dipakai kalau sudah
+            # direview, jatuh ke label lexicon asli kalau belum (2026-07-18).
+            "sentiment": (analysis.final_label or analysis.label) if analysis else None,
+            "sentiment_source": ("llm_reviewed" if analysis and analysis.final_label else "lexicon_only") if analysis else None,
             "score": round(analysis.score, 3) if analysis else None,
             "created_at": comment.created_at.isoformat() if comment.created_at else None,
         }
         for comment, analysis in rows
     ]
 
-    # Distribusi sentimen
-    label_rows = list((await db.scalars(
-        select(LexiconAnalysis.label).where(LexiconAnalysis.keyword_id == keyword.id)
-    )).all())
+    # Distribusi sentimen -- pakai final_label kalau ada, jatuh ke lexicon
+    label_rows = list((await db.execute(
+        select(func.coalesce(LexiconAnalysis.final_label, LexiconAnalysis.label))
+        .where(LexiconAnalysis.keyword_id == keyword.id)
+    )).scalars().all())
     counter = Counter(label_rows)
     total_analyzed = sum(counter.values())
 
@@ -834,6 +1044,115 @@ async def _build_smart_search_result(db: AsyncSession, keyword: Keyword) -> dict
         "sentiment": {**sentiment, "dominant": counter.most_common(1)[0][0] if counter else "netral"},
         "videos": videos,
         "sample_comments": sample_comments,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRENDING PUBLIC DASHBOARD -- tanpa auth, untuk di-share sbg link publik
+# (mirip /monitor-public). Data GLOBAL (sama utk semua orang), jadi cukup
+# satu URL tetap -- tidak perlu sistem token per-share seperti Maltego,
+# karena isinya bukan dashboard personal per-user.
+# ─────────────────────────────────────────────────────────────────────────────
+
+TRENDING_PUBLIC_TOP_VIDEOS = 5  # video terpopuler yg ditampilkan per topik
+
+
+async def get_trending_public_dashboard(
+    db: AsyncSession, geo: str = "ID", days: int = 7,
+) -> dict:
+    """
+    Trending topic YouTube 7 hari terakhir (hari ini s/d `days`-1 hari lalu),
+    dikelompokkan per tanggal, tiap topik disertai video terpopulernya
+    (urut views terbanyak, maks TRENDING_PUBLIC_TOP_VIDEOS).
+
+    Keyword<->TrendingTopic TIDAK ada FK -- dicocokkan lewat teks
+    (Keyword.keyword == TrendingTopic.title), sesuai cara
+    fetch_and_store_trending() membuat Keyword di atas. Topik yang belum
+    sempat dapat video (baru fetched, belum kepilih scraping) tetap
+    ditampilkan dengan video_count=0/top_videos=[] -- bukan dihilangkan.
+    """
+    today = date.today()
+    start_date = today - timedelta(days=days - 1)
+
+    topics = list((await db.scalars(
+        select(TrendingTopic)
+        .where(
+            TrendingTopic.geo == geo,
+            func.date(TrendingTopic.fetched_at) >= start_date,
+            func.date(TrendingTopic.fetched_at) <= today,
+        )
+        .order_by(TrendingTopic.fetched_at.asc(), TrendingTopic.rank.asc())
+    )).all())
+
+    # ── Cocokkan topik -> keyword_id lewat judul (batch, 1 query) ────────────
+    titles = list({t.title for t in topics})
+    title_to_kwid: dict[str, uuid.UUID] = {}
+    if titles:
+        rows = (await db.execute(
+            select(Keyword.keyword, Keyword.id).where(Keyword.keyword.in_(titles))
+        )).all()
+        title_to_kwid = {row[0]: row[1] for row in rows}
+
+    # ── Top-N video per keyword_id + total video_count, 1 query (window fn) ──
+    videos_by_kwid: dict[str, list[dict]] = {}
+    count_by_kwid: dict[str, int] = {}
+    kw_ids = list({str(kwid) for kwid in title_to_kwid.values()})
+    if kw_ids:
+        rows = (await db.execute(text("""
+            WITH ranked AS (
+                SELECT
+                    keyword_id, content AS title, url, author AS channel,
+                    (metadata->>'thumbnail') AS thumbnail,
+                    COALESCE((metadata->>'views')::bigint, 0) AS views,
+                    COALESCE((metadata->>'likes')::bigint, 0) AS likes,
+                    published_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY keyword_id
+                        ORDER BY COALESCE((metadata->>'views')::bigint, 0) DESC
+                    ) AS rn,
+                    COUNT(*) OVER (PARTITION BY keyword_id) AS video_count
+                FROM posts
+                WHERE platform = 'youtube' AND keyword_id = ANY(:kw_ids)
+            )
+            SELECT * FROM ranked WHERE rn <= :top_n ORDER BY keyword_id, rn
+        """), {"kw_ids": kw_ids, "top_n": TRENDING_PUBLIC_TOP_VIDEOS})).mappings().all()
+
+        for r in rows:
+            kwid = str(r["keyword_id"])
+            count_by_kwid[kwid] = r["video_count"]
+            videos_by_kwid.setdefault(kwid, []).append({
+                "title":        r["title"],
+                "url":          r["url"],
+                "channel":      r["channel"],
+                "thumbnail":    r["thumbnail"],
+                "views":        r["views"],
+                "likes":        r["likes"],
+                "published_at": r["published_at"].isoformat() if r["published_at"] else None,
+            })
+
+    # ── Susun per hari ─────────────────────────────────────────────────────
+    days_map: dict[str, list[dict]] = {}
+    for t in topics:
+        day_key = t.fetched_at.date().isoformat()
+        kwid = title_to_kwid.get(t.title)
+        kwid_str = str(kwid) if kwid else None
+        days_map.setdefault(day_key, []).append({
+            "rank":        t.rank,
+            "title":       t.title,
+            "traffic":     t.traffic,
+            "description": t.description,
+            "fetched_at":  t.fetched_at.isoformat(),
+            "video_count": count_by_kwid.get(kwid_str, 0),
+            "top_videos":  videos_by_kwid.get(kwid_str, []),
+        })
+
+    day_list = [(today - timedelta(days=i)) for i in range(days - 1, -1, -1)]  # oldest -> terbaru
+    return {
+        "geo": geo,
+        "days": [
+            {"date": d.isoformat(), "topics": days_map.get(d.isoformat(), [])}
+            for d in day_list
+        ],
     }
 
 

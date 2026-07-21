@@ -14,6 +14,11 @@ class Comment(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "comments"
 
     post_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("posts.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Nullable = balasan top-level (perilaku SEMUA baris lama, tidak berubah).
+    # Diisi = sub-komentar/balasan-ke-balasan, dikaitkan by ID -- ditambahkan
+    # 2026-07-20 utk redesain metode pencarian Threads (docs/threads-redesign-schema.md),
+    # tapi generik utk platform manapun yg punya nested reply.
+    parent_comment_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("comments.id", ondelete="CASCADE"), nullable=True, index=True)
     external_id: Mapped[str] = mapped_column(String(255), nullable=False)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     author: Mapped[str | None] = mapped_column(String(255), nullable=True)

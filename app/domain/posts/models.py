@@ -16,10 +16,24 @@ class Post(Base, UUIDMixin, TimestampMixin):
     keyword_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("keywords.id", ondelete="SET NULL"), nullable=True, index=True)
     external_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     platform: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     author: Mapped[str | None] = mapped_column(String(255), nullable=True)
     url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIMENSION), nullable=True)
+    # tags: list[str] hasil ekstrak hashtag dari content/caption (lihat
+    # _extract_hashtags() di normalizer.py) -- BUKAN dari API platform
+    # (kebanyakan platform tidak expose tags terstruktur di endpoint yg
+    # kita pakai), jadi cakupannya terbatas ke hashtag literal di teks.
+    tags: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # media: list[{"type": "image"|"video", "url": str}] -- MVP cuma
+    # thumbnail (1 gambar), belum tangkap multi-gambar/carousel.
+    media: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # metrics: {"views","likes","comments","shares"} terstruktur, nilai
+    # yg platform-nya tidak punya konsep itu (mis. FB/IG views) tetap 0,
+    # BUKAN None -- konsisten dgn metadata_ lama supaya dashboard yg
+    # sudah baca metadata_ tidak perlu berubah interpretasi.
+    metrics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
     raw_data: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

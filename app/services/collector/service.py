@@ -119,6 +119,8 @@ class CollectorService:
                     raw = await _fetch_page(
                         connector_instance, platform, keyword.keyword, cursor, max_pages
                     )
+                    if raw.get("_source") == "youtube_data_api":
+                        result.used_fallback = True
                     items = connector_instance.extract_posts(raw)
 
                     if not items:

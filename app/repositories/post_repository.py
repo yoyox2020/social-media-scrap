@@ -67,16 +67,32 @@ class PostRepository:
                 "keyword_id": p.keyword_id,
                 "external_id": p.external_id,
                 "platform": p.platform,
+                "title": p.title,
                 "content": p.content,
                 "author": p.author,
                 "url": p.url,
+                "tags": p.tags,
+                "media": p.media,
+                "metrics": p.metrics,
                 "metadata": p.metadata_,
                 "raw_data": p.raw_data,
                 "published_at": p.published_at,
                 "collected_at": p.collected_at,
                 "cleaned_content": p.cleaned_content,
                 "language": p.language,
-                "is_processed": p.is_processed,
+                # WAJIB coalesce None->False -- objek Post baru (belum pernah
+                # di-flush lewat ORM) belum punya default Python-side
+                # (mapped_column(default=False)) ter-apply, atribut ini masih
+                # None mentah. bulk_create pakai Core insert() (bypass ORM
+                # unit-of-work) jadi default itu TIDAK PERNAH otomatis
+                # ke-substitusi -- None ke-kirim apa adanya ke DB. Ditemukan
+                # 2026-07-16 lewat test real-DB: migrasi terbaru declare kolom
+                # ini NOT NULL, tapi skema live production ternyata TIDAK
+                # (schema drift) -- makanya belum pernah kelihatan sbg bug di
+                # produksi. Fix ini benar utk skema manapun (idealnya NOT
+                # NULL, tapi aman juga kalau nullable).
+                "is_processed": p.is_processed if p.is_processed is not None else False,
+                "is_near_duplicate": p.is_near_duplicate if p.is_near_duplicate is not None else False,
             }
             for p in posts
         ]

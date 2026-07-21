@@ -10,6 +10,34 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.domain.posts.models import Post
+from app.services.processing.cleaner import default_cleaner
+from app.services.processing.text_normalizer import default_normalizer
+
+_HASHTAG_RE = re.compile(r"#(\w+)")
+
+
+def _extract_hashtags(text: str | None) -> list[str]:
+    """Ekstrak hashtag literal ("#kata") dari teks post/caption -- MVP,
+    bukan dari field tags terstruktur API (kebanyakan platform di pipeline
+    ini tidak expose itu di endpoint yg kita pakai)."""
+    if not text:
+        return []
+    return list(dict.fromkeys(_HASHTAG_RE.findall(text)))  # dedup, urutan tetap
+
+
+def _media_list(url: str | None, kind: str = "image") -> list[dict]:
+    """Bangun list media dari 1 URL (thumbnail/gambar) yg sudah ada --
+    MVP cuma 1 item, belum tangkap multi-gambar/carousel per platform."""
+    return [{"type": kind, "url": url}] if url else []
+
+
+def _detect_lang(text: str | None) -> str:
+    """Deteksi bahasa post saat ini juga (saat normalisasi/create), BUKAN
+    lewat ProcessingService.process_keyword() terpisah -- itu pipeline lama
+    yg cuma jalan kalau dipicu manual (POST /processing/trigger), jadi
+    posts.language selalu NULL di praktiknya. Reuse heuristik yg sama
+    (TextNormalizer.detect_language), cuma dipanggil lebih awal."""
+    return default_normalizer.detect_language(default_cleaner.clean(text or ""))
 
 
 def _parse_relative_time(text: str, reference: datetime | None = None) -> datetime | None:
@@ -79,19 +107,29 @@ class TikTokNormalizer:
         aweme_id = str(item.get("aweme_id", ""))
         username = author.get("unique_id", "") or author.get("uniqueId", "")
 
+        content = item.get("desc", "")
+        likes = _safe_int(stats.get("digg_count"))
+        comments = _safe_int(stats.get("comment_count"))
+        shares = _safe_int(stats.get("share_count"))
+        views = _safe_int(stats.get("play_count"))
+
         return Post(
             id=uuid.uuid4(),
             keyword_id=keyword_id,
             external_id=aweme_id,
             platform=self.PLATFORM,
-            content=item.get("desc", ""),
+            content=content,
             author=username,
             url=f"https://www.tiktok.com/@{username}/video/{aweme_id}" if aweme_id else None,
+            tags=_extract_hashtags(content),
+            media=[],  # TikTok: cover/thumbnail belum diekstrak dari raw response (gap terpisah)
+            metrics={"views": views, "likes": likes, "comments": comments, "shares": shares},
+            language=_detect_lang(content),
             metadata_={
-                "likes": _safe_int(stats.get("digg_count")),
-                "comments": _safe_int(stats.get("comment_count")),
-                "shares": _safe_int(stats.get("share_count")),
-                "views": _safe_int(stats.get("play_count")),
+                "likes": likes,
+                "comments": comments,
+                "shares": shares,
+                "views": views,
                 "nickname": author.get("nickname", ""),
             },
             raw_data=item,
@@ -141,6 +179,11 @@ class YouTubeNormalizer:
                 content=title,
                 author=channel,
                 url=f"https://www.youtube.com/watch?v={video_id}" if video_id else None,
+                title=title,
+                tags=_extract_hashtags(title + " " + description),
+                media=_media_list(thumb_url),
+                metrics={"views": 0, "likes": 0, "comments": 0, "shares": 0},  # diisi enrich_youtube_statistics()
+                language=_detect_lang(title + " " + description),
                 metadata_={
                     "views": 0,
                     "likes": 0,
@@ -181,6 +224,11 @@ class YouTubeNormalizer:
             content=title,
             author=channel,
             url=f"https://www.youtube.com/watch?v={video_id}" if video_id else None,
+            title=title,
+            tags=_extract_hashtags(title + " " + description),
+            media=_media_list(thumb_url),
+            metrics={"views": views, "likes": 0, "comments": 0, "shares": 0},  # likes/comments diisi enrich_youtube_statistics()
+            language=_detect_lang(title + " " + description),
             metadata_={
                 "views": views,
                 "likes": 0,
@@ -241,6 +289,14 @@ async def enrich_youtube_statistics(posts: list[Post]) -> None:
         post.metadata_["views"] = stats["views"]
         post.metadata_["likes"] = stats["likes"]
         post.metadata_["comments"] = stats["comments"]
+        # metrics HARUS ikut di-update di sini juga -- kalau tidak, metrics
+        # akan diam-diam nyangkut di nilai awal (views asli tapi likes/
+        # comments selalu 0) sementara metadata_ sudah benar, bikin 2 sumber
+        # data post yg sama saling beda nilai.
+        if post.metrics is not None:
+            post.metrics["views"] = stats["views"]
+            post.metrics["likes"] = stats["likes"]
+            post.metrics["comments"] = stats["comments"]
 
 
 # ── Instagram ─────────────────────────────────────────────────────────────────
@@ -274,6 +330,11 @@ class InstagramNormalizer:
         candidates = img.get("candidates") or []
         thumbnail = candidates[0].get("url", "") if candidates else item.get("thumbnail_url", "")
 
+        is_video = bool(item.get("is_video") or item.get("media_type") == 2)
+        likes = _safe_int(item.get("like_count"))
+        comments = _safe_int(item.get("comment_count") or item.get("comments_count"))
+        views = _safe_int(item.get("view_count") or item.get("play_count"))
+
         return Post(
             id=uuid.uuid4(),
             keyword_id=keyword_id,
@@ -282,14 +343,18 @@ class InstagramNormalizer:
             content=caption,
             author=username,
             url=item.get("permalink") or (f"https://www.instagram.com/p/{shortcode}/" if shortcode else None),
+            tags=_extract_hashtags(caption),
+            media=_media_list(thumbnail, "video" if is_video else "image"),
+            metrics={"views": views, "likes": likes, "comments": comments, "shares": 0},
+            language=_detect_lang(caption),
             metadata_={
-                "likes":       _safe_int(item.get("like_count")),
-                "comments":    _safe_int(item.get("comment_count") or item.get("comments_count")),
+                "likes":       likes,
+                "comments":    comments,
                 "media_type":  item.get("media_type", ""),
-                "is_video":    bool(item.get("is_video") or item.get("media_type") == 2),
+                "is_video":    is_video,
                 "thumbnail":   thumbnail,
                 "shortcode":   shortcode,
-                "views":       _safe_int(item.get("view_count") or item.get("play_count")),
+                "views":       views,
             },
             raw_data=item,
             published_at=_utc_from_timestamp(item.get("taken_at") or item.get("timestamp")),
@@ -313,18 +378,28 @@ class RedditNormalizer:
         data = item.get("data") or item
         post_id = self._get_post_id(item)
 
+        title = data.get("title", "")
+        content = title + (" " + data.get("selftext", "") if data.get("selftext") else "")
+        score = _safe_int(data.get("score"))
+        comments = _safe_int(data.get("num_comments"))
+
         return Post(
             id=uuid.uuid4(),
             keyword_id=keyword_id,
             external_id=post_id,
             platform=self.PLATFORM,
-            content=data.get("title", "") + (" " + data.get("selftext", "") if data.get("selftext") else ""),
+            content=content,
             author=data.get("author", ""),
             url=f"https://www.reddit.com{data.get('permalink', '')}" if data.get("permalink") else None,
+            title=title,
+            tags=_extract_hashtags(content),
+            media=[],  # Reddit: gambar post belum diekstrak dari raw response
+            metrics={"views": 0, "likes": score, "comments": comments, "shares": 0},  # score = analog terdekat "likes"
+            language=_detect_lang(content),
             metadata_={
-                "score": _safe_int(data.get("score")),
+                "score": score,
                 "upvote_ratio": data.get("upvote_ratio", 0),
-                "comments": _safe_int(data.get("num_comments")),
+                "comments": comments,
                 "subreddit": data.get("subreddit", ""),
                 "is_self": data.get("is_self", True),
             },
@@ -335,31 +410,81 @@ class RedditNormalizer:
 
 
 # ── Threads ───────────────────────────────────────────────────────────────────
+# CATATAN 2026-07-19: normalizer INI SEBELUMNYA menebak bentuk raw response
+# (item.get("id")/item.get("caption")/item.get("permalink") dst, semua flat)
+# -- TERBUKTI SALAH TOTAL saat dites live ke EnsembleData asli. Bentuk asli
+# `post` (hasil ThreadsConnector.extract_posts()/extract_replies()) adalah
+# objek Instagram-family yang JAUH lebih dalam: `pk` (ID asli), `code`
+# (shortcode utk URL), `user.username`, `caption.text` (teks LENGKAP sudah
+# direkonstruksi API, tidak perlu gabung text_fragments manual),
+# `like_count` (TOP-LEVEL, bukan di caption), `text_post_app_info.
+# direct_reply_count/repost_count/quote_count`, `taken_at` (unix epoch
+# detik), `image_versions2.candidates[]`/`video_versions[]` utk media.
+
 
 class ThreadsNormalizer:
     PLATFORM = "threads"
 
     def normalize(self, items: list[dict], keyword_id: uuid.UUID) -> list[Post]:
-        return [self._to_post(item, keyword_id) for item in items if item.get("id") or item.get("pk")]
+        return [self._to_post(item, keyword_id) for item in items if item.get("pk")]
 
     def _to_post(self, item: dict, keyword_id: uuid.UUID) -> Post:
-        post_id = str(item.get("id") or item.get("pk") or "")
+        post_pk = str(item.get("pk") or "")
+        code = item.get("code") or ""
         user = item.get("user") or {}
+        username = user.get("username") or ""
+
+        # caption.text SUDAH teks lengkap direkonstruksi API (termasuk
+        # @mention) -- fallback ke gabungan text_fragments kalau caption
+        # kosong (ditemukan live: post reply kadang caption-nya null).
+        caption = item.get("caption") or {}
+        content = caption.get("text") if isinstance(caption, dict) else None
+        if not content:
+            app_info = item.get("text_post_app_info") or {}
+            fragments = (app_info.get("text_fragments") or {}).get("fragments") or []
+            if isinstance(fragments, list):
+                content = "".join(f.get("plaintext") or "" for f in fragments if isinstance(f, dict))
+        content = content or ""
+
+        app_info = item.get("text_post_app_info") or {}
+        likes = _safe_int(item.get("like_count"))
+        replies = _safe_int(app_info.get("direct_reply_count"))
+        reposts = _safe_int(app_info.get("repost_count"))
+        quotes = _safe_int(app_info.get("quote_count"))
+
+        media: list[dict] = []
+        for cand in (item.get("image_versions2") or {}).get("candidates") or []:
+            if cand.get("url"):
+                media.append({"type": "image", "url": cand["url"]})
+                break  # ambil resolusi pertama (biasanya terbesar) saja, cukup utk thumbnail
+        video_versions = item.get("video_versions") or []
+        if video_versions and video_versions[0].get("url"):
+            media.append({"type": "video", "url": video_versions[0]["url"]})
+
+        url = f"https://www.threads.net/@{username}/post/{code}" if username and code else None
 
         return Post(
             id=uuid.uuid4(),
             keyword_id=keyword_id,
-            external_id=post_id,
+            external_id=post_pk,
             platform=self.PLATFORM,
-            content=item.get("caption") or item.get("text", ""),
-            author=user.get("username", ""),
-            url=item.get("permalink"),
+            content=content,
+            author=username,
+            url=url,
+            tags=_extract_hashtags(content),
+            media=media,
+            metrics={"views": 0, "likes": likes, "comments": replies, "shares": reposts + quotes},
+            language=_detect_lang(content),
             metadata_={
-                "likes": _safe_int(item.get("like_count")),
-                "replies": _safe_int(item.get("reply_count")),
+                "likes": likes,
+                "replies": replies,
+                "reposts": reposts,
+                "quotes": quotes,
+                "code": code,
+                "source": "ensembledata",
             },
             raw_data=item,
-            published_at=_utc_from_timestamp(item.get("taken_at") or item.get("timestamp")),
+            published_at=_utc_from_timestamp(item.get("taken_at")),
             collected_at=datetime.now(timezone.utc),
         )
 

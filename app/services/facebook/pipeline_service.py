@@ -28,6 +28,7 @@ from app.domain.entities.models import Entity
 from app.domain.posts.models import Post
 from app.domain.youtube_analysis.models import LexiconAnalysis
 from app.integrations.facebook.connector import FacebookConnector
+from app.services.processing.normalizer import _detect_lang, _extract_hashtags, _media_list
 from app.shared.apify_errors import tag_if_quota_error
 from app.shared.config import settings
 
@@ -124,20 +125,27 @@ async def scrape_facebook_posts(
             except Exception:
                 pass
 
+        content = raw_p.get("message") or raw_p.get("story") or ""
+        thumbnail = raw_p.get("full_picture", "")
+
         post = Post(
             platform="facebook",
             external_id=post_id,
-            content=raw_p.get("message") or raw_p.get("story") or "",
+            content=content,
             author=page_info.get("username") or identifier,
             url=raw_p.get("permalink_url") or f"https://www.facebook.com/{post_id}",
             published_at=published_at,
             collected_at=datetime.now(timezone.utc),
             keyword_id=keyword_id,
+            tags=_extract_hashtags(content),
+            media=_media_list(thumbnail),
+            metrics={"views": 0, "likes": likes, "comments": comments_count, "shares": shares},
+            language=_detect_lang(content),
             metadata_={
                 "likes":     likes,
                 "comments":  comments_count,
                 "shares":    shares,
-                "thumbnail": raw_p.get("full_picture", ""),
+                "thumbnail": thumbnail,
                 "story":     raw_p.get("story", ""),
                 "source":    "facebook_scrape",
             },
@@ -324,6 +332,9 @@ async def scrape_facebook_posts_via_provider(
                 except ValueError:
                     published_at = None
 
+            likes = meta_row.get("postLikesCount", 0)
+            comments = meta_row.get("postCommentsCount", 0)
+
             post_obj = Post(
                 id=uuid.uuid4(),
                 keyword_id=keyword_id,
@@ -334,9 +345,13 @@ async def scrape_facebook_posts_via_provider(
                 url=post_url,
                 published_at=published_at,
                 collected_at=datetime.now(timezone.utc),
+                tags=_extract_hashtags(caption),
+                media=[],  # Facebook (jalur ini): thumbnail belum diekstrak dari raw response
+                metrics={"views": 0, "likes": likes, "comments": comments, "shares": 0},
+                language=_detect_lang(caption),
                 metadata_={
-                    "likes":     meta_row.get("postLikesCount", 0),
-                    "comments":  meta_row.get("postCommentsCount", 0),
+                    "likes":     likes,
+                    "comments":  comments,
                     "followers": profile_followers,
                     "source":    provider_used,
                 },

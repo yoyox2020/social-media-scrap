@@ -26,6 +26,8 @@ from app.domain.comments.models import Comment
 from app.domain.entities.models import Entity
 from app.domain.posts.models import Post
 from app.domain.youtube_analysis.models import LexiconAnalysis
+from app.services.processing.cleaner import default_cleaner
+from app.services.processing.text_normalizer import default_normalizer
 
 MAX_POSTS = 20
 # Dibatasi lebih rendah dari TikTok (30) karena tiap balasan butuh 1 actor
@@ -130,6 +132,11 @@ async def scrape_twitter_posts_via_provider(
         author = raw.get("author") or {}
         screen_name = author.get("screen_name") or identifier
         content = raw.get("text", "")
+        hashtags = list(dict.fromkeys(_HASHTAG_RE.findall(content)))
+        likes = _to_int(raw.get("favorites"))
+        retweets = _to_int(raw.get("retweets"))
+        views = _to_int(raw.get("views"))
+        comments = _to_int(raw.get("replies"))
         post_obj = Post(
             id=uuid.uuid4(),
             keyword_id=keyword_id,
@@ -140,12 +147,16 @@ async def scrape_twitter_posts_via_provider(
             url=f"https://x.com/{screen_name}/status/{ext_id}",
             published_at=_parse_twitter_date(raw.get("created_at")),
             collected_at=datetime.now(timezone.utc),
+            tags=hashtags,
+            media=[],  # Twitter: gambar/media tweet belum diekstrak dari raw response
+            metrics={"views": views, "likes": likes, "comments": comments, "shares": retweets},
+            language=default_normalizer.detect_language(default_cleaner.clean(content)),
             metadata_={
-                "likes":     _to_int(raw.get("favorites")),
-                "retweets":  _to_int(raw.get("retweets")),
+                "likes":     likes,
+                "retweets":  retweets,
                 "quotes":    _to_int(raw.get("quotes")),
-                "views":     _to_int(raw.get("views")),
-                "comments":  _to_int(raw.get("replies")),
+                "views":     views,
+                "comments":  comments,
                 "followers": _to_int(author.get("followers_count")),
                 "source":    "apify",
             },
@@ -154,7 +165,7 @@ async def scrape_twitter_posts_via_provider(
         await db.flush()
         posts_saved += 1
 
-        for tag in dict.fromkeys(_HASHTAG_RE.findall(content)):
+        for tag in hashtags:
             db.add(Entity(post_id=post_obj.id, text=tag, entity_type="HASHTAG"))
 
         from app.workers.ai_worker import analyze_post_task

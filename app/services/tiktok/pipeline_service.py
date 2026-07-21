@@ -20,6 +20,7 @@ from app.domain.comments.models import Comment
 from app.domain.entities.models import Entity
 from app.domain.posts.models import Post
 from app.domain.youtube_analysis.models import LexiconAnalysis
+from app.services.processing.normalizer import _detect_lang, _extract_hashtags
 
 MAX_POSTS = 20
 MAX_COMMENTS = 30
@@ -116,21 +117,30 @@ async def scrape_tiktok_posts_via_provider(
             continue
 
         author_meta = raw.get("authorMeta") or {}
+        content = raw.get("text", "")
+        likes = raw.get("diggCount", 0)
+        shares = raw.get("shareCount", 0)
+        views = raw.get("playCount", 0)
+        comments = raw.get("commentCount", 0)
         post_obj = Post(
             id=uuid.uuid4(),
             keyword_id=keyword_id,
             external_id=ext_id,
             platform="tiktok",
-            content=raw.get("text", ""),
+            content=content,
             author=author_meta.get("name") or identifier,
             url=raw.get("webVideoUrl") or f"https://www.tiktok.com/@{identifier}/video/{ext_id}",
             published_at=_parse_iso(raw.get("createTimeISO")),
             collected_at=datetime.now(timezone.utc),
+            tags=_extract_hashtags(content),
+            media=[],  # TikTok: cover/thumbnail belum diekstrak dari raw response (gap terpisah)
+            metrics={"views": views, "likes": likes, "comments": comments, "shares": shares},
+            language=_detect_lang(content),
             metadata_={
-                "likes":     raw.get("diggCount", 0),
-                "shares":    raw.get("shareCount", 0),
-                "views":     raw.get("playCount", 0),
-                "comments":  raw.get("commentCount", 0),
+                "likes":     likes,
+                "shares":    shares,
+                "views":     views,
+                "comments":  comments,
                 "collects":  raw.get("collectCount", 0),
                 "followers": author_meta.get("fans", 0),
                 "source":    "apify",

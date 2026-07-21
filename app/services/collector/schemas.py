@@ -37,6 +37,14 @@ class CollectionResult:
     skipped_duplicates: int = 0
     pages_fetched: int = 0
     errors: list[str] = field(default_factory=list)
+    # True kalau ADA halaman mana pun yang datanya berasal dari fallback
+    # provider (mis. YouTube Data API v3 saat EnsembleData 493/495) --
+    # dibaca dari marker `_source` yang connector sendiri sudah taruh di raw
+    # response (lihat app/integrations/youtube/connector.py extract_posts()),
+    # BUKAN ditebak dari teks error. Ditambahkan setelah ditemukan bug: kalau
+    # fallback-nya BERHASIL (tanpa exception), `errors` tetap kosong jadi
+    # tebakan berbasis string "495"/"493" di errors tidak pernah kena.
+    used_fallback: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -47,4 +55,5 @@ class CollectionResult:
             "skipped_duplicates": self.skipped_duplicates,
             "pages_fetched": self.pages_fetched,
             "errors": self.errors,
+            "used_fallback": self.used_fallback,
         }
