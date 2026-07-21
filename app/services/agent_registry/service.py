@@ -4,10 +4,13 @@ user). Mengelompokkan key/model per agent dalam satu tampilan, TANPA
 menduplikasi penyimpanan key yang sudah ada di Redis (lihat docstring
 app/domain/agent_registry/models.py).
 
-SEED_AGENTS: daftar AWAL agent yang SUDAH py kode scraping asli, disamakan
-dengan app/services/credentials/registry.py -- dijalankan SEKALI (idempotent,
-cek nama+key_label dulu sebelum insert) lewat `ensure_seeded()`, supaya
-tabel ini otomatis terisi tanpa migrasi data manual/kaku.
+CATATAN RESTRUKTURISASI (2026-07-22): SEMUA agent lama (YouTube
+Discovery/Metadata/Views Refresh/Sentiment/Instagram Backfill/Threads)
+DIHAPUS kodenya sekaligus (lihat docstring app/main.py) -- SEED_AGENTS
+sengaja DIKOSONGKAN, tabel ini mulai dari NOL. Riwayat agent lama tetap
+bisa dirujuk di branch `main` (GitHub) kalau perlu. Agent BARU ditambah
+lewat form dashboard "Kelola Agent" (POST /api/v1/agent-registry),
+TIDAK ada seeding otomatis lagi.
 """
 from __future__ import annotations
 
@@ -19,53 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.agent_registry.models import AgentRegistryEntry
 
-SEED_AGENTS: list[dict] = [
-    {"agent_name": "YouTube Discovery Agent 1", "category": "YouTube",
-     "description": "Cari video viral/trending baru otomatis (mode bebas + topic-guided), validasi kandidat via LLM.",
-     "key_label": "YouTube Data API", "linked_credential_id": "yt_discovery1_youtube"},
-    {"agent_name": "YouTube Discovery Agent 1", "category": "YouTube",
-     "description": "Cari video viral/trending baru otomatis (mode bebas + topic-guided), validasi kandidat via LLM.",
-     "key_label": "OpenRouter (utama)", "linked_credential_id": "yt_discovery1_openrouter"},
-    {"agent_name": "YouTube Discovery Agent 1", "category": "YouTube",
-     "description": "Cari video viral/trending baru otomatis (mode bebas + topic-guided), validasi kandidat via LLM.",
-     "key_label": "OpenRouter (cadangan)", "linked_credential_id": "yt_discovery1_openrouter_fallback"},
-
-    {"agent_name": "YouTube Discovery Agent 2", "category": "YouTube",
-     "description": "SAMA seperti Agent 1, TERPISAH TOTAL, HANYA topic-guided, jadwal tiap 1 jam.",
-     "key_label": "YouTube Data API", "linked_credential_id": "yt_discovery2_youtube"},
-    {"agent_name": "YouTube Discovery Agent 2", "category": "YouTube",
-     "description": "SAMA seperti Agent 1, TERPISAH TOTAL, HANYA topic-guided, jadwal tiap 1 jam.",
-     "key_label": "OpenRouter", "linked_credential_id": "yt_discovery2_openrouter"},
-
-    {"agent_name": "YouTube Metadata Agent", "category": "YouTube",
-     "description": "Lengkapi info video+channel+komentar dari YouTube API + viral_context (LLM).",
-     "key_label": "OpenRouter", "linked_credential_id": "yt_metadata_openrouter"},
-    {"agent_name": "YouTube Metadata Agent", "category": "YouTube",
-     "description": "Lengkapi info video+channel+komentar dari YouTube API + viral_context (LLM).",
-     "key_label": "YouTube Data API (global, fallback)", "linked_credential_id": "youtube_data_api_key"},
-
-    {"agent_name": "Views Refresh Agent", "category": "YouTube",
-     "description": "HANYA update views/likes/comments (cepat), kuota YouTube API terpisah dari Metadata Agent.",
-     "key_label": "YouTube Data API", "linked_credential_id": "views_refresh_youtube"},
-
-    {"agent_name": "Sentiment Agent", "category": "Sentimen",
-     "description": "Opini kedua LLM utk komentar yang lexicon rule-based kemungkinan salah label.",
-     "key_label": "OpenRouter (primer)", "linked_credential_id": "sentiment_openrouter"},
-    {"agent_name": "Sentiment Agent", "category": "Sentimen",
-     "description": "Opini kedua LLM utk komentar yang lexicon rule-based kemungkinan salah label.",
-     "key_label": "OpenRouter (tie-breaker)", "linked_credential_id": "sentiment_openrouter_tiebreaker"},
-
-    {"agent_name": "Instagram Thumbnail Backfill Agent", "category": "Instagram",
-     "description": "Isi ulang foto post Instagram lama, provider diacak Apify/EnsembleData per akun. Pakai POOL rotasi (bukan 1 token), lihat /manage-api-keys utk kelola semua token.",
-     "key_label": "Apify (pool)", "linked_credential_id": "apify_api_token"},
-    {"agent_name": "Instagram Thumbnail Backfill Agent", "category": "Instagram",
-     "description": "Isi ulang foto post Instagram lama, provider diacak Apify/EnsembleData per akun. Pakai POOL rotasi (bukan 1 token), lihat /manage-api-keys utk kelola semua token.",
-     "key_label": "EnsembleData (pool)", "linked_credential_id": "ensemble_data_api_token"},
-
-    {"agent_name": "Threads", "category": "Threads",
-     "description": "Scrape post+balasan berbasis keyword (tier cache->live->antrian). Pakai POOL rotasi EnsembleData, lihat /manage-api-keys.",
-     "key_label": "EnsembleData (pool)", "linked_credential_id": "ensemble_data_api_token"},
-]
+SEED_AGENTS: list[dict] = []
 
 
 async def ensure_seeded(db: AsyncSession) -> int:
