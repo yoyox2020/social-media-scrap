@@ -25,7 +25,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 logger = logging.getLogger(__name__)
 
 ACCOUNT_DISCOVERY_PLATFORMS = {"facebook", "tiktok", "twitter"}
-DIRECT_POST_PLATFORMS = {"instagram", "news"}
+# Threads ditambahkan 2026-07-19 -- search berbasis keyword LANGSUNG (via
+# EnsembleData), post tersimpan seketika, TIDAK butuh tahap "temukan akun"
+# spt Facebook/TikTok/Twitter -- pola sama dgn Instagram/News.
+DIRECT_POST_PLATFORMS = {"instagram", "news", "threads"}
 ALL_SMART_SEARCH_PLATFORMS = ACCOUNT_DISCOVERY_PLATFORMS | DIRECT_POST_PLATFORMS | {"youtube"}
 
 
@@ -64,6 +67,9 @@ async def run_tier3_discovery(
 
     if platform == "news":
         return await _discover_news(db, keyword_text, max_results)
+
+    if platform == "threads":
+        return await _discover_threads(db, keyword_text, max_results)
 
     if platform == "youtube":
         return await _discover_youtube(db, keyword_text)
@@ -115,6 +121,27 @@ async def _discover_news(db: AsyncSession, keyword_text: str, max_results: int) 
 
     save_result = await save_news_articles(db, articles)
     return {"keyword": keyword_text, "posts_found": len(articles), "saved": save_result}
+
+
+async def _discover_threads(db: AsyncSession, keyword_text: str, max_results: int) -> dict[str, Any]:
+    """Direct-post model -- posts+balasan tersimpan langsung via EnsembleData
+    (app/services/threads/pipeline_service.py), TIDAK lewat trend_recommendations
+    sama sekali di jalur INI (beda dari jadwal harian Threads yg baca
+    trend_recommendations, lihat app/services/threads/trend_scrape_service.py
+    -- keduanya SAMA-SAMA memanggil search_threads_posts(), cuma sumber
+    keyword-nya beda: sini dari Smart Search user, jadwal harian dari topik
+    AI-discovery). comments_top_n dibuat kecil (1) krn ini jalur interaktif
+    (bisa dipicu user kapan saja), bukan batch terjadwal -- kendali biaya
+    EnsembleData (lihat catatan kuota di pipeline_service.py)."""
+    from app.services.threads.pipeline_service import search_threads_posts
+
+    try:
+        result = await search_threads_posts(db, keyword=keyword_text, max_posts=max_results, comments_top_n=1)
+    except Exception as exc:
+        logger.error("run_tier3_discovery[threads]: gagal utk keyword=%r: %s", keyword_text, exc)
+        return {"keyword": keyword_text, "posts_found": 0, "error": str(exc)}
+
+    return {"keyword": keyword_text, "posts_found": result.get("posts_found", 0), "saved": result}
 
 
 async def _discover_youtube(db: AsyncSession, keyword_text: str) -> dict[str, Any]:

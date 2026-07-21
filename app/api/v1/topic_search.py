@@ -283,6 +283,14 @@ async def _save_topic(
         if kw_obj and kw_obj.id not in existing_kw_ids:
             link = SearchTopicKeyword(topic_id=topic.id, keyword_id=kw_obj.id, keyword_text=kw_text)
             db.add(link)
+            # Tandai LANGSUNG di sini (bukan cuma dari topic.topic_keywords
+            # yg sudah ada di DB) -- kalau 2 keyword_text BEDA di request yg
+            # SAMA resolve ke Keyword.id yg SAMA (fuzzy match _find_keyword,
+            # atau keyword_text dobel tidak sengaja), tanpa ini keduanya lolos
+            # cek "belum ada" lalu dua2nya coba di-INSERT dgn (topic_id,
+            # keyword_id) identik -> UniqueViolationError search_topic_keywords_pkey
+            # (500, ketemu live 2026-07-20 dari log produksi).
+            existing_kw_ids.add(kw_obj.id)
 
     return topic
 
@@ -887,3 +895,183 @@ async def delete_topic(
     await db.commit()
 
     return build_success_response({"message": f"Topik '{topic.name}' dinonaktifkan"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: Notifikasi Viral (dicek Celery per jam, lihat
+# app/services/search_topics/notification_service.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ThresholdUpdateRequest(BaseModel):
+    platform: str = Field(..., description="youtube | tiktok | twitter | facebook | instagram")
+    metric: str = Field(..., description="'views' atau 'likes'")
+    value: int = Field(..., gt=0, description="Ambang batas baru")
+
+
+class LookbackDaysUpdateRequest(BaseModel):
+    days: int = Field(..., gt=0, description="Jendela waktu baru (hari) -- post lebih tua dari ini tidak dinotifikasi")
+
+
+@router.get("/notifications", response_model=dict)
+async def list_notifications(
+    topic_id: uuid.UUID | None = Query(default=None, description="Filter ke satu topik saja"),
+    platform: str | None = Query(default=None),
+    is_read: bool | None = Query(default=None, description="Kosongkan = semua (baca+belum)"),
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List notifikasi topik viral, terbaru dulu -- ini yang di-poll
+    frontend utk tampilkan daftar/badge notifikasi."""
+    from app.domain.search_topics.models import TopicNotification
+
+    conditions = []
+    if topic_id:
+        conditions.append(TopicNotification.topic_id == topic_id)
+    if platform:
+        conditions.append(TopicNotification.platform == platform)
+    if is_read is not None:
+        conditions.append(TopicNotification.is_read == is_read)
+
+    base_q = select(TopicNotification)
+    count_q = select(func.count(TopicNotification.id))
+    for cond in conditions:
+        base_q = base_q.where(cond)
+        count_q = count_q.where(cond)
+
+    total = (await db.scalar(count_q)) or 0
+    rows = (await db.scalars(
+        base_q.order_by(TopicNotification.created_at.desc())
+        .offset((page - 1) * limit).limit(limit)
+    )).all()
+
+    return build_success_response({
+        "items": [
+            {
+                "id": str(n.id),
+                "topic_id": str(n.topic_id),
+                "platform": n.platform,
+                "post_id": str(n.post_id) if n.post_id else None,
+                "keyword_text": n.keyword_text,
+                "metric_type": n.metric_type,
+                "metric_value": n.metric_value,
+                "threshold": n.threshold,
+                "title": n.title,
+                "author": n.author,
+                "url": n.url,
+                "post_published_at": n.post_published_at.isoformat() if n.post_published_at else None,
+                # Umur konten pada saat dinotifikasi (BUKAN umur notifikasinya
+                # sendiri) -- ambang batas viral murni angka tetap tanpa
+                # komponen waktu, jadi post lama yg baru ke-notif itu valid;
+                # field ini supaya user bisa lihat sekilas seberapa baru
+                # kontennya tanpa perlu itung manual dari post_published_at.
+                "age_days": (datetime.now(timezone.utc) - n.post_published_at).days if n.post_published_at else None,
+                "is_read": n.is_read,
+                "created_at": n.created_at.isoformat(),
+            }
+            for n in rows
+        ],
+        "pagination": {
+            "page": page, "limit": limit, "total": total,
+            "total_pages": max(1, (total + limit - 1) // limit),
+        },
+    })
+
+
+@router.get("/notifications/unread-count", response_model=dict)
+async def unread_notification_count(
+    topic_id: uuid.UUID | None = Query(default=None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Angka cepat utk badge notifikasi frontend -- di-poll lebih sering
+    drpd list lengkap krn jauh lebih murah (cuma COUNT)."""
+    from app.domain.search_topics.models import TopicNotification
+
+    q = select(func.count(TopicNotification.id)).where(TopicNotification.is_read == False)  # noqa: E712
+    if topic_id:
+        q = q.where(TopicNotification.topic_id == topic_id)
+    count = (await db.scalar(q)) or 0
+    return build_success_response({"unread_count": count})
+
+
+@router.post("/notifications/{notification_id}/read", response_model=dict)
+async def mark_notification_read(
+    notification_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.domain.search_topics.models import TopicNotification
+
+    notif = await db.get(TopicNotification, notification_id)
+    if not notif:
+        from app.shared.exceptions import NotFoundError
+        raise NotFoundError(f"Notifikasi {notification_id} tidak ditemukan")
+
+    notif.is_read = True
+    notif.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    return build_success_response({"id": str(notif.id), "is_read": True})
+
+
+@router.get("/notifications/thresholds", response_model=dict)
+async def get_notification_thresholds(
+    current_user: User = Depends(get_current_user),
+):
+    """Lihat ambang batas viral yang SEDANG AKTIF per platform (dari Redis,
+    bukan .env -- lihat notification_service.py)."""
+    from app.services.search_topics.notification_service import get_all_thresholds
+
+    return build_success_response({"thresholds": await get_all_thresholds()})
+
+
+@router.patch("/notifications/thresholds", response_model=dict)
+async def update_notification_threshold(
+    body: ThresholdUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Ubah ambang batas viral SATU platform -- LANGSUNG kepakai di
+    pengecekan per-jam BERIKUTNYA (task selalu baca nilai terkini dari
+    Redis), TIDAK perlu restart apa pun."""
+    from app.services.search_topics.notification_service import set_threshold
+    from app.shared.exceptions import ValidationError
+
+    try:
+        updated = await set_threshold(body.platform, body.metric, body.value)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+
+    return build_success_response({"platform": body.platform, **updated})
+
+
+@router.get("/notifications/lookback-days", response_model=dict)
+async def get_notification_lookback_days(
+    current_user: User = Depends(get_current_user),
+):
+    """Lihat jendela waktu (hari) yang SEDANG AKTIF -- post lebih tua dari
+    ini (dihitung dari published_at, fallback collected_at) tidak lagi
+    dianggap 'baru viral' dan tidak dinotifikasi. Dari Redis, bukan hardcode
+    -- lihat notification_service.py."""
+    from app.services.search_topics.notification_service import get_lookback_days
+
+    return build_success_response({"lookback_days": await get_lookback_days()})
+
+
+@router.patch("/notifications/lookback-days", response_model=dict)
+async def update_notification_lookback_days(
+    body: LookbackDaysUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Ubah jendela waktu -- LANGSUNG kepakai di pengecekan per-jam
+    BERIKUTNYA (task selalu baca nilai terkini dari Redis), TIDAK perlu
+    restart apa pun."""
+    from app.services.search_topics.notification_service import set_lookback_days
+    from app.shared.exceptions import ValidationError
+
+    try:
+        updated = await set_lookback_days(body.days)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+
+    return build_success_response({"lookback_days": updated})

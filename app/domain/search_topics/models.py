@@ -1,11 +1,11 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.infrastructure.database.base import Base
+from app.infrastructure.database.base import Base, TimestampMixin, UUIDMixin
 
 
 class SearchTopic(Base):
@@ -56,3 +56,47 @@ class SearchTopicKeyword(Base):
     last_rescanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     topic: Mapped["SearchTopic"] = relationship("SearchTopic", back_populates="topic_keywords")
+
+
+class TopicNotification(Base, UUIDMixin, TimestampMixin):
+    """
+    Notifikasi "topik ini lagi viral" -- dibuat task Celery per jam
+    (app/services/search_topics/notification_service.py) begitu ada post
+    yang cocok keyword topik DAN metriknya (views/likes, tergantung
+    platform) lewat ambang batas (disimpan di Redis, BUKAN .env -- supaya
+    bisa diubah live tanpa restart, lihat notification_service.py).
+
+    UniqueConstraint(topic_id, post_id) dipakai SEKALIGUS sbg mekanisme
+    dedup "post ini sudah pernah dinotifikasi utk topik ini belum" --
+    insert baru pakai ON CONFLICT DO NOTHING, bukan query SELECT existence
+    check terpisah.
+    """
+    __tablename__ = "topic_notifications"
+    __table_args__ = (
+        UniqueConstraint("topic_id", "post_id", name="uq_topic_notification_topic_post"),
+    )
+
+    topic_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("search_topics.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    platform: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    post_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("posts.id", ondelete="SET NULL"), nullable=True
+    )
+    keyword_text: Mapped[str] = mapped_column(String(255), nullable=False)
+    metric_type: Mapped[str] = mapped_column(String(20), nullable=False)  # "views" | "likes"
+    metric_value: Mapped[int] = mapped_column(Integer, nullable=False)
+    threshold: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    author: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # Snapshot tanggal upload ASLI konten (BUKAN kapan notifikasi dibuat) --
+    # ditambahkan 2026-07-20 supaya user bisa lihat sekilas seberapa "baru"
+    # konten yang dinotifikasi (ambang batas viral di sini murni angka
+    # tetap, TIDAK ada komponen waktu -- post 3 minggu lalu yg baru
+    # ke-notif tetap valid selama masih dalam lookback_days & belum pernah
+    # dinotif, lihat notification_service.py). Disimpan sbg snapshot
+    # (pola sama dgn title/author/url di atas) supaya tetap ada nilainya
+    # walau post_id kelak SET NULL (post dihapus).
+    post_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_read: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false", index=True)
