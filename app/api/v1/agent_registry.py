@@ -26,11 +26,13 @@ class AddCustomAgentRequest(BaseModel):
     key_label: str = Field(default="API Key", max_length=100)
     api_key: str | None = Field(default=None, max_length=2000)
     model: str | None = Field(default=None, max_length=255)
+    account_email: str | None = Field(default=None, max_length=255)
 
 
 class UpdateCustomAgentRequest(BaseModel):
     api_key: str | None = Field(default=None, max_length=2000)
     model: str | None = Field(default=None, max_length=255)
+    account_email: str | None = Field(default=None, max_length=255)
 
 
 @router.get("", response_model=dict)
@@ -51,7 +53,7 @@ async def add_custom_agent(
     Agent baru genuinely aktif tetap butuh kode (lihat pola 6-lapis)."""
     entry = await service.add_custom_agent(
         db, body.agent_name, body.category, body.description,
-        body.key_label, body.api_key, body.model,
+        body.key_label, body.api_key, body.model, body.account_email,
     )
     return build_success_response({"id": str(entry.id), "agent_name": entry.agent_name})
 
@@ -66,7 +68,7 @@ async def update_custom_agent(
     """Ganti key/model baris CUSTOM saja (linked_credential_id NULL) --
     baris yang linked ke credential existing HARUS diganti lewat
     /api/v1/credentials/{id}, endpoint ini akan menolak (404)."""
-    entry = await service.update_custom_agent_key(db, entry_id, body.api_key, body.model)
+    entry = await service.update_custom_agent_key(db, entry_id, body.api_key, body.model, body.account_email)
     if not entry:
         raise NotFoundError("Agent registry entry tidak ditemukan atau bukan entry custom (pakai /api/v1/credentials utk yang linked)")
     return build_success_response({"id": str(entry.id), "updated": True})

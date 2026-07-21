@@ -182,6 +182,7 @@ async def kelola_agent_page():
   <input type="text" id="agreg-new-keylabel" placeholder="Label key (mis. OpenRouter)">
   <input type="password" id="agreg-new-apikey" placeholder="API key (opsional)">
   <input type="text" id="agreg-new-model" placeholder="Model (opsional)">
+  <input type="text" id="agreg-new-account" placeholder="Akun/email (opsional)">
   <button class="retry-btn" onclick="agRegAddNew()">Tambah Agent</button>
   <span id="agreg-add-msg" style="margin-left:10px;font-size:0.82rem"></span>
 </div>
@@ -220,13 +221,14 @@ async function agRegLoad() {
         </div>
         <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:8px">${a.description || ''}</div>
         <table>
-          <thead><tr><th>Key</th><th>Nilai</th><th>Model</th><th>Aksi</th></tr></thead>
+          <thead><tr><th>Key</th><th>Nilai</th><th>Model</th><th>Akun</th><th>Aksi</th></tr></thead>
           <tbody>
           ${a.keys.map(k => `
             <tr>
               <td style="font-size:0.78rem">${k.key_label}</td>
               <td style="font-family:monospace;font-size:0.75rem">${k.masked_value || '-'}</td>
               <td style="font-size:0.75rem">${k.model || '-'}</td>
+              <td style="font-size:0.75rem">${k.account_email || '-'}</td>
               <td style="font-size:0.72rem;color:#64748b">
                 ${k.editable_here
                   ? `<input type="password" id="agreg-edit-${k.id}" placeholder="Key baru..." style="width:110px;display:inline-block;padding:4px 6px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.7rem">
@@ -276,6 +278,7 @@ async function agRegAddNew() {
     key_label: document.getElementById('agreg-new-keylabel').value.trim() || 'API Key',
     api_key: document.getElementById('agreg-new-apikey').value.trim() || null,
     model: document.getElementById('agreg-new-model').value.trim() || null,
+    account_email: document.getElementById('agreg-new-account').value.trim() || null,
   };
   const msgEl = document.getElementById('agreg-add-msg');
   try {
@@ -290,7 +293,7 @@ async function agRegAddNew() {
     }
     msgEl.style.color = '#4ade80';
     msgEl.textContent = 'Agent ditambahkan!';
-    ['name', 'category', 'desc', 'keylabel', 'apikey', 'model'].forEach(f => {
+    ['name', 'category', 'desc', 'keylabel', 'apikey', 'model', 'account'].forEach(f => {
       document.getElementById('agreg-new-' + f).value = '';
     });
     agRegLoad();

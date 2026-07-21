@@ -70,7 +70,7 @@ async def list_agents(db: AsyncSession) -> list[dict]:
                 "id": str(row.id), "key_label": row.key_label,
                 "masked_value": mask_value(value), "is_set": bool(value),
                 "linked_credential_id": row.linked_credential_id,
-                "model": None, "editable_here": False,
+                "model": None, "account_email": row.account_email, "editable_here": False,
                 "note": "Diedit lewat /manage-api-keys (shared/pool) atau tab Pengaturan agent ini.",
             })
         else:
@@ -78,7 +78,7 @@ async def list_agents(db: AsyncSession) -> list[dict]:
                 "id": str(row.id), "key_label": row.key_label,
                 "masked_value": mask_value(row.custom_api_key), "is_set": bool(row.custom_api_key),
                 "linked_credential_id": None,
-                "model": row.custom_model, "editable_here": True,
+                "model": row.custom_model, "account_email": row.account_email, "editable_here": True,
                 "note": "Agent custom -- belum tentu py kode scraping asli, ini cuma pencatatan." if row.is_custom else None,
             })
     return list(agents.values())
@@ -86,7 +86,7 @@ async def list_agents(db: AsyncSession) -> list[dict]:
 
 async def add_custom_agent(
     db: AsyncSession, agent_name: str, category: str, description: str | None,
-    key_label: str, api_key: str | None, model: str | None,
+    key_label: str, api_key: str | None, model: str | None, account_email: str | None = None,
 ) -> AgentRegistryEntry:
     """Registrasi agent BARU dari form dashboard -- key/model disimpan
     LANGSUNG di baris ini (tidak ada kode scraping otomatis yang
@@ -96,6 +96,7 @@ async def add_custom_agent(
         agent_name=agent_name.strip(), category=category.strip() or "Umum",
         description=(description or "").strip() or None,
         key_label=key_label.strip() or "API Key",
+        account_email=(account_email or "").strip() or None,
         linked_credential_id=None,
         custom_api_key=(api_key or "").strip() or None,
         custom_model=(model or "").strip() or None,
@@ -109,8 +110,9 @@ async def add_custom_agent(
 
 async def update_custom_agent_key(
     db: AsyncSession, entry_id: uuid.UUID, api_key: str | None, model: str | None,
+    account_email: str | None = None,
 ) -> AgentRegistryEntry | None:
-    """Ganti key/model utk baris CUSTOM (linked_credential_id NULL) --
+    """Ganti key/model/akun utk baris CUSTOM (linked_credential_id NULL) --
     utk baris yang linked ke credential existing, ganti lewat
     /api/v1/credentials/{id} yang sudah ada, BUKAN lewat sini."""
     entry = await db.get(AgentRegistryEntry, entry_id)
@@ -120,6 +122,8 @@ async def update_custom_agent_key(
         entry.custom_api_key = api_key.strip() or None
     if model is not None:
         entry.custom_model = model.strip() or None
+    if account_email is not None:
+        entry.account_email = account_email.strip() or None
     entry.updated_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(entry)

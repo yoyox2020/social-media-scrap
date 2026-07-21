@@ -24,6 +24,7 @@ class AgentRegistryEntry(Base, UUIDMixin):
     category: Mapped[str] = mapped_column(String(50), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     key_label: Mapped[str] = mapped_column(String(100), nullable=False)
+    account_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     linked_credential_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     custom_api_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     custom_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
