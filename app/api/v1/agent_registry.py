@@ -57,6 +57,7 @@ class AddCustomAgentRequest(BaseModel):
     api_key: str | None = Field(default=None, max_length=2000)
     model: str | None = Field(default=None, max_length=255)
     account_email: str | None = Field(default=None, max_length=255)
+    parent_agent_name: str | None = Field(default=None, max_length=255)
 
 
 class UpdateCustomAgentRequest(BaseModel):
@@ -84,6 +85,7 @@ async def add_custom_agent(
     entry = await service.add_custom_agent(
         db, body.agent_name, body.category, body.description,
         body.key_label, body.api_key, body.model, body.account_email,
+        body.parent_agent_name,
     )
     return build_success_response({"id": str(entry.id), "agent_name": entry.agent_name})
 

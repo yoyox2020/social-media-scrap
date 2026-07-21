@@ -25,6 +25,10 @@ class AgentRegistryEntry(Base, UUIDMixin):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     key_label: Mapped[str] = mapped_column(String(100), nullable=False)
     account_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Hierarki parent-child (2026-07-22) -- cocokkan ke agent_name agent
+    # LAIN yg jadi induknya (mis. child "agent_viral_youtube" -> parent
+    # "agent_viral"). NULL = agent top-level, tidak punya induk.
+    parent_agent_name: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     linked_credential_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     custom_api_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     custom_model: Mapped[str | None] = mapped_column(String(255), nullable=True)

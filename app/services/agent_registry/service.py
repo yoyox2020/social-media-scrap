@@ -61,7 +61,7 @@ async def list_agents(db: AsyncSession) -> list[dict]:
     for row in rows:
         bucket = agents.setdefault(row.agent_name, {
             "agent_name": row.agent_name, "category": row.category,
-            "description": row.description, "keys": [],
+            "description": row.description, "parent_agent_name": row.parent_agent_name, "keys": [],
         })
         if row.linked_credential_id and row.linked_credential_id in cred_by_id:
             entry = cred_by_id[row.linked_credential_id]
@@ -87,16 +87,20 @@ async def list_agents(db: AsyncSession) -> list[dict]:
 async def add_custom_agent(
     db: AsyncSession, agent_name: str, category: str, description: str | None,
     key_label: str, api_key: str | None, model: str | None, account_email: str | None = None,
+    parent_agent_name: str | None = None,
 ) -> AgentRegistryEntry:
     """Registrasi agent BARU dari form dashboard -- key/model disimpan
     LANGSUNG di baris ini (tidak ada kode scraping otomatis yang
-    terbentuk, murni pencatatan/rencana sampai ada kode asli ditulis)."""
+    terbentuk, murni pencatatan/rencana sampai ada kode asli ditulis).
+    `parent_agent_name` opsional -- isi dgn agent_name INDUK kalau ini
+    child (mis. "agent_youtube01" -> parent "agent_youtube")."""
     now = datetime.now(timezone.utc)
     entry = AgentRegistryEntry(
         agent_name=agent_name.strip(), category=category.strip() or "Umum",
         description=(description or "").strip() or None,
         key_label=key_label.strip() or "API Key",
         account_email=(account_email or "").strip() or None,
+        parent_agent_name=(parent_agent_name or "").strip() or None,
         linked_credential_id=None,
         custom_api_key=(api_key or "").strip() or None,
         custom_model=(model or "").strip() or None,
