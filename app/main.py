@@ -27,7 +27,6 @@ import app.domain.posts.models  # noqa: F401
 import app.domain.comments.models  # noqa: F401
 import app.domain.sentiments.models  # noqa: F401
 import app.domain.entities.models  # noqa: F401
-import app.domain.topics.models  # noqa: F401
 import app.domain.trends.models  # noqa: F401
 import app.domain.reports.models  # noqa: F401
 import app.domain.trending.models  # noqa: F401
