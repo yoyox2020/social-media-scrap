@@ -66,7 +66,13 @@ services:
     environment:
       - OLLAMA_KEEP_ALIVE=24h
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      # Sebelumnya pakai `curl` -- image ollama/ollama:latest TIDAK punya
+      # curl/wget sama sekali, jadi healthcheck SELALU gagal ("curl: not
+      # found") walau Ollama-nya sendiri jalan normal (ditemukan 2026-07-18,
+      # sudah "unhealthy" berhari-hari padahal request nyata tetap berhasil
+      # di log). `ollama list` pakai binary yg SUDAH ada di image, tetap
+      # panggil API server lokal scr internal jadi validasi yg SAMA validnya.
+      test: ["CMD-SHELL", "ollama list || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5

@@ -4,7 +4,7 @@ import json
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 
 def _fix_leading_zeros(s: str) -> str:
@@ -42,8 +42,11 @@ def _fix_leading_zeros(s: str) -> str:
 
 from app.api.v1 import (
     agents,
+    apify_pool,
     auth,
     collectors,
+    credentials,
+    ensembledata_pool,
     entities,
     keywords,
     metrics,
@@ -74,6 +77,8 @@ import app.domain.search_topics.models  # noqa: F401
 import app.domain.scrape_runs.models  # noqa: F401
 import app.domain.instagram_trending.models  # noqa: F401
 import app.domain.trend_recommendations.models  # noqa: F401
+import app.domain.youtube_discovery.models  # noqa: F401
+import app.domain.youtube_video_metadata.models  # noqa: F401
 
 from app.api.v1.youtube.router import router as youtube_router
 from app.api.v1.instagram.router import router as instagram_router
@@ -81,6 +86,7 @@ from app.api.v1.facebook.router import router as facebook_router
 from app.api.v1.tiktok.router import router as tiktok_router
 from app.api.v1.twitter.router import router as twitter_router
 from app.api.v1.news.router import router as news_router
+from app.api.v1.threads.router import router as threads_router
 from app.api.v1.trend_discovery.router import router as trend_discovery_router
 from app.infrastructure.database.connection import engine
 from app.infrastructure.logging.logger import get_logger, setup_logging
@@ -88,7 +94,7 @@ from app.infrastructure.middleware.request_id import RequestIDMiddleware
 from app.infrastructure.redis.connection import close_redis, get_redis
 from app.shared.config import settings
 from app.shared.exceptions import AppException
-from app.shared.utils import build_error_response
+from app.shared.utils import build_error_response, build_success_response
 
 logger = get_logger(__name__)
 
@@ -224,6 +230,481 @@ async def health_check():
     )
 
 
+@app.get("/api/v1/system/ollama-status", tags=["monitor"])
+async def get_ollama_status():
+    """Status Ollama LEBIH RINCI drpd /health (yg cuma OK/error) -- model apa
+    yg SEDANG ter-load di memori + kapan expire (via /api/ps, pola sama dgn
+    `ollama ps`). Dipakai banner /scraping-status (permintaan user 2026-07-18:
+    "apakah ollama sudah ada di dashboard riwayatnya" -- belum ada sebelumnya,
+    cuma numpang di /health TANPA detail apa2)."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            tags_resp = await client.get(f"{settings.ollama_base_url}/api/tags")
+            ps_resp = await client.get(f"{settings.ollama_base_url}/api/ps")
+        alive = tags_resp.status_code == 200
+        loaded = ps_resp.json().get("models", []) if ps_resp.status_code == 200 else []
+        return build_success_response({
+            "alive": alive,
+            "loaded_models": [
+                {
+                    "name": m.get("name"),
+                    "size_mb": round((m.get("size") or 0) / 1024 / 1024, 1),
+                    "expires_at": m.get("expires_at"),
+                }
+                for m in loaded
+            ],
+        })
+    except Exception as exc:
+        return build_success_response({"alive": False, "error": str(exc)[:300], "loaded_models": []})
+
+
+@app.get("/manage-api-keys", response_class=HTMLResponse, include_in_schema=False)
+async def manage_api_keys_page():
+    """Halaman TERPUSAT kelola SEMUA API key/credential third-party
+    (permintaan user 2026-07-18) -- sebelumnya tersebar di banyak tab agent
+    berbeda. Admin-only (butuh token Bearer, lihat GET/PATCH /api/v1/credentials).
+
+    2026-07-20: Pool Token Apify DIGABUNG ke halaman ini sbg kategori
+    tambahan (bukan halaman terpisah /apify-pool lagi) -- permintaan user
+    setelah /apify-pool terasa ribet (bearer + token Apify dua kolom
+    terpisah, dua halaman beda): "gabungkan saja tpi perkategori, jgn bikin
+    susah lagi". SATU kolom Bearer dipakai kedua bagian (kategori credential
+    + pool Apify). Tombol Hapus token Apify SEKARANG by index (klik
+    langsung, TIDAK perlu tempel ulang token lengkap -- lihat
+    app/services/apify_pool/config.py::remove_token_at_index())."""
+    html = """<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kelola API Key</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; padding: 24px; }
+  h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 4px; }
+  .subtitle { color: #64748b; font-size: 0.85rem; margin-bottom: 20px; }
+  .token-box { font-size: 0.78rem; color: #94a3b8; margin-bottom: 20px; padding: 12px 14px; background: #1e293b; border-radius: 8px; max-width: 640px; line-height: 1.5; }
+  .token-box input { width: 100%; margin-top: 8px; padding: 8px 10px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0; font-size: 0.82rem; }
+  .category-group { margin-bottom: 28px; }
+  .category-title { font-size: 0.78rem; font-weight: 700; color: #60a5fa; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 10px; }
+  .cred-card { background: #1e293b; border-radius: 10px; padding: 16px 18px; margin-bottom: 10px; display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
+  .cred-info { flex: 1 1 260px; min-width: 220px; }
+  .cred-label { font-size: 0.9rem; font-weight: 600; margin-bottom: 3px; }
+  .cred-used-by { font-size: 0.75rem; color: #94a3b8; margin-bottom: 6px; }
+  .cred-value { font-size: 0.78rem; font-family: monospace; }
+  .cred-value.set { color: #4ade80; }
+  .cred-value.unset { color: #64748b; font-style: italic; }
+  .cred-live { font-size: 0.68rem; color: #475569; margin-top: 4px; }
+  .cred-edit { flex: 1 1 260px; display: flex; gap: 8px; min-width: 240px; }
+  .cred-edit input { flex: 1; padding: 8px 10px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0; font-size: 0.82rem; }
+  .cred-btn { background: #1d4ed8; color: #fff; border: none; padding: 8px 14px; border-radius: 6px; font-size: 0.8rem; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  .cred-btn:hover { background: #2563eb; }
+  .cred-msg { font-size: 0.75rem; margin-left: 4px; }
+  .green { color: #4ade80; }
+  .red { color: #f87171; }
+  #auth-gate { padding: 40px 0; text-align: center; color: #64748b; }
+  /* Pool Apify (kategori tambahan, digabung 2026-07-20) */
+  .note-box { font-size: 0.78rem; color: #fbbf24; background: rgba(251,191,36,0.08); border: 1px solid #451a03; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; }
+  .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .add-form { display: flex; gap: 8px; flex: 1 1 380px; min-width: 280px; }
+  .add-form input { flex: 1; padding: 8px 10px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0; font-size: 0.82rem; }
+  .btn-secondary { background: #334155; color: #e2e8f0; border: none; padding: 8px 14px; border-radius: 6px; font-size: 0.8rem; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  .btn-secondary:hover { background: #475569; }
+  .btn-danger { background: #7f1d1d; color: #fca5a5; border: none; padding: 6px 12px; border-radius: 6px; font-size: 0.78rem; font-weight: 600; cursor: pointer; }
+  .btn-danger:hover { background: #991b1b; }
+  .pool-size { font-size: 0.8rem; color: #64748b; }
+  .token-card { background: #1e293b; border-radius: 10px; padding: 14px 16px; margin-bottom: 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 14px; border-left: 3px solid #334155; }
+  .token-card.exhausted { border-left-color: #f87171; }
+  .token-card.ok { border-left-color: #4ade80; }
+  .token-info { flex: 1 1 180px; min-width: 160px; }
+  .token-masked { font-family: monospace; font-size: 0.82rem; margin-bottom: 4px; }
+  .token-status { font-size: 0.7rem; padding: 2px 8px; border-radius: 99px; font-weight: 600; display: inline-block; }
+  .token-status.ok { background: #14532d; color: #4ade80; }
+  .token-status.exhausted { background: #450a0a; color: #f87171; }
+  .usage-block { flex: 2 1 240px; min-width: 220px; }
+  .usage-top { display: flex; justify-content: space-between; font-size: 0.76rem; color: #94a3b8; margin-bottom: 5px; }
+  .usage-top .amount { font-weight: 700; color: #e2e8f0; }
+  .usage-bar { background: #0f172a; border-radius: 99px; height: 7px; width: 100%; overflow: hidden; }
+  .usage-fill { height: 7px; border-radius: 99px; transition: width 0.3s; }
+  .usage-fill.green { background: #4ade80; }
+  .usage-fill.yellow { background: #fbbf24; }
+  .usage-fill.red { background: #f87171; }
+  .usage-cycle { font-size: 0.66rem; color: #475569; margin-top: 4px; }
+  .usage-error { font-size: 0.74rem; color: #f87171; font-style: italic; }
+  .empty-state { color: #475569; font-size: 0.85rem; font-style: italic; padding: 14px 0; }
+</style>
+</head>
+<body>
+
+<h1>Kelola API Key &amp; Credential</h1>
+<div class="subtitle">Satu halaman utk lihat/ganti SEMUA API key third-party yg dipakai project ini -- perubahan langsung aktif, tanpa restart server.</div>
+
+<div class="token-box">
+  Butuh token login ADMIN (Bearer) -- tempel sekali, tersimpan di browser ini saja.
+  <input type="password" id="ck-token" placeholder="Bearer token admin..." onchange="ckSaveToken()">
+</div>
+
+<div id="ck-content"><div id="auth-gate">Masukkan token admin di atas utk memuat daftar credential.</div></div>
+
+<div class="category-group">
+  <div class="category-title">Apify (Pool Rotasi)</div>
+  <div id="ap-content"><div id="auth-gate-ap">Masukkan token admin di atas utk memuat pool.</div></div>
+</div>
+
+<div class="category-group">
+  <div class="category-title">EnsembleData (Pool Rotasi)</div>
+  <div id="ed-content"><div id="auth-gate-ed">Masukkan token admin di atas utk memuat pool.</div></div>
+</div>
+
+<script>
+function ckToken() {
+  return document.getElementById('ck-token').value || localStorage.getItem('ck_token') || '';
+}
+function ckSaveToken() {
+  const t = document.getElementById('ck-token').value.trim();
+  if (t) { localStorage.setItem('ck_token', t); ckLoad(); apLoad(); edLoad(); }
+}
+function ckAuthHeaders() {
+  return { 'Authorization': 'Bearer ' + ckToken(), 'Content-Type': 'application/json' };
+}
+function ckEsc(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+async function ckLoad() {
+  const content = document.getElementById('ck-content');
+  if (!ckToken()) { content.innerHTML = '<div id="auth-gate">Masukkan token admin di atas utk memuat daftar credential.</div>'; return; }
+  content.innerHTML = '<div id="auth-gate">Memuat...</div>';
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/credentials', { headers: ckAuthHeaders() });
+    const json = await r.json();
+    if (!r.ok) {
+      content.innerHTML = `<div id="auth-gate" class="red">Gagal memuat (${r.status}): ${ckEsc(json.error?.message || json.detail || 'token invalid/bukan admin')}</div>`;
+      return;
+    }
+    const items = json.data?.items || [];
+    const byCategory = {};
+    for (const it of items) {
+      (byCategory[it.category] = byCategory[it.category] || []).push(it);
+    }
+    content.innerHTML = Object.entries(byCategory).map(([cat, entries]) => `
+      <div class="category-group">
+        <div class="category-title">${ckEsc(cat)}</div>
+        ${entries.map(it => `
+          <div class="cred-card">
+            <div class="cred-info">
+              <div class="cred-label">${ckEsc(it.label)}</div>
+              <div class="cred-used-by">${ckEsc(it.used_by)}</div>
+              <div class="cred-value ${it.is_set ? 'set' : 'unset'}">${it.is_set ? ckEsc(it.masked_value) : 'belum diisi'}</div>
+              <div class="cred-live">${ckEsc(it.live_effect)}</div>
+            </div>
+            <div class="cred-edit">
+              <input type="password" id="ck-input-${ckEsc(it.id)}" placeholder="Tempel key/token baru...">
+              <button class="cred-btn" onclick="ckSave('${it.id}')">Simpan</button>
+              <span class="cred-msg" id="ck-msg-${ckEsc(it.id)}"></span>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    `).join('');
+  } catch(e) {
+    content.innerHTML = '<div id="auth-gate" class="red">Gagal terhubung ke server.</div>';
+  }
+}
+
+async function ckSave(id) {
+  const input = document.getElementById('ck-input-' + id);
+  const msg = document.getElementById('ck-msg-' + id);
+  const value = input.value.trim();
+  if (!value) { msg.className = 'cred-msg red'; msg.textContent = 'Isi dulu.'; return; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/credentials/' + encodeURIComponent(id), {
+      method: 'PATCH', headers: ckAuthHeaders(), body: JSON.stringify({ value }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.className = 'cred-msg green';
+      msg.textContent = 'Tersimpan.';
+      input.value = '';
+      ckLoad();
+    } else {
+      msg.className = 'cred-msg red';
+      msg.textContent = json.error?.message || json.detail || 'Gagal.';
+    }
+  } catch(e) { msg.className = 'cred-msg red'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+// ── Pool Apify (kategori tambahan, digabung ke halaman ini 2026-07-20) ──
+function apEsc(s) { return ckEsc(s); }
+function apBarClass(pct) {
+  if (pct === null || pct === undefined) return 'green';
+  if (pct >= 85) return 'red';
+  if (pct >= 60) return 'yellow';
+  return 'green';
+}
+
+async function apLoad() {
+  const content = document.getElementById('ap-content');
+  if (!ckToken()) { content.innerHTML = '<div id="auth-gate-ap">Masukkan token admin di atas utk memuat pool.</div>'; return; }
+  content.innerHTML = '<div id="auth-gate-ap">Memuat...</div>';
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/apify-pool', { headers: ckAuthHeaders() });
+    const json = await r.json();
+    if (!r.ok) {
+      content.innerHTML = `<div id="auth-gate-ap" class="red">Gagal memuat (${r.status}): ${apEsc(json.error?.message || json.detail || 'token invalid/bukan admin')}</div>`;
+      return;
+    }
+    const data = json.data || {};
+    const tokens = data.tokens || [];
+
+    let html = `
+      <div class="toolbar">
+        <div class="add-form">
+          <input type="password" id="ap-new-token" placeholder="Tempel token Apify baru...">
+          <button class="cred-btn" onclick="apAdd()">Tambah</button>
+        </div>
+        <button class="btn-secondary" onclick="apReset()">Reset Status Habis</button>
+        <span class="pool-size">${tokens.length} token di pool</span>
+      </div>
+      <div class="cred-msg" id="ap-msg"></div>
+    `;
+
+    if (data.note) {
+      html += `<div class="note-box">${apEsc(data.note)}</div>`;
+    }
+
+    if (tokens.length === 0) {
+      html += '<div class="empty-state">Pool masih kosong -- semua platform Apify pakai APIFY_API_TOKEN .env (satu token, tanpa rotasi). Tambahkan token pertama di atas kalau mau aktifkan rotasi.</div>';
+    } else {
+      html += tokens.map((t, idx) => {
+        const usage = t.usage || {};
+        const pct = usage.percent_used;
+        const cardCls = t.exhausted_flag ? 'exhausted' : 'ok';
+        const statusText = t.exhausted_flag ? 'HABIS (menunggu pulih)' : 'Aktif';
+        let usageHtml;
+        if (usage.checked) {
+          usageHtml = `
+            <div class="usage-top">
+              <span>Pemakaian bulan ini</span>
+              <span class="amount">$${usage.used_usd} / $${usage.limit_usd} (${usage.percent_used}%)</span>
+            </div>
+            <div class="usage-bar"><div class="usage-fill ${apBarClass(pct)}" style="width:${Math.min(pct ?? 0, 100)}%"></div></div>
+            <div class="usage-cycle">Siklus: ${apEsc((usage.cycle_start||'').slice(0,10))} s/d ${apEsc((usage.cycle_end||'').slice(0,10))}</div>
+          `;
+        } else {
+          usageHtml = `<div class="usage-error">Gagal cek pemakaian: ${apEsc(usage.message || 'tidak diketahui')}</div>`;
+        }
+        return `
+          <div class="token-card ${cardCls}">
+            <div class="token-info">
+              <div class="token-masked">${apEsc(t.masked)}</div>
+              <span class="token-status ${cardCls}">${statusText}</span>
+            </div>
+            <div class="usage-block">${usageHtml}</div>
+            <button class="btn-danger" onclick="apRemove(${idx})">Hapus</button>
+          </div>
+        `;
+      }).join('');
+    }
+
+    content.innerHTML = html;
+  } catch(e) {
+    content.innerHTML = '<div id="auth-gate-ap" class="red">Gagal terhubung ke server.</div>';
+  }
+}
+
+async function apAdd() {
+  const input = document.getElementById('ap-new-token');
+  const msg = document.getElementById('ap-msg');
+  const value = input.value.trim();
+  if (!value) { msg.className = 'cred-msg red'; msg.textContent = 'Isi token dulu.'; return; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/apify-pool', {
+      method: 'POST', headers: ckAuthHeaders(), body: JSON.stringify({ token: value }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.className = 'cred-msg green';
+      msg.textContent = 'Token ditambahkan (pool: ' + json.data.pool_size + ').';
+      input.value = '';
+      apLoad();
+    } else {
+      msg.className = 'cred-msg red';
+      msg.textContent = json.error?.message || json.detail || 'Gagal.';
+    }
+  } catch(e) { msg.className = 'cred-msg red'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function apRemove(index) {
+  // Hapus by POSISI (index) -- TIDAK perlu tempel ulang token lengkap,
+  // API tidak pernah balikin nilai token asli (cuma masked, keamanan).
+  const msg = document.getElementById('ap-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/apify-pool/remove', {
+      method: 'POST', headers: ckAuthHeaders(), body: JSON.stringify({ index }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.className = 'cred-msg green';
+      msg.textContent = 'Token dihapus (pool: ' + json.data.pool_size + ').';
+      apLoad();
+    } else {
+      msg.className = 'cred-msg red';
+      msg.textContent = json.error?.message || json.detail || 'Gagal.';
+    }
+  } catch(e) { msg.className = 'cred-msg red'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function apReset() {
+  const msg = document.getElementById('ap-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/apify-pool/reset', {
+      method: 'POST', headers: ckAuthHeaders(),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.className = 'cred-msg green';
+      msg.textContent = 'Reset ' + json.data.reset_count + ' token yang sebelumnya ditandai habis.';
+      apLoad();
+    } else {
+      msg.className = 'cred-msg red';
+      msg.textContent = json.error?.message || json.detail || 'Gagal.';
+    }
+  } catch(e) { msg.className = 'cred-msg red'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+// ── Pool EnsembleData (kategori tambahan, pola SAMA dgn Pool Apify di atas) ──
+function edEsc(s) { return ckEsc(s); }
+
+async function edLoad() {
+  const content = document.getElementById('ed-content');
+  if (!ckToken()) { content.innerHTML = '<div id="auth-gate-ed">Masukkan token admin di atas utk memuat pool.</div>'; return; }
+  content.innerHTML = '<div id="auth-gate-ed">Memuat...</div>';
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/ensembledata-pool', { headers: ckAuthHeaders() });
+    const json = await r.json();
+    if (!r.ok) {
+      content.innerHTML = `<div id="auth-gate-ed" class="red">Gagal memuat (${r.status}): ${edEsc(json.error?.message || json.detail || 'token invalid/bukan admin')}</div>`;
+      return;
+    }
+    const data = json.data || {};
+    const tokens = data.tokens || [];
+
+    let html = `
+      <div class="toolbar">
+        <div class="add-form">
+          <input type="password" id="ed-new-token" placeholder="Tempel token EnsembleData baru...">
+          <button class="cred-btn" onclick="edAdd()">Tambah</button>
+        </div>
+        <button class="btn-secondary" onclick="edReset()">Reset Status Habis</button>
+        <span class="pool-size">${tokens.length} token di pool</span>
+      </div>
+      <div class="cred-msg" id="ed-msg"></div>
+    `;
+
+    if (data.note) {
+      html += `<div class="note-box">${edEsc(data.note)}</div>`;
+    }
+
+    if (tokens.length === 0) {
+      html += '<div class="empty-state">Pool masih kosong -- pakai ENSEMBLE_DATA_API_TOKEN .env (satu token, tanpa rotasi). Tambahkan token pertama di atas kalau mau aktifkan rotasi.</div>';
+    } else {
+      html += tokens.map((t, idx) => {
+        const cardCls = t.exhausted ? 'exhausted' : 'ok';
+        const statusText = t.exhausted ? 'HABIS (menunggu pulih)' : 'Aktif';
+        return `
+          <div class="token-card ${cardCls}">
+            <div class="token-info">
+              <div class="token-masked">${edEsc(t.masked)}</div>
+              <span class="token-status ${cardCls}">${statusText}</span>
+            </div>
+            <button class="btn-danger" onclick="edRemove(${idx})">Hapus</button>
+          </div>
+        `;
+      }).join('');
+    }
+
+    content.innerHTML = html;
+  } catch(e) {
+    content.innerHTML = '<div id="auth-gate-ed" class="red">Gagal terhubung ke server.</div>';
+  }
+}
+
+async function edAdd() {
+  const input = document.getElementById('ed-new-token');
+  const msg = document.getElementById('ed-msg');
+  const value = input.value.trim();
+  if (!value) { msg.className = 'cred-msg red'; msg.textContent = 'Isi token dulu.'; return; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/ensembledata-pool', {
+      method: 'POST', headers: ckAuthHeaders(), body: JSON.stringify({ token: value }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.className = 'cred-msg green';
+      msg.textContent = 'Token ditambahkan (pool: ' + json.data.pool_size + ').';
+      input.value = '';
+      edLoad();
+    } else {
+      msg.className = 'cred-msg red';
+      msg.textContent = json.error?.message || json.detail || 'Gagal.';
+    }
+  } catch(e) { msg.className = 'cred-msg red'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function edRemove(index) {
+  const msg = document.getElementById('ed-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/ensembledata-pool/remove', {
+      method: 'POST', headers: ckAuthHeaders(), body: JSON.stringify({ index }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.className = 'cred-msg green';
+      msg.textContent = 'Token dihapus (pool: ' + json.data.pool_size + ').';
+      edLoad();
+    } else {
+      msg.className = 'cred-msg red';
+      msg.textContent = json.error?.message || json.detail || 'Gagal.';
+    }
+  } catch(e) { msg.className = 'cred-msg red'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function edReset() {
+  const msg = document.getElementById('ed-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/ensembledata-pool/reset', {
+      method: 'POST', headers: ckAuthHeaders(),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.className = 'cred-msg green';
+      msg.textContent = 'Reset ' + json.data.reset_count + ' token yang sebelumnya ditandai habis.';
+      edLoad();
+    } else {
+      msg.className = 'cred-msg red';
+      msg.textContent = json.error?.message || json.detail || 'Gagal.';
+    }
+  } catch(e) { msg.className = 'cred-msg red'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+const savedToken = localStorage.getItem('ck_token');
+if (savedToken) { document.getElementById('ck-token').value = savedToken; ckLoad(); apLoad(); edLoad(); }
+</script>
+
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
+@app.get("/apify-pool", include_in_schema=False)
+async def apify_pool_page_redirect():
+    """Halaman lama, DIGABUNG ke /manage-api-keys 2026-07-20 (permintaan
+    user: "gabungkan saja tpi perkategori, jgn bikin susah lagi") --
+    redirect supaya link/bookmark lama tetap jalan."""
+    return RedirectResponse(url="/manage-api-keys")
+
+
 @app.get("/scraping-status", response_class=HTMLResponse, include_in_schema=False)
 async def scraping_status_page():
     """Halaman monitoring scraping — tidak perlu login, bisa dibuka langsung di browser."""
@@ -259,6 +740,10 @@ async def scraping_status_page():
   td { padding: 9px 10px; border-bottom: 1px solid #1e293b; vertical-align: middle; }
   tr:hover td { background: #1e293b44; }
   .section-title { font-size: 0.85rem; font-weight: 600; color: #94a3b8; margin: 20px 0 10px; text-transform: uppercase; letter-spacing: .05em; }
+  .da-tabbar { display: flex; gap: 4px; margin-bottom: 4px; border-bottom: 1px solid #1e293b; }
+  .da-tab-btn { background: none; border: none; color: #64748b; padding: 8px 16px; font-size: 0.82rem; font-weight: 600; cursor: pointer; border-bottom: 2px solid transparent; }
+  .da-tab-btn.active { color: #60a5fa; border-bottom-color: #60a5fa; }
+  .da-panel { padding-top: 4px; }
   .refresh-bar { font-size: 0.75rem; color: #475569; margin-bottom: 16px; }
   #countdown { color: #60a5fa; }
   .error-text { color: #f87171; font-size: 0.75rem; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -387,6 +872,17 @@ async def scraping_status_page():
   </div>
 </div>
 
+<div id="ollama-banner" class="ed-banner unknown">
+  <span class="alive-dot off" id="ollama-dot"></span>
+  <div>
+    <span class="ed-banner-title">Ollama (model lokal, fallback AI Discovery) &mdash;</span>
+    <span id="ollama-status-text" style="margin-left:4px">Memuat...</span>
+  </div>
+  <div style="margin-left:auto;text-align:right;font-size:0.75rem;color:#475569;max-width:320px">
+    <div id="ollama-models">-</div>
+  </div>
+</div>
+
 <div id="apify-banner" class="ed-banner unknown">
   <span class="alive-dot off" id="apify-dot"></span>
   <div>
@@ -398,7 +894,471 @@ async def scraping_status_page():
   </div>
 </div>
 
-<div class="grid">
+<div id="ytq-banner" class="ed-banner unknown">
+  <span class="alive-dot off" id="ytq-dot"></span>
+  <div>
+    <span class="ed-banner-title">Kuota YouTube Data API v3 (fallback EnsembleData) &mdash;</span>
+    <span id="ytq-status-text" style="margin-left:4px">Memuat...</span>
+    <span id="ytq-status-detail" style="color:#64748b;font-size:0.8rem;margin-left:8px"></span>
+  </div>
+  <div style="margin-left:auto;text-align:right;font-size:0.75rem;color:#475569">
+    <div id="ytq-last-err">-</div>
+    <div id="ytq-last-ok" style="color:#4ade80"></div>
+  </div>
+</div>
+
+<div id="bf-banner" class="ed-banner unknown">
+  <span class="alive-dot off" id="bf-dot"></span>
+  <div>
+    <span class="ed-banner-title">Backfill views/likes/comments YouTube lama &mdash;</span>
+    <span id="bf-status-text" style="margin-left:4px">Memuat...</span>
+    <span id="bf-status-detail" style="color:#64748b;font-size:0.8rem;margin-left:8px"></span>
+  </div>
+  <div style="margin-left:auto;text-align:right;font-size:0.75rem;color:#475569">
+    <div id="bf-progress">-</div>
+  </div>
+</div>
+
+<div class="section-title" style="margin-top:24px">YouTube Discovery Agent &mdash; pencarian viral/trending otomatis</div>
+<div class="da-tabbar">
+  <button class="da-tab-btn active" id="da-tab-btn-status" onclick="daSwitchTab('status')">Status</button>
+  <button class="da-tab-btn" id="da-tab-btn-runs" onclick="daSwitchTab('runs')">Riwayat Run</button>
+  <button class="da-tab-btn" id="da-tab-btn-config" onclick="daSwitchTab('config')">Pengaturan</button>
+</div>
+
+<div id="da-panel-status" class="da-panel">
+  <div id="da-status-banner" class="ed-banner unknown">
+    <span class="alive-dot off" id="da-dot"></span>
+    <div>
+      <span class="ed-banner-title">Status Agent &mdash;</span>
+      <span id="da-status-text" style="margin-left:4px">Memuat...</span>
+    </div>
+    <div style="margin-left:auto;text-align:right;font-size:0.75rem;color:#475569">
+      <div id="da-last-run-at">-</div>
+    </div>
+  </div>
+  <div class="grid" style="margin-top:12px">
+    <div class="card"><div class="label">Topik Dicek</div><div class="value" id="da-topics-checked">-</div></div>
+    <div class="card"><div class="label">Kandidat Ditemukan</div><div class="value blue" id="da-candidates-found">-</div></div>
+    <div class="card"><div class="label">Lolos Validasi</div><div class="value green" id="da-candidates-validated">-</div></div>
+    <div class="card"><div class="label">Ditolak LLM</div><div class="value yellow" id="da-candidates-rejected">-</div></div>
+    <div class="card"><div class="label">Post Tersimpan</div><div class="value green" id="da-posts-saved">-</div></div>
+  </div>
+  <div id="da-error-box" style="display:none;margin-top:12px;padding:10px 14px;background:#450a0a;border-radius:8px;color:#fca5a5;font-size:0.82rem"></div>
+
+  <div style="margin-top:16px">
+    <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">Topik yang Dicakup (Mode Topic-guided) &mdash; daftar tetap, bukan progress run tertentu</div>
+    <div id="da-topics-covered" style="font-size:0.82rem;color:#e2e8f0">Memuat...</div>
+  </div>
+</div>
+
+<div id="da-panel-runs" class="da-panel" style="display:none">
+  <table style="margin-top:12px">
+    <thead><tr>
+      <th>Mulai</th><th>Status</th><th>Topik</th><th>Ditemukan</th><th>Lolos</th><th>Ditolak</th><th>Tersimpan</th><th>Model</th><th></th>
+    </tr></thead>
+    <tbody id="da-runs-tbody"><tr><td colspan="9">Memuat...</td></tr></tbody>
+  </table>
+  <div id="da-runs-pagination" style="margin-top:10px"></div>
+</div>
+
+<div id="da-detail-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;align-items:center;justify-content:center" onclick="if(event.target===this) daCloseDetails()">
+  <div style="background:#1e293b;border-radius:10px;padding:20px;max-width:820px;max-height:82vh;overflow-y:auto;width:92%">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3 style="margin:0;font-size:1rem">Rincian Kandidat yang Discraping</h3>
+      <button class="page-btn" onclick="daCloseDetails()">Tutup</button>
+    </div>
+    <div id="da-detail-modal-body"></div>
+  </div>
+</div>
+
+<div id="da-panel-config" class="da-panel" style="display:none">
+  <div style="max-width:520px;margin-top:12px">
+    <div style="font-size:0.78rem;color:#94a3b8;margin-bottom:14px;padding:10px 12px;background:#1e293b;border-radius:8px;line-height:1.5">
+      Lihat status/riwayat TIDAK perlu token. Mengubah pengaturan di bawah butuh token
+      login (Bearer) &mdash; tempel sekali, tersimpan di browser ini saja.
+      <input type="password" id="da-token" placeholder="Bearer token..." style="width:100%;margin-top:8px;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.8rem">
+    </div>
+
+    <div style="margin-bottom:18px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">Interval Scheduler</div>
+      <div id="da-interval-btns" style="display:flex;gap:8px"></div>
+    </div>
+
+    <div style="margin-bottom:14px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:6px">Model OpenRouter</div>
+      <input type="text" id="da-model-input" placeholder="mis. deepseek/deepseek-chat-v3-0324:free" style="width:100%;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+    </div>
+
+    <div style="margin-bottom:14px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:6px">API Key OpenRouter <span id="da-key-current" style="color:#64748b"></span></div>
+      <input type="password" id="da-apikey-input" placeholder="Kosongkan kalau tidak diubah" style="width:100%;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+    </div>
+
+    <button class="retry-btn" onclick="daSaveConfig()">Simpan Pengaturan</button>
+    <span id="da-config-msg" style="margin-left:10px;font-size:0.82rem"></span>
+  </div>
+</div>
+
+<div class="section-title" style="margin-top:24px">YouTube Discovery Agent 2 &mdash; agent TERPISAH, key YouTube+OpenRouter sendiri, HANYA topic-guided, tiap 1 jam</div>
+
+<div id="da2q-banner" class="ed-banner unknown">
+  <span class="alive-dot off" id="da2q-dot"></span>
+  <div>
+    <span class="ed-banner-title">Kuota YouTube Data API v3 (Agent 2, key terpisah) &mdash;</span>
+    <span id="da2q-status-text" style="margin-left:4px">Memuat...</span>
+    <span id="da2q-status-detail" style="color:#64748b;font-size:0.8rem;margin-left:8px"></span>
+  </div>
+  <div style="margin-left:auto;text-align:right;font-size:0.75rem;color:#475569">
+    <div id="da2q-last-err">-</div>
+    <div id="da2q-last-ok" style="color:#4ade80"></div>
+  </div>
+</div>
+
+<div class="da-tabbar">
+  <button class="da-tab-btn active" id="da2-tab-btn-status" onclick="da2SwitchTab('status')">Status</button>
+  <button class="da-tab-btn" id="da2-tab-btn-runs" onclick="da2SwitchTab('runs')">Riwayat Run</button>
+  <button class="da-tab-btn" id="da2-tab-btn-config" onclick="da2SwitchTab('config')">Pengaturan</button>
+</div>
+
+<div id="da2-panel-status" class="da-panel">
+  <div id="da2-status-banner" class="ed-banner unknown">
+    <span class="alive-dot off" id="da2-dot"></span>
+    <div>
+      <span class="ed-banner-title">Status Agent 2 &mdash;</span>
+      <span id="da2-status-text" style="margin-left:4px">Memuat...</span>
+    </div>
+    <div style="margin-left:auto;text-align:right;font-size:0.75rem;color:#475569">
+      <div id="da2-last-run-at">-</div>
+    </div>
+  </div>
+  <div class="grid" style="margin-top:12px">
+    <div class="card"><div class="label">Topik Dicek</div><div class="value" id="da2-topics-checked">-</div></div>
+    <div class="card"><div class="label">Kandidat Ditemukan</div><div class="value blue" id="da2-candidates-found">-</div></div>
+    <div class="card"><div class="label">Lolos Validasi</div><div class="value green" id="da2-candidates-validated">-</div></div>
+    <div class="card"><div class="label">Ditolak LLM</div><div class="value yellow" id="da2-candidates-rejected">-</div></div>
+    <div class="card"><div class="label">Post Tersimpan</div><div class="value green" id="da2-posts-saved">-</div></div>
+  </div>
+  <div id="da2-error-box" style="display:none;margin-top:12px;padding:10px 14px;background:#450a0a;border-radius:8px;color:#fca5a5;font-size:0.82rem"></div>
+
+  <div style="margin-top:16px">
+    <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">Topik yang Dicakup (HANYA topic-guided, TIDAK ada mode free-discovery) &mdash; daftar SAMA dgn Agent 1, dua agent cari topik yg sama pakai key terpisah</div>
+    <div id="da2-topics-covered" style="font-size:0.82rem;color:#e2e8f0">Memuat...</div>
+  </div>
+</div>
+
+<div id="da2-panel-runs" class="da-panel" style="display:none">
+  <table style="margin-top:12px">
+    <thead><tr>
+      <th>Mulai</th><th>Status</th><th>Topik</th><th>Ditemukan</th><th>Lolos</th><th>Ditolak</th><th>Tersimpan</th><th>Model</th><th></th>
+    </tr></thead>
+    <tbody id="da2-runs-tbody"><tr><td colspan="9">Memuat...</td></tr></tbody>
+  </table>
+  <div id="da2-runs-pagination" style="margin-top:10px"></div>
+</div>
+
+<div id="da2-panel-config" class="da-panel" style="display:none">
+  <div style="max-width:520px;margin-top:12px">
+    <div style="font-size:0.78rem;color:#94a3b8;margin-bottom:14px;padding:10px 12px;background:#1e293b;border-radius:8px;line-height:1.5">
+      Lihat status/riwayat TIDAK perlu token. Mengubah pengaturan di bawah butuh token
+      login (Bearer) &mdash; pakai token yang sama dgn tab Discovery Agent di atas (tersimpan bersama).
+    </div>
+
+    <div style="margin-bottom:18px;padding:12px 14px;background:#1e293b;border-radius:8px;display:flex;align-items:center;justify-content:space-between">
+      <div>
+        <div style="font-size:0.85rem;font-weight:600">Agent 2 Aktif?</div>
+        <div style="font-size:0.75rem;color:#94a3b8;margin-top:2px">Matikan kapan saja tanpa menghapus key/model yang tersimpan.</div>
+      </div>
+      <button class="retry-btn" id="da2-enabled-btn" onclick="da2ToggleEnabled()">Memuat...</button>
+    </div>
+
+    <div style="margin-bottom:18px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">Interval Scheduler</div>
+      <div id="da2-interval-btns" style="display:flex;gap:8px"></div>
+    </div>
+
+    <div style="margin-bottom:14px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:6px">Model OpenRouter (milik Agent 2, terpisah dari Agent 1)</div>
+      <input type="text" id="da2-model-input" placeholder="mis. nvidia/nemotron-nano-9b-v2:free" style="width:100%;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+    </div>
+
+    <div style="margin-bottom:14px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:6px">API Key OpenRouter (Agent 2) <span id="da2-key-current" style="color:#64748b"></span></div>
+      <input type="password" id="da2-apikey-input" placeholder="Kosongkan kalau tidak diubah" style="width:100%;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+    </div>
+
+    <div style="margin-bottom:14px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:6px">YouTube Data API Key (Agent 2, TERPISAH dari Agent 1) <span id="da2-ytkey-current" style="color:#64748b"></span></div>
+      <input type="password" id="da2-ytkey-input" placeholder="Kosongkan kalau tidak diubah" style="width:100%;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+    </div>
+
+    <button class="retry-btn" onclick="da2SaveConfig()">Simpan Pengaturan</button>
+    <span id="da2-config-msg" style="margin-left:10px;font-size:0.82rem"></span>
+  </div>
+</div>
+
+<div class="section-title" style="margin-top:24px">YouTube Metadata Agent &mdash; lengkapi info video+channel (bukan analisis)</div>
+<div class="da-tabbar">
+  <button class="da-tab-btn active" id="ma-tab-btn-status" onclick="maSwitchTab('status')">Status</button>
+  <button class="da-tab-btn" id="ma-tab-btn-history" onclick="maSwitchTab('history')">Riwayat</button>
+  <button class="da-tab-btn" id="ma-tab-btn-config" onclick="maSwitchTab('config')">Pengaturan</button>
+</div>
+
+<div id="ma-panel-status" class="da-panel">
+  <div id="ma-status-banner" class="ed-banner unknown">
+    <span class="alive-dot off" id="ma-dot"></span>
+    <div>
+      <span class="ed-banner-title">Status Agent &mdash;</span>
+      <span id="ma-status-text" style="margin-left:4px">Memuat...</span>
+    </div>
+    <div style="margin-left:auto;text-align:right;font-size:0.75rem;color:#475569">
+      <div id="ma-last-run-at">-</div>
+    </div>
+  </div>
+  <div class="grid" style="margin-top:12px">
+    <div class="card"><div class="label">Antrian (Belum Ter-enrich)</div><div class="value yellow" id="ma-pending">-</div></div>
+    <div class="card"><div class="label">Total Sudah Ter-enrich</div><div class="value green" id="ma-total-enriched">-</div></div>
+    <div class="card"><div class="label">Antrian Refresh (Data Basi)</div><div class="value yellow" id="ma-pending-refresh">-</div></div>
+    <div class="card"><div class="label">Judul Berubah (Perlu Ditinjau)</div><div class="value red" id="ma-title-mismatch-count">-</div></div>
+  </div>
+  <div style="font-size:0.72rem;color:#64748b;margin-top:6px">
+    "Antrian Refresh" = video yg SUDAH ter-enrich tapi datanya (views/likes/komentar) lebih tua dari
+    <span id="ma-refresh-age-label">-</span> &mdash; akan otomatis diambil ulang tiap agent jalan (Stage 2, terus-menerus).
+    "Judul Berubah" = judul tersimpan TIDAK cocok lagi dengan judul asli di YouTube saat terakhir dicek
+    (video mungkin ganti judul, atau data awal salah) &mdash; judul lama SENGAJA tidak ditimpa otomatis,
+    lihat tab Riwayat (centang "Cuma judul berubah") untuk tinjau manual.
+  </div>
+</div>
+
+<div id="ma-panel-history" class="da-panel" style="display:none">
+  <label style="font-size:0.8rem;color:#94a3b8;display:flex;align-items:center;gap:6px;margin-top:12px">
+    <input type="checkbox" id="ma-history-mismatch-only" onchange="maLoadHistory(1)"> Cuma judul berubah (perlu ditinjau)
+  </label>
+  <table style="margin-top:8px">
+    <thead><tr>
+      <th>Waktu</th><th>Judul</th><th>Channel</th><th>Views</th><th>Keyword</th><th>Konteks Viral</th>
+    </tr></thead>
+    <tbody id="ma-history-tbody"><tr><td colspan="6">Memuat...</td></tr></tbody>
+  </table>
+  <div id="ma-history-pagination" style="margin-top:10px"></div>
+</div>
+
+<div id="ma-panel-config" class="da-panel" style="display:none">
+  <div style="max-width:520px;margin-top:12px">
+    <div style="font-size:0.78rem;color:#94a3b8;margin-bottom:14px;padding:10px 12px;background:#1e293b;border-radius:8px;line-height:1.5">
+      Lihat status/riwayat TIDAK perlu token. Mengubah pengaturan di bawah butuh token
+      login (Bearer) &mdash; pakai token yang sama dgn tab Discovery Agent di atas (tersimpan bersama).
+    </div>
+
+    <div style="margin-bottom:18px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">Interval Scheduler (menit)</div>
+      <div id="ma-interval-btns" style="display:flex;gap:8px"></div>
+    </div>
+
+    <div style="margin-bottom:18px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">Refresh data basi setelah (jam) &mdash; Stage 2, butuh login</div>
+      <div id="ma-refresh-age-btns" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+    </div>
+
+    <div style="margin-bottom:18px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">Jumlah video di-refresh per run &mdash; butuh login</div>
+      <div id="ma-refresh-batch-btns" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+    </div>
+
+    <div style="margin-bottom:18px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">Jumlah post BARU di-enrich per run (kecepatan kejar backlog) &mdash; butuh login</div>
+      <div id="ma-enrich-batch-btns" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+      <div style="font-size:0.72rem;color:#64748b;margin-top:6px">Makin besar = makin cepat backlog habis, tapi makin banyak kuota YouTube API terpakai per run. Naikkan bertahap sambil pantau error kuota.</div>
+    </div>
+
+    <div style="margin-bottom:14px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:6px">Model OpenRouter (khusus viral_context)</div>
+      <input type="text" id="ma-model-input" placeholder="mis. openai/gpt-oss-20b:free" style="width:100%;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+    </div>
+
+    <div style="margin-bottom:14px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:6px">API Key OpenRouter <span id="ma-key-current" style="color:#64748b"></span></div>
+      <input type="password" id="ma-apikey-input" placeholder="Kosongkan kalau tidak diubah" style="width:100%;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+    </div>
+
+    <button class="retry-btn" onclick="maSaveConfig()">Simpan Pengaturan</button>
+    <span id="ma-config-msg" style="margin-left:10px;font-size:0.82rem"></span>
+  </div>
+</div>
+
+<div class="section-title" style="margin-top:24px">Sentiment Agent &mdash; opini kedua LLM utk komentar yg lexicon kemungkinan salah</div>
+<div class="da-tabbar">
+  <button class="da-tab-btn active" id="sa-tab-btn-status" onclick="saSwitchTab('status')">Status</button>
+  <button class="da-tab-btn" id="sa-tab-btn-history" onclick="saSwitchTab('history')">Riwayat</button>
+  <button class="da-tab-btn" id="sa-tab-btn-config" onclick="saSwitchTab('config')">Pengaturan</button>
+</div>
+
+<div id="sa-panel-status" class="da-panel">
+  <div id="sa-status-banner" class="ed-banner unknown">
+    <span class="alive-dot off" id="sa-dot"></span>
+    <div>
+      <span class="ed-banner-title">Status Agent &mdash;</span>
+      <span id="sa-status-text" style="margin-left:4px">Memuat...</span>
+    </div>
+    <div style="margin-left:auto;text-align:right;font-size:0.75rem;color:#475569">
+      <div id="sa-last-run-at">-</div>
+    </div>
+  </div>
+  <div class="grid" style="margin-top:12px">
+    <div class="card"><div class="label">Antrian (Belum Direview)</div><div class="value yellow" id="sa-pending">-</div></div>
+    <div class="card"><div class="label">Direview LLM</div><div class="value blue" id="sa-reviewed-by-llm">-</div></div>
+    <div class="card"><div class="label">Sepakat dgn Lexicon</div><div class="value green" id="sa-agreements">-</div></div>
+    <div class="card"><div class="label">Beda Pendapat</div><div class="value red" id="sa-disagreements">-</div></div>
+  </div>
+  <div style="font-size:0.72rem;color:#64748b;margin-top:6px">
+    Cuma komentar BUKAN Bahasa Indonesia atau berlabel "netral" dari lexicon yg direview LLM (yg lain
+    dipercaya lexicon apa adanya, tidak buang panggilan LLM percuma). Lexicon TIDAK ditimpa -- lihat
+    tab Riwayat utk bandingkan kedua opininya.
+  </div>
+</div>
+
+<div id="sa-panel-history" class="da-panel" style="display:none">
+  <label style="font-size:0.8rem;color:#94a3b8;display:flex;align-items:center;gap:6px;margin-top:12px">
+    <input type="checkbox" id="sa-history-disagreement-only" onchange="saLoadHistory(1)"> Cuma yang beda pendapat (lexicon vs LLM)
+  </label>
+  <table style="margin-top:8px">
+    <thead><tr>
+      <th>Waktu</th><th>Komentar</th><th>Bahasa</th><th>Lexicon</th><th>LLM</th><th>Sepakat?</th>
+    </tr></thead>
+    <tbody id="sa-history-tbody"><tr><td colspan="6">Memuat...</td></tr></tbody>
+  </table>
+  <div id="sa-history-pagination" style="margin-top:10px"></div>
+</div>
+
+<div id="sa-panel-config" class="da-panel" style="display:none">
+  <div style="max-width:520px;margin-top:12px">
+    <div style="font-size:0.78rem;color:#94a3b8;margin-bottom:14px;padding:10px 12px;background:#1e293b;border-radius:8px;line-height:1.5">
+      Lihat status/riwayat TIDAK perlu token. Mengubah pengaturan di bawah butuh token
+      login (Bearer) &mdash; pakai token yang sama dgn tab Discovery Agent di atas (tersimpan bersama).
+    </div>
+
+    <div style="margin-bottom:18px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">Interval Scheduler (menit)</div>
+      <div id="sa-interval-btns" style="display:flex;gap:8px"></div>
+    </div>
+
+    <div style="margin-bottom:18px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">Jumlah komentar direview per run</div>
+      <div id="sa-batch-btns" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+    </div>
+
+    <div style="margin-bottom:14px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:6px">Model OpenRouter</div>
+      <input type="text" id="sa-model-input" placeholder="mis. openai/gpt-oss-20b:free" style="width:100%;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+    </div>
+
+    <div style="margin-bottom:14px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:6px">API Key OpenRouter <span id="sa-key-current" style="color:#64748b"></span></div>
+      <input type="password" id="sa-apikey-input" placeholder="Kosongkan kalau tidak diubah" style="width:100%;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+    </div>
+
+    <div style="font-size:0.78rem;color:#94a3b8;margin:20px 0 14px;padding:10px 12px;background:#1e293b;border-radius:8px;line-height:1.5">
+      <b>Tie-breaker</b> &mdash; LLM KEDUA (provider beda) yg jadi penengah HANYA saat lexicon vs
+      LLM pertama tidak sepakat. Kalau kosong, tie-breaker dilewati (langsung ditandai "tidak sepakat" tanpa suara ketiga).
+    </div>
+
+    <div style="margin-bottom:14px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:6px">Model Tie-breaker</div>
+      <input type="text" id="sa-tb-model-input" placeholder="mis. google/gemma-4-31b-it:free" style="width:100%;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+    </div>
+
+    <div style="margin-bottom:14px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:6px">API Key Tie-breaker <span id="sa-tb-key-current" style="color:#64748b"></span></div>
+      <input type="password" id="sa-tb-apikey-input" placeholder="Kosongkan kalau tidak diubah" style="width:100%;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+    </div>
+
+    <button class="retry-btn" onclick="saSaveConfig()">Simpan Pengaturan</button>
+    <span id="sa-config-msg" style="margin-left:10px;font-size:0.82rem"></span>
+
+    <div style="margin-top:26px">
+      <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">Usulan Kata Baru utk Kamus Lexicon (dari kasus lexicon kalah suara)</div>
+      <table>
+        <thead><tr><th>Kata</th><th>Polaritas</th><th>Muncul</th><th>Contoh Komentar</th></tr></thead>
+        <tbody id="sa-suggestions-tbody"><tr><td colspan="4">Memuat...</td></tr></tbody>
+      </table>
+      <div style="font-size:0.72rem;color:#64748b;margin-top:6px">
+        Ini USULAN, TIDAK otomatis ditambahkan ke kamus -- tinjau manual dulu sebelum dimasukkan ke
+        app/ai/lexicon/data/positive.txt atau negative.txt (kamus ini dipakai lintas platform, bukan cuma YouTube).
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section-title" style="margin-top:24px">Views Refresh Agent &mdash; agent kedua, kuota YouTube API TERPISAH, khusus konsistensi views (prioritas video topic-search dulu)</div>
+<div id="vr-status-banner" class="ed-banner unknown" style="margin-top:12px">
+  <span class="alive-dot off" id="vr-dot"></span>
+  <div>
+    <span class="ed-banner-title">Status Agent &mdash;</span>
+    <span id="vr-status-text" style="margin-left:4px">Memuat...</span>
+  </div>
+  <div style="margin-left:auto;text-align:right;font-size:0.75rem;color:#475569">
+    <div id="vr-last-run-at">-</div>
+  </div>
+</div>
+<div class="grid" style="margin-top:12px">
+  <div class="card"><div class="label">Antrian Refresh (Kuota Terpisah)</div><div class="value yellow" id="vr-pending">-</div></div>
+</div>
+<div style="font-size:0.72rem;color:#64748b;margin:6px 0 16px">
+  Agent ini CUMA update <b>views/likes/comments</b> (angka saja, cepat) -- TIDAK ambil ulang info
+  channel/subscriber/konten komentar (itu tetap tugas Metadata Agent, lebih lengkap tapi lebih pelan).
+  Prioritas: video yg terkait topic-search diproses LEBIH DULU drpd video tanpa keterkaitan topik.
+  Pakai API key YouTube TERPISAH (kuota 10.000/hari sendiri) -- jalan berdampingan dgn Metadata Agent
+  tanpa tabrakan (baris yg sedang diproses satu agent otomatis dilewati agent lainnya).
+</div>
+
+<div style="max-width:520px">
+  <div style="font-size:0.78rem;color:#94a3b8;margin-bottom:14px;padding:10px 12px;background:#1e293b;border-radius:8px;line-height:1.5">
+    Lihat status TIDAK perlu token. Mengubah pengaturan di bawah butuh token login (Bearer) &mdash;
+    pakai token yang sama dgn tab Discovery Agent di atas.
+  </div>
+
+  <div style="margin-bottom:18px">
+    <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">Interval Scheduler (menit)</div>
+    <div id="vr-interval-btns" style="display:flex;gap:8px"></div>
+  </div>
+
+  <div style="margin-bottom:18px">
+    <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">Jumlah video di-refresh per run</div>
+    <div id="vr-batch-btns" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+  </div>
+
+  <div style="margin-bottom:18px">
+    <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:8px">Refresh data basi setelah (jam)</div>
+    <div id="vr-age-btns" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+  </div>
+
+  <div style="margin-bottom:14px">
+    <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:6px">API Key YouTube Data API v3 (project Google Cloud TERPISAH) <span id="vr-key-current" style="color:#64748b"></span></div>
+    <input type="password" id="vr-apikey-input" placeholder="Kosongkan kalau tidak diubah" style="width:100%;padding:7px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:0.82rem">
+  </div>
+
+  <button class="retry-btn" onclick="vrSaveConfig()">Simpan Pengaturan</button>
+  <span id="vr-config-msg" style="margin-left:10px;font-size:0.82rem"></span>
+</div>
+
+<div class="section-title" style="margin-top:24px">YouTube API Key &mdash; Monitoring Kuota Semua Agent</div>
+<div style="font-size:0.72rem;color:#64748b;margin-bottom:12px;max-width:760px">
+  Cek status LANGSUNG dari Google (1 unit kuota per key UNIK, key yg dipakai &gt;1 slot cuma dites sekali).
+  Kalau kolom "Berbagi Dengan" terisi, artinya 2 slot itu memakai key YANG SAMA (kuota digabung, BUKAN
+  rotasi terpisah) -- isi slot yg kosong/berbagi dengan key baru supaya benar-benar terpisah.
+</div>
+<div style="margin-bottom:10px">
+  <button class="retry-btn" onclick="ykCheckNow()">Cek Status Sekarang</button>
+  <span id="yk-msg" style="margin-left:10px;font-size:0.82rem;color:#64748b"></span>
+</div>
+<div style="overflow-x:auto">
+<table>
+  <thead><tr><th>Slot</th><th>Key</th><th>Berbagi Dengan</th><th>Status</th><th>Keterangan</th><th>Ganti Key</th></tr></thead>
+  <tbody id="yk-tbody"><tr><td colspan="6" style="color:#475569;font-style:italic">Klik "Cek Status Sekarang" utk mulai (butuh token login Bearer, sama dgn tab Discovery Agent di atas)</td></tr></tbody>
+</table>
+</div>
+
+<div class="grid" style="margin-top:24px">
   <div class="card"><div class="label">Status</div><div class="value" id="worker-status">-</div></div>
   <div class="card"><div class="label">Sedang Jalan</div><div class="value blue" id="running">-</div></div>
   <div class="card"><div class="label">Total Posts</div><div class="value" id="total-posts">-</div></div>
@@ -1240,6 +2200,35 @@ async function load() {
     edLastErr.textContent = ed.last_error_at  ? `Error terakhir: ${fmt(ed.last_error_at)}` : '';
     edLastOk.textContent  = ed.last_success_at ? `Sukses terakhir: ${fmt(ed.last_success_at)}` : '';
 
+    // ── Ollama status banner (model lokal, fallback AI Discovery) -- BARU,
+    // permintaan user 2026-07-18 "apakah ollama sudah ada di dashboard" ──
+    try {
+      const ro = await fetch(base + '/api/v1/system/ollama-status');
+      const jo = await ro.json();
+      const od = jo.data || {};
+      const ollamaBanner = document.getElementById('ollama-banner');
+      const ollamaDot = document.getElementById('ollama-dot');
+      const ollamaText = document.getElementById('ollama-status-text');
+      const ollamaModels = document.getElementById('ollama-models');
+      if (od.alive) {
+        ollamaBanner.className = 'ed-banner active';
+        ollamaDot.className = 'alive-dot on';
+        ollamaText.innerHTML = '<span class="green">AKTIF</span>';
+      } else {
+        ollamaBanner.className = 'ed-banner expired';
+        ollamaDot.className = 'alive-dot off';
+        ollamaText.innerHTML = '<span class="red">MATI</span>';
+      }
+      const models = od.loaded_models || [];
+      if (models.length === 0) {
+        ollamaModels.textContent = 'Tidak ada model ter-load di memori saat ini';
+      } else {
+        ollamaModels.innerHTML = models.map(m =>
+          `${daEsc(m.name)} (${m.size_mb} MB)`
+        ).join(', ');
+      }
+    } catch(e) { console.error(e); }
+
     // ── Apify quota banner (Facebook/Instagram/TikTok/Twitter/Smart Search) ──
     const apifyQ = d.apify_quota || {};
     const apifyBanner = document.getElementById('apify-banner');
@@ -1262,6 +2251,64 @@ async function load() {
       apifyText.innerHTML = `<span class="green">TERSEDIA</span> (${apifyQ.plan || '-'})`;
       apifyDetail.textContent = apifyQ.message || '';
     }
+
+    // ── YouTube Data API v3 quota banner (fallback EnsembleData) ────────────
+    const ytq = d.youtube_data_api_quota || {};
+    const ytqBanner = document.getElementById('ytq-banner');
+    const ytqDot  = document.getElementById('ytq-dot');
+    const ytqText = document.getElementById('ytq-status-text');
+    const ytqDetail = document.getElementById('ytq-status-detail');
+    const ytqLastErr = document.getElementById('ytq-last-err');
+    const ytqLastOk  = document.getElementById('ytq-last-ok');
+    ytqBanner.className = `ed-banner ${ytq.status || 'unknown'}`;
+    if (ytq.status === 'active') {
+      ytqDot.className = 'alive-dot on';
+      ytqText.innerHTML = '<span class="green">AKTIF</span>';
+      ytqDetail.textContent = ytq.message || '';
+    } else if (ytq.status === 'expired') {
+      ytqDot.className = 'alive-dot off';
+      ytqText.innerHTML = '<span class="red">QUOTA HABIS</span>';
+      ytqDetail.textContent = ytq.message || '';
+    } else {
+      ytqDot.className = 'alive-dot off';
+      ytqText.innerHTML = '<span style="color:#64748b">UNKNOWN</span>';
+      ytqDetail.textContent = ytq.message || 'Belum ada data';
+    }
+    ytqLastErr.textContent = ytq.last_error_at  ? `Error terakhir: ${fmt(ytq.last_error_at)}` : '';
+    ytqLastOk.textContent  = ytq.last_success_at ? `Sukses terakhir: ${fmt(ytq.last_success_at)}` : '';
+
+    // ── Backfill views/likes/comments YouTube lama ──────────────────────────
+    const bf = d.youtube_backfill || {};
+    const bfBanner = document.getElementById('bf-banner');
+    const bfDot  = document.getElementById('bf-dot');
+    const bfText = document.getElementById('bf-status-text');
+    const bfDetail = document.getElementById('bf-status-detail');
+    const bfProgress = document.getElementById('bf-progress');
+    if (bf.status === 'completed') {
+      bfBanner.className = 'ed-banner active';
+      bfDot.className = 'alive-dot on';
+      bfText.innerHTML = '<span class="green">SELESAI</span> ✓';
+    } else if (bf.status === 'running') {
+      bfBanner.className = 'ed-banner unknown';
+      bfDot.className = 'alive-dot on';
+      bfText.innerHTML = '<span style="color:#60a5fa">SEDANG JALAN...</span>';
+    } else if (bf.status === 'error') {
+      bfBanner.className = 'ed-banner expired';
+      bfDot.className = 'alive-dot off';
+      bfText.innerHTML = '<span class="red">ERROR</span>';
+    } else if (bf.status === 'stopped') {
+      bfBanner.className = 'ed-banner unknown';
+      bfDot.className = 'alive-dot off';
+      bfText.innerHTML = '<span style="color:#64748b">DIHENTIKAN MANUAL</span>';
+    } else {
+      bfBanner.className = 'ed-banner unknown';
+      bfDot.className = 'alive-dot off';
+      bfText.innerHTML = '<span style="color:#64748b">BELUM PERNAH JALAN</span>';
+    }
+    bfDetail.textContent = bf.message || '';
+    bfProgress.textContent = bf.total_target
+      ? `${bf.processed || 0}/${bf.total_target} diperiksa · ${bf.updated || 0} diperbaiki · ${bf.remaining || 0} sisa`
+      : '';
 
     // ── Instagram statistik ───────────────────────────────────────────────
     const ig = d.instagram || {};
@@ -1543,6 +2590,1110 @@ async function load() {
   }
 }
 
+// ── YouTube Discovery Agent (tab baru, endpoint TERPISAH dari monitor-public) ──
+let daActiveTab = 'status';
+let daRunsPage = 1;
+let daStatusTimer = null;
+
+function daToken() {
+  return document.getElementById('da-token').value || localStorage.getItem('da_token') || '';
+}
+
+function daAuthHeaders() {
+  const t = daToken();
+  return t ? { 'Authorization': 'Bearer ' + t, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
+}
+
+// ── YouTube API Key -- Monitoring Kuota Semua Agent (2026-07-20) ──
+const YK_STATUS_MAP = {
+  ok:             ['OK',            '#4ade80'],
+  quota_exceeded: ['Kuota Habis',   '#f87171'],
+  rate_limited:   ['Rate Limited',  '#fbbf24'],
+  invalid_key:    ['Key Invalid',   '#f87171'],
+  forbidden:      ['Forbidden',     '#f87171'],
+  not_set:        ['Belum Diisi',   '#64748b'],
+  error:          ['Error',         '#fb923c'],
+};
+
+async function ykCheckNow() {
+  const msgEl = document.getElementById('yk-msg');
+  msgEl.style.color = '#60a5fa';
+  msgEl.textContent = 'Mengecek ke Google...';
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/api-keys/health', { headers: daAuthHeaders() });
+    const j = await r.json();
+    if (!r.ok) {
+      msgEl.style.color = '#f87171';
+      msgEl.textContent = 'Gagal: ' + (j.detail || j.message || 'isi token login dulu');
+      return;
+    }
+    const items = j.data.items;
+    document.getElementById('yk-tbody').innerHTML = items.map(it => {
+      const [label, color] = YK_STATUS_MAP[it.status] || [it.status, '#94a3b8'];
+      return `<tr>
+        <td>${it.label}</td>
+        <td style="font-family:monospace;font-size:0.75rem">${it.masked_key || '-'}</td>
+        <td style="font-size:0.75rem;color:#94a3b8">${it.shared_with.length ? it.shared_with.join(', ') : '-'}</td>
+        <td><span class="pill" style="background:${color}22;color:${color}">${label}</span></td>
+        <td style="font-size:0.75rem;color:#94a3b8;max-width:260px">${it.detail}</td>
+        <td>
+          <input type="password" id="yk-new-${it.id}" placeholder="Key baru..." style="width:150px;padding:4px 6px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.72rem">
+          <button class="retry-btn" style="padding:4px 10px;font-size:0.72rem" onclick="ykSwap('${it.id}')">Ganti</button>
+        </td>
+      </tr>`;
+    }).join('');
+    msgEl.style.color = '#64748b';
+    msgEl.textContent = 'Terakhir dicek: ' + new Date().toLocaleTimeString('id-ID');
+  } catch (e) {
+    msgEl.style.color = '#f87171';
+    msgEl.textContent = 'Gagal: ' + e.message;
+  }
+}
+
+async function ykSwap(id) {
+  const input = document.getElementById('yk-new-' + id);
+  const value = input.value.trim();
+  if (!value) return;
+  if (!daToken()) { alert('Isi token login (Bearer) dulu di tab Discovery Agent di atas'); return; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/credentials/' + id, {
+      method: 'PATCH',
+      headers: daAuthHeaders(),
+      body: JSON.stringify({ value }),
+    });
+    const j = await r.json();
+    if (!r.ok) { alert('Gagal: ' + (j.detail || j.message || 'unknown')); return; }
+    input.value = '';
+    ykCheckNow();
+  } catch (e) {
+    alert('Gagal: ' + e.message);
+  }
+}
+
+function daSwitchTab(name) {
+  daActiveTab = name;
+  ['status', 'runs', 'config'].forEach(n => {
+    document.getElementById('da-panel-' + n).style.display = (n === name) ? '' : 'none';
+    document.getElementById('da-tab-btn-' + n).classList.toggle('active', n === name);
+  });
+  if (name === 'status') daLoadStatus();
+  if (name === 'runs') daLoadRuns(1);
+  if (name === 'config') daLoadConfig();
+}
+
+async function daLoadStatus() {
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/discovery-agent/status');
+    const json = await r.json();
+    const d = json.data || {};
+    const banner = document.getElementById('da-status-banner');
+    const dot = document.getElementById('da-dot');
+    const text = document.getElementById('da-status-text');
+    const lastRunAt = document.getElementById('da-last-run-at');
+    const errBox = document.getElementById('da-error-box');
+
+    if (d.is_running) {
+      banner.className = 'ed-banner unknown';
+      dot.className = 'alive-dot on';
+      text.innerHTML = '<span style="color:#60a5fa">SEDANG MENCARI...</span>';
+    } else if (d.last_run?.status === 'success') {
+      banner.className = 'ed-banner active';
+      dot.className = 'alive-dot on';
+      text.innerHTML = '<span class="green">IDLE (run terakhir sukses)</span>';
+    } else if (d.last_run?.status === 'failed') {
+      banner.className = 'ed-banner expired';
+      dot.className = 'alive-dot off';
+      text.innerHTML = '<span class="red">IDLE (run terakhir GAGAL)</span>';
+    } else {
+      banner.className = 'ed-banner unknown';
+      dot.className = 'alive-dot off';
+      text.innerHTML = '<span style="color:#64748b">BELUM PERNAH JALAN</span>';
+    }
+
+    const lr = d.last_run;
+    if (lr) {
+      lastRunAt.textContent = 'Mulai: ' + new Date(lr.started_at).toLocaleString('id-ID');
+      document.getElementById('da-topics-checked').textContent = lr.topics_checked;
+      document.getElementById('da-candidates-found').textContent = lr.candidates_found;
+      document.getElementById('da-candidates-validated').textContent = lr.candidates_validated;
+      document.getElementById('da-candidates-rejected').textContent = lr.candidates_rejected;
+      document.getElementById('da-posts-saved').textContent = lr.posts_saved;
+      if (lr.error_message) {
+        errBox.style.display = '';
+        errBox.textContent = 'Error: ' + lr.error_message;
+      } else {
+        errBox.style.display = 'none';
+      }
+    }
+
+    const topicsCovered = d.topics_covered || [];
+    const tcBox = document.getElementById('da-topics-covered');
+    if (topicsCovered.length === 0) {
+      tcBox.innerHTML = '<span style="color:#64748b">Belum ada topik aktif yang mencakup YouTube.</span>';
+    } else {
+      tcBox.innerHTML = topicsCovered.map(t =>
+        `<div style="margin-bottom:6px"><b>${daEsc(t.topic)}</b>: ${t.keywords.map(daEsc).join(', ') || '<span style="color:#64748b">(tanpa keyword)</span>'}</div>`
+      ).join('');
+    }
+  } catch(e) { console.error(e); }
+}
+
+async function daLoadRuns(page) {
+  daRunsPage = page;
+  const tbody = document.getElementById('da-runs-tbody');
+  tbody.innerHTML = '<tr><td colspan="9">Memuat...</td></tr>';
+  try {
+    const r = await fetch(window.location.origin + `/api/v1/youtube/discovery-agent/runs?page=${page}&limit=${PAGE_LIMIT}`);
+    const json = await r.json();
+    const items = json.data?.items || [];
+    const pag = json.data?.pagination || {};
+
+    if (items.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="9">Belum ada riwayat run.</td></tr>';
+    } else {
+      tbody.innerHTML = items.map(r => {
+        const topicsInDetail = (r.details || []).filter(d => d.mode === 'topic').map(d => d.topic);
+        const topicSummary = [...new Set(topicsInDetail)].slice(0, 3).join(', ') || (r.topics_checked > 0 ? `${r.topics_checked} topik` : '-');
+        return `<tr>
+          <td>${new Date(r.started_at).toLocaleString('id-ID')}</td>
+          <td><span class="pill pill-${r.status}">${r.status}</span></td>
+          <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${topicSummary}">${topicSummary}</td>
+          <td>${r.candidates_found}</td>
+          <td class="green">${r.candidates_validated}</td>
+          <td class="yellow">${r.candidates_rejected}</td>
+          <td class="green">${r.posts_saved}</td>
+          <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.model_used || '-'}</td>
+          <td><button class="page-btn" onclick='daShowDetails(${JSON.stringify(JSON.stringify(r.details || []))})'>Detail</button></td>
+        </tr>`;
+      }).join('');
+    }
+
+    renderPagination('da-runs-pagination', pag.page, pag.total_pages, pag.total, 'daLoadRuns');
+  } catch(e) { console.error(e); tbody.innerHTML = '<tr><td colspan="9">Gagal memuat.</td></tr>'; }
+}
+
+function daEsc(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function daShowDetails(detailsJsonStr) {
+  const details = JSON.parse(detailsJsonStr);
+  const body = document.getElementById('da-detail-modal-body');
+
+  if (!details.length) {
+    body.innerHTML = '<p style="color:#94a3b8">Tidak ada rincian kandidat utk run ini.</p>';
+    document.getElementById('da-detail-modal').style.display = 'flex';
+    return;
+  }
+
+  const validCount = details.filter(d => d.valid).length;
+  const rejectedCount = details.length - validCount;
+
+  // Ringkasan alasan ditolak (dedup) -- biar langsung ketahuan kalau SEMUA
+  // gagal krn 1 sebab yg sama (mis. model LLM deprecated), bukan harus
+  // scroll baca ratusan baris identik satu-satu.
+  const reasonCounts = {};
+  details.filter(d => !d.valid).forEach(d => {
+    const r = (d.reason || '(tidak ada alasan)').slice(0, 200);
+    reasonCounts[r] = (reasonCounts[r] || 0) + 1;
+  });
+  const reasonSummary = Object.entries(reasonCounts).sort((a, b) => b[1] - a[1]);
+
+  let html = `<div style="font-size:0.8rem;color:#94a3b8;margin-bottom:10px">${details.length} kandidat diperiksa &mdash; <span class="green">${validCount} lolos</span>, <span class="yellow">${rejectedCount} ditolak</span></div>`;
+
+  if (reasonSummary.length) {
+    html += `<div style="margin-bottom:14px;padding:10px 12px;background:#0f172a;border-radius:8px">
+      <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">Ringkasan Alasan Ditolak</div>
+      ${reasonSummary.map(([reason, count]) => `<div style="font-size:0.78rem;margin-bottom:4px"><span class="yellow">${count}x</span> &mdash; ${daEsc(reason)}</div>`).join('')}
+    </div>`;
+  }
+
+  html += `<table><thead><tr><th>Status</th><th>Judul (klik utk buka di YouTube)</th><th>Topik/Mode</th></tr></thead><tbody>`;
+  html += details.map(d => `<tr>
+    <td><span class="pill pill-${d.valid ? 'success' : 'failed'}">${d.valid ? 'LOLOS' : 'DITOLAK'}</span></td>
+    <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${daEsc(d.reason)}">
+      ${d.video_id ? `<a href="https://youtube.com/watch?v=${daEsc(d.video_id)}" target="_blank" style="color:#e2e8f0">${daEsc(d.title) || daEsc(d.video_id)}</a>` : (daEsc(d.title) || '-')}
+    </td>
+    <td>${daEsc(d.mode) || '-'}${d.topic ? ' / ' + daEsc(d.topic) : ''}</td>
+  </tr>`).join('');
+  html += `</tbody></table>`;
+
+  body.innerHTML = html;
+  document.getElementById('da-detail-modal').style.display = 'flex';
+}
+
+function daCloseDetails() {
+  document.getElementById('da-detail-modal').style.display = 'none';
+}
+
+async function daLoadConfig() {
+  try {
+    const rs = await fetch(window.location.origin + '/api/v1/youtube/discovery-agent/schedule');
+    const js = await rs.json();
+    const interval = js.data?.interval_hours;
+    const allowed = js.data?.allowed_values || [1, 4, 8, 24];
+    document.getElementById('da-interval-btns').innerHTML = allowed.map(h =>
+      `<button class="page-btn ${h === interval ? 'active' : ''}" style="${h === interval ? 'background:#1d4ed8;color:#fff' : ''}" onclick="daSetInterval(${h})">${h} jam</button>`
+    ).join('');
+  } catch(e) { console.error(e); }
+
+  const savedToken = localStorage.getItem('da_token');
+  if (savedToken) document.getElementById('da-token').value = savedToken;
+
+  if (daToken()) {
+    try {
+      const rc = await fetch(window.location.origin + '/api/v1/youtube/discovery-agent/config', { headers: daAuthHeaders() });
+      const jc = await rc.json();
+      if (rc.ok) {
+        document.getElementById('da-model-input').placeholder = jc.data?.model || '';
+        document.getElementById('da-key-current').textContent = jc.data?.api_key_set ? `(saat ini: ${jc.data.api_key_masked})` : '(belum diatur)';
+      }
+    } catch(e) { console.error(e); }
+  }
+}
+
+async function daSetInterval(hours) {
+  const msg = document.getElementById('da-config-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/discovery-agent/schedule', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify({ interval_hours: hours }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.style.color = '#4ade80';
+      msg.textContent = `Interval diubah ke ${hours} jam.`;
+      daLoadConfig();
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).';
+    }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function daSaveConfig() {
+  const msg = document.getElementById('da-config-msg');
+  const model = document.getElementById('da-model-input').value.trim();
+  const apiKey = document.getElementById('da-apikey-input').value.trim();
+  const token = document.getElementById('da-token').value.trim();
+  if (token) localStorage.setItem('da_token', token);
+
+  if (!model && !apiKey) { msg.style.color = '#fbbf24'; msg.textContent = 'Isi model atau API key dulu.'; return; }
+
+  try {
+    const body = {};
+    if (model) body.model = model;
+    if (apiKey) body.api_key = apiKey;
+    const r = await fetch(window.location.origin + '/api/v1/youtube/discovery-agent/config', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify(body),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.style.color = '#4ade80';
+      msg.textContent = 'Tersimpan.';
+      document.getElementById('da-apikey-input').value = '';
+      daLoadConfig();
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).';
+    }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+daLoadStatus();
+daStatusTimer = setInterval(() => { if (daActiveTab === 'status') daLoadStatus(); }, 15000);
+
+// ── YouTube Discovery Agent 2 (AGENT TERPISAH dari Agent 1 di atas -- key
+//    YouTube+OpenRouter SENDIRI, HANYA topic-guided, reuse token da-token) ──
+let da2ActiveTab = 'status';
+let da2RunsPage = 1;
+let da2StatusTimer = null;
+let da2EnabledState = null;
+
+function da2SwitchTab(name) {
+  da2ActiveTab = name;
+  ['status', 'runs', 'config'].forEach(n => {
+    document.getElementById('da2-panel-' + n).style.display = (n === name) ? '' : 'none';
+    document.getElementById('da2-tab-btn-' + n).classList.toggle('active', n === name);
+  });
+  if (name === 'status') da2LoadStatus();
+  if (name === 'runs') da2LoadRuns(1);
+  if (name === 'config') da2LoadConfig();
+}
+
+async function da2LoadStatus() {
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/discovery-agent-2/status');
+    const json = await r.json();
+    const d = json.data || {};
+    const banner = document.getElementById('da2-status-banner');
+    const dot = document.getElementById('da2-dot');
+    const text = document.getElementById('da2-status-text');
+    const lastRunAt = document.getElementById('da2-last-run-at');
+    const errBox = document.getElementById('da2-error-box');
+
+    if (d.enabled === false) {
+      banner.className = 'ed-banner expired';
+      dot.className = 'alive-dot off';
+      text.innerHTML = '<span style="color:#64748b">DIMATIKAN (tombol OFF)</span>';
+    } else if (d.is_running) {
+      banner.className = 'ed-banner unknown';
+      dot.className = 'alive-dot on';
+      text.innerHTML = '<span style="color:#60a5fa">SEDANG MENCARI...</span>';
+    } else if (d.last_run?.status === 'success') {
+      banner.className = 'ed-banner active';
+      dot.className = 'alive-dot on';
+      text.innerHTML = '<span class="green">IDLE (run terakhir sukses)</span>';
+    } else if (d.last_run?.status === 'failed') {
+      banner.className = 'ed-banner expired';
+      dot.className = 'alive-dot off';
+      text.innerHTML = '<span class="red">IDLE (run terakhir GAGAL)</span>';
+    } else {
+      banner.className = 'ed-banner unknown';
+      dot.className = 'alive-dot off';
+      text.innerHTML = '<span style="color:#64748b">BELUM PERNAH JALAN</span>';
+    }
+
+    const lr = d.last_run;
+    if (lr) {
+      lastRunAt.textContent = 'Mulai: ' + new Date(lr.started_at).toLocaleString('id-ID');
+      document.getElementById('da2-topics-checked').textContent = lr.topics_checked;
+      document.getElementById('da2-candidates-found').textContent = lr.candidates_found;
+      document.getElementById('da2-candidates-validated').textContent = lr.candidates_validated;
+      document.getElementById('da2-candidates-rejected').textContent = lr.candidates_rejected;
+      document.getElementById('da2-posts-saved').textContent = lr.posts_saved;
+      if (lr.error_message) {
+        errBox.style.display = '';
+        errBox.textContent = 'Error: ' + lr.error_message;
+      } else {
+        errBox.style.display = 'none';
+      }
+    }
+
+    // ── Banner kuota YouTube Data API v3 milik Agent 2 (key terpisah) ──────
+    const da2q = d.youtube_api_quota || {};
+    const da2qBanner = document.getElementById('da2q-banner');
+    const da2qDot = document.getElementById('da2q-dot');
+    const da2qText = document.getElementById('da2q-status-text');
+    const da2qDetail = document.getElementById('da2q-status-detail');
+    const da2qLastErr = document.getElementById('da2q-last-err');
+    const da2qLastOk = document.getElementById('da2q-last-ok');
+    da2qBanner.className = `ed-banner ${da2q.status || 'unknown'}`;
+    if (da2q.status === 'active') {
+      da2qDot.className = 'alive-dot on';
+      da2qText.innerHTML = '<span class="green">AKTIF</span>';
+      da2qDetail.textContent = da2q.message || '';
+    } else if (da2q.status === 'expired') {
+      da2qDot.className = 'alive-dot off';
+      da2qText.innerHTML = '<span class="red">QUOTA HABIS</span>';
+      da2qDetail.textContent = da2q.message || '';
+    } else {
+      da2qDot.className = 'alive-dot off';
+      da2qText.innerHTML = '<span style="color:#64748b">UNKNOWN</span>';
+      da2qDetail.textContent = da2q.message || 'Belum ada data';
+    }
+    da2qLastErr.textContent = da2q.last_error_at ? `Error terakhir: ${fmt(da2q.last_error_at)}` : '';
+    da2qLastOk.textContent = da2q.last_success_at ? `Sukses terakhir: ${fmt(da2q.last_success_at)}` : '';
+
+    const topicsCovered = d.topics_covered || [];
+    const tcBox = document.getElementById('da2-topics-covered');
+    if (topicsCovered.length === 0) {
+      tcBox.innerHTML = '<span style="color:#64748b">Belum ada topik aktif yang mencakup YouTube.</span>';
+    } else {
+      tcBox.innerHTML = topicsCovered.map(t =>
+        `<div style="margin-bottom:6px"><b>${daEsc(t.topic)}</b>: ${t.keywords.map(daEsc).join(', ') || '<span style="color:#64748b">(tanpa keyword)</span>'}</div>`
+      ).join('');
+    }
+  } catch(e) { console.error(e); }
+}
+
+async function da2LoadRuns(page) {
+  da2RunsPage = page;
+  const tbody = document.getElementById('da2-runs-tbody');
+  tbody.innerHTML = '<tr><td colspan="9">Memuat...</td></tr>';
+  try {
+    const r = await fetch(window.location.origin + `/api/v1/youtube/discovery-agent-2/runs?page=${page}&limit=${PAGE_LIMIT}`);
+    const json = await r.json();
+    const items = json.data?.items || [];
+    const pag = json.data?.pagination || {};
+
+    if (items.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="9">Belum ada riwayat run.</td></tr>';
+    } else {
+      tbody.innerHTML = items.map(r => {
+        const topicsInDetail = (r.details || []).filter(d => d.mode === 'topic').map(d => d.topic);
+        const topicSummary = [...new Set(topicsInDetail)].slice(0, 3).join(', ') || (r.topics_checked > 0 ? `${r.topics_checked} topik` : '-');
+        return `<tr>
+          <td>${new Date(r.started_at).toLocaleString('id-ID')}</td>
+          <td><span class="pill pill-${r.status}">${r.status}</span></td>
+          <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${topicSummary}">${topicSummary}</td>
+          <td>${r.candidates_found}</td>
+          <td class="green">${r.candidates_validated}</td>
+          <td class="yellow">${r.candidates_rejected}</td>
+          <td class="green">${r.posts_saved}</td>
+          <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.model_used || '-'}</td>
+          <td><button class="page-btn" onclick='daShowDetails(${JSON.stringify(JSON.stringify(r.details || []))})'>Detail</button></td>
+        </tr>`;
+      }).join('');
+    }
+
+    renderPagination('da2-runs-pagination', pag.page, pag.total_pages, pag.total, 'da2LoadRuns');
+  } catch(e) { console.error(e); tbody.innerHTML = '<tr><td colspan="9">Gagal memuat.</td></tr>'; }
+}
+
+async function da2LoadConfig() {
+  try {
+    const rs = await fetch(window.location.origin + '/api/v1/youtube/discovery-agent-2/schedule');
+    const js = await rs.json();
+    const interval = js.data?.interval_hours;
+    const allowed = js.data?.allowed_values || [1, 4, 8, 12];
+    document.getElementById('da2-interval-btns').innerHTML = allowed.map(h =>
+      `<button class="page-btn ${h === interval ? 'active' : ''}" style="${h === interval ? 'background:#1d4ed8;color:#fff' : ''}" onclick="da2SetInterval(${h})">${h} jam</button>`
+    ).join('');
+  } catch(e) { console.error(e); }
+
+  const savedToken = localStorage.getItem('da_token');
+  if (savedToken) document.getElementById('da-token').value = savedToken;
+
+  if (daToken()) {
+    try {
+      const rc = await fetch(window.location.origin + '/api/v1/youtube/discovery-agent-2/config', { headers: daAuthHeaders() });
+      const jc = await rc.json();
+      if (rc.ok) {
+        document.getElementById('da2-model-input').placeholder = jc.data?.model || '';
+        document.getElementById('da2-key-current').textContent = jc.data?.api_key_set ? `(saat ini: ${jc.data.api_key_masked})` : '(belum diatur)';
+        document.getElementById('da2-ytkey-current').textContent = jc.data?.youtube_api_key_set ? `(saat ini: ${jc.data.youtube_api_key_masked})` : '(belum diatur)';
+        da2EnabledState = jc.data?.enabled;
+        da2RenderEnabledBtn();
+      }
+    } catch(e) { console.error(e); }
+  }
+}
+
+function da2RenderEnabledBtn() {
+  const btn = document.getElementById('da2-enabled-btn');
+  if (da2EnabledState === null) { btn.textContent = 'Login dulu'; return; }
+  if (da2EnabledState) {
+    btn.textContent = 'AKTIF -- klik utk matikan';
+    btn.style.background = '#166534'; btn.style.color = '#fff';
+  } else {
+    btn.textContent = 'MATI -- klik utk nyalakan';
+    btn.style.background = '#7f1d1d'; btn.style.color = '#fff';
+  }
+}
+
+async function da2ToggleEnabled() {
+  if (!daToken()) { alert('Isi token dulu di tab Pengaturan Discovery Agent (atas).'); return; }
+  const msg = document.getElementById('da2-config-msg');
+  const next = !da2EnabledState;
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/discovery-agent-2/config', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify({ enabled: next }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      da2EnabledState = json.data?.enabled ?? next;
+      da2RenderEnabledBtn();
+      msg.style.color = '#4ade80';
+      msg.textContent = da2EnabledState ? 'Agent 2 diaktifkan.' : 'Agent 2 dimatikan.';
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).';
+    }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function da2SetInterval(hours) {
+  const msg = document.getElementById('da2-config-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/discovery-agent-2/schedule', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify({ interval_hours: hours }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.style.color = '#4ade80';
+      msg.textContent = `Interval diubah ke ${hours} jam.`;
+      da2LoadConfig();
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).';
+    }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function da2SaveConfig() {
+  const msg = document.getElementById('da2-config-msg');
+  const model = document.getElementById('da2-model-input').value.trim();
+  const apiKey = document.getElementById('da2-apikey-input').value.trim();
+  const ytKey = document.getElementById('da2-ytkey-input').value.trim();
+  const token = document.getElementById('da-token').value.trim();
+  if (token) localStorage.setItem('da_token', token);
+
+  if (!model && !apiKey && !ytKey) { msg.style.color = '#fbbf24'; msg.textContent = 'Isi model, API key, atau YouTube key dulu.'; return; }
+
+  try {
+    const body = {};
+    if (model) body.model = model;
+    if (apiKey) body.api_key = apiKey;
+    if (ytKey) body.youtube_api_key = ytKey;
+    const r = await fetch(window.location.origin + '/api/v1/youtube/discovery-agent-2/config', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify(body),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.style.color = '#4ade80';
+      msg.textContent = 'Tersimpan.';
+      document.getElementById('da2-apikey-input').value = '';
+      document.getElementById('da2-ytkey-input').value = '';
+      da2LoadConfig();
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).';
+    }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+da2LoadStatus();
+da2StatusTimer = setInterval(() => { if (da2ActiveTab === 'status') da2LoadStatus(); }, 15000);
+
+// ── YouTube Metadata Agent (tab terpisah, endpoint TERPISAH -- reuse token dari Discovery Agent) ──
+let maActiveTab = 'status';
+let maStatusTimer = null;
+
+function maSwitchTab(name) {
+  maActiveTab = name;
+  ['status', 'history', 'config'].forEach(n => {
+    document.getElementById('ma-panel-' + n).style.display = (n === name) ? '' : 'none';
+    document.getElementById('ma-tab-btn-' + n).classList.toggle('active', n === name);
+  });
+  if (name === 'status') maLoadStatus();
+  if (name === 'history') maLoadHistory(1);
+  if (name === 'config') maLoadConfig();
+}
+
+async function maLoadStatus() {
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/metadata-agent/status');
+    const json = await r.json();
+    const d = json.data || {};
+    const banner = document.getElementById('ma-status-banner');
+    const dot = document.getElementById('ma-dot');
+    const text = document.getElementById('ma-status-text');
+
+    if (d.is_running) {
+      banner.className = 'ed-banner unknown';
+      dot.className = 'alive-dot on';
+      text.innerHTML = '<span style="color:#60a5fa">SEDANG MELENGKAPI DATA...</span>';
+    } else if (d.total_enriched > 0) {
+      banner.className = 'ed-banner active';
+      dot.className = 'alive-dot on';
+      text.innerHTML = '<span class="green">IDLE</span>';
+    } else {
+      banner.className = 'ed-banner unknown';
+      dot.className = 'alive-dot off';
+      text.innerHTML = '<span style="color:#64748b">BELUM PERNAH JALAN</span>';
+    }
+    document.getElementById('ma-last-run-at').textContent = d.last_run_at ? ('Terakhir: ' + new Date(d.last_run_at).toLocaleString('id-ID')) : '-';
+    document.getElementById('ma-pending').textContent = (d.pending_enrichment ?? 0).toLocaleString('id-ID');
+    document.getElementById('ma-total-enriched').textContent = (d.total_enriched ?? 0).toLocaleString('id-ID');
+    document.getElementById('ma-pending-refresh').textContent = (d.pending_refresh ?? 0).toLocaleString('id-ID');
+    document.getElementById('ma-refresh-age-label').textContent = (d.refresh_age_hours ?? 6) + ' jam';
+    document.getElementById('ma-title-mismatch-count').textContent = (d.title_mismatch_count ?? 0).toLocaleString('id-ID');
+  } catch(e) { console.error(e); }
+}
+
+async function maLoadHistory(page) {
+  const tbody = document.getElementById('ma-history-tbody');
+  tbody.innerHTML = '<tr><td colspan="6">Memuat...</td></tr>';
+  const mismatchOnly = document.getElementById('ma-history-mismatch-only').checked;
+  try {
+    const r = await fetch(window.location.origin + `/api/v1/youtube/metadata-agent/history?page=${page}&limit=${PAGE_LIMIT}&only_title_mismatch=${mismatchOnly}`);
+    const json = await r.json();
+    const items = json.data?.items || [];
+    const pag = json.data?.pagination || {};
+
+    if (items.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="6">${mismatchOnly ? 'Tidak ada judul yang berubah.' : 'Belum ada video yang ter-enrich.'}</td></tr>`;
+    } else {
+      tbody.innerHTML = items.map(it => `<tr${it.title_mismatch ? ' style="background:#450a0a"' : ''}>
+        <td>${new Date(it.fetched_at).toLocaleString('id-ID')}</td>
+        <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+          <a href="${it.url}" target="_blank" style="color:#e2e8f0">${it.title || it.video_id}</a>
+          ${it.title_mismatch ? `<div class="red" style="font-size:0.7rem" title="Judul asli YouTube saat terakhir dicek: ${it.title_live || ''}">&#9888; judul berubah -&gt; ${(it.title_live || '').slice(0, 50)}</div>` : ''}
+        </td>
+        <td>${it.channel_name || '-'}</td>
+        <td>${(it.views ?? 0).toLocaleString('id-ID')}</td>
+        <td>${it.keyword_matched || '-'}</td>
+        <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${it.viral_context || ''}">${it.viral_context ? it.viral_context.slice(0, 60) + '...' : '-'}</td>
+      </tr>`).join('');
+    }
+    renderPagination('ma-history-pagination', pag.page, pag.total_pages, pag.total, 'maLoadHistory');
+  } catch(e) { console.error(e); tbody.innerHTML = '<tr><td colspan="6">Gagal memuat.</td></tr>'; }
+}
+
+async function maLoadConfig() {
+  try {
+    const rs = await fetch(window.location.origin + '/api/v1/youtube/metadata-agent/schedule');
+    const js = await rs.json();
+    const interval = js.data?.interval_minutes;
+    const allowed = js.data?.allowed_values || [15, 30, 60, 240];
+    document.getElementById('ma-interval-btns').innerHTML = allowed.map(m =>
+      `<button class="page-btn ${m === interval ? 'active' : ''}" style="${m === interval ? 'background:#1d4ed8;color:#fff' : ''}" onclick="maSetInterval(${m})">${m} mnt</button>`
+    ).join('');
+  } catch(e) { console.error(e); }
+
+  if (daToken()) {
+    try {
+      const rc = await fetch(window.location.origin + '/api/v1/youtube/metadata-agent/config', { headers: daAuthHeaders() });
+      const jc = await rc.json();
+      if (rc.ok) {
+        document.getElementById('ma-model-input').placeholder = jc.data?.model || '';
+        document.getElementById('ma-key-current').textContent = jc.data?.api_key_set ? `(saat ini: ${jc.data.api_key_masked})` : '(belum diatur)';
+
+        const rah = jc.data?.refresh_age_hours;
+        const allowedAge = jc.data?.allowed_refresh_age_hours || [1, 3, 6, 12, 24];
+        document.getElementById('ma-refresh-age-btns').innerHTML = allowedAge.map(h =>
+          `<button class="page-btn ${h === rah ? 'active' : ''}" style="${h === rah ? 'background:#1d4ed8;color:#fff' : ''}" onclick="maSetRefreshAgeHours(${h})">${h} jam</button>`
+        ).join('');
+
+        const rbs = jc.data?.refresh_batch_size;
+        const allowedBatch = jc.data?.allowed_refresh_batch_size || [10, 20, 50, 100];
+        document.getElementById('ma-refresh-batch-btns').innerHTML = allowedBatch.map(s =>
+          `<button class="page-btn ${s === rbs ? 'active' : ''}" style="${s === rbs ? 'background:#1d4ed8;color:#fff' : ''}" onclick="maSetRefreshBatchSize(${s})">${s}</button>`
+        ).join('');
+
+        const ebs = jc.data?.enrich_batch_size;
+        const allowedEnrichBatch = jc.data?.allowed_enrich_batch_size || [10, 20, 50, 100];
+        document.getElementById('ma-enrich-batch-btns').innerHTML = allowedEnrichBatch.map(s =>
+          `<button class="page-btn ${s === ebs ? 'active' : ''}" style="${s === ebs ? 'background:#1d4ed8;color:#fff' : ''}" onclick="maSetEnrichBatchSize(${s})">${s}</button>`
+        ).join('');
+      }
+    } catch(e) { console.error(e); }
+  } else {
+    document.getElementById('ma-refresh-age-btns').innerHTML = '<span style="color:#64748b;font-size:0.78rem">Login dulu (paste token di atas) utk mengatur.</span>';
+    document.getElementById('ma-refresh-batch-btns').innerHTML = '<span style="color:#64748b;font-size:0.78rem">Login dulu (paste token di atas) utk mengatur.</span>';
+    document.getElementById('ma-enrich-batch-btns').innerHTML = '<span style="color:#64748b;font-size:0.78rem">Login dulu (paste token di atas) utk mengatur.</span>';
+  }
+}
+
+async function maSetInterval(minutes) {
+  const msg = document.getElementById('ma-config-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/metadata-agent/schedule', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify({ interval_minutes: minutes }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.style.color = '#4ade80';
+      msg.textContent = `Interval diubah ke ${minutes} menit.`;
+      maLoadConfig();
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).';
+    }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function maSetRefreshAgeHours(hours) {
+  const msg = document.getElementById('ma-config-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/metadata-agent/config', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify({ refresh_age_hours: hours }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.style.color = '#4ade80';
+      msg.textContent = `Ambang refresh diubah ke ${hours} jam.`;
+      maLoadConfig();
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).';
+    }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function maSetRefreshBatchSize(size) {
+  const msg = document.getElementById('ma-config-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/metadata-agent/config', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify({ refresh_batch_size: size }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.style.color = '#4ade80';
+      msg.textContent = `Batch refresh diubah ke ${size} video/run.`;
+      maLoadConfig();
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).';
+    }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function maSetEnrichBatchSize(size) {
+  const msg = document.getElementById('ma-config-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/metadata-agent/config', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify({ enrich_batch_size: size }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.style.color = '#4ade80';
+      msg.textContent = `Batch enrich diubah ke ${size} post baru/run.`;
+      maLoadConfig();
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).';
+    }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function maSaveConfig() {
+  const msg = document.getElementById('ma-config-msg');
+  const model = document.getElementById('ma-model-input').value.trim();
+  const apiKey = document.getElementById('ma-apikey-input').value.trim();
+
+  if (!model && !apiKey) { msg.style.color = '#fbbf24'; msg.textContent = 'Isi model atau API key dulu.'; return; }
+
+  try {
+    const body = {};
+    if (model) body.model = model;
+    if (apiKey) body.api_key = apiKey;
+    const r = await fetch(window.location.origin + '/api/v1/youtube/metadata-agent/config', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify(body),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.style.color = '#4ade80';
+      msg.textContent = 'Tersimpan.';
+      document.getElementById('ma-apikey-input').value = '';
+      maLoadConfig();
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).';
+    }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+maLoadStatus();
+maStatusTimer = setInterval(() => { if (maActiveTab === 'status') maLoadStatus(); }, 15000);
+
+// ── Sentiment Agent (tab terpisah, endpoint TERPISAH -- reuse token dari Discovery Agent) ──
+let saActiveTab = 'status';
+let saStatusTimer = null;
+
+function saSwitchTab(name) {
+  saActiveTab = name;
+  ['status', 'history', 'config'].forEach(n => {
+    document.getElementById('sa-panel-' + n).style.display = (n === name) ? '' : 'none';
+    document.getElementById('sa-tab-btn-' + n).classList.toggle('active', n === name);
+  });
+  if (name === 'status') saLoadStatus();
+  if (name === 'history') saLoadHistory(1);
+  if (name === 'config') { saLoadConfig(); saLoadSuggestions(); }
+}
+
+async function saLoadStatus() {
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/sentiment-agent/status');
+    const json = await r.json();
+    const d = json.data || {};
+    const banner = document.getElementById('sa-status-banner');
+    const dot = document.getElementById('sa-dot');
+    const text = document.getElementById('sa-status-text');
+
+    if (d.is_running) {
+      banner.className = 'ed-banner unknown';
+      dot.className = 'alive-dot on';
+      text.innerHTML = '<span style="color:#60a5fa">SEDANG MEREVIEW...</span>';
+    } else if (d.total_reviewed > 0) {
+      banner.className = 'ed-banner active';
+      dot.className = 'alive-dot on';
+      text.innerHTML = '<span class="green">IDLE</span>';
+    } else {
+      banner.className = 'ed-banner unknown';
+      dot.className = 'alive-dot off';
+      text.innerHTML = '<span style="color:#64748b">BELUM PERNAH JALAN</span>';
+    }
+    document.getElementById('sa-last-run-at').textContent = d.last_run_at ? ('Terakhir: ' + new Date(d.last_run_at).toLocaleString('id-ID')) : '-';
+    document.getElementById('sa-pending').textContent = (d.pending_review ?? 0).toLocaleString('id-ID');
+    document.getElementById('sa-reviewed-by-llm').textContent = (d.reviewed_by_llm ?? 0).toLocaleString('id-ID');
+    document.getElementById('sa-agreements').textContent = (d.agreements ?? 0).toLocaleString('id-ID');
+    document.getElementById('sa-disagreements').textContent = (d.disagreements ?? 0).toLocaleString('id-ID');
+  } catch(e) { console.error(e); }
+}
+
+async function saLoadHistory(page) {
+  const tbody = document.getElementById('sa-history-tbody');
+  tbody.innerHTML = '<tr><td colspan="6">Memuat...</td></tr>';
+  const disagreementOnly = document.getElementById('sa-history-disagreement-only').checked;
+  try {
+    const r = await fetch(window.location.origin + `/api/v1/youtube/sentiment-agent/history?page=${page}&limit=${PAGE_LIMIT}&only_disagreement=${disagreementOnly}`);
+    const json = await r.json();
+    const items = json.data?.items || [];
+    const pag = json.data?.pagination || {};
+
+    if (items.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="6">${disagreementOnly ? 'Tidak ada yang beda pendapat.' : 'Belum ada komentar yang direview.'}</td></tr>`;
+    } else {
+      tbody.innerHTML = items.map(it => `<tr${it.agreement === false ? ' style="background:#450a0a"' : ''}>
+        <td>${new Date(it.checked_at).toLocaleString('id-ID')}</td>
+        <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${daEsc(it.content)}">${daEsc(it.content)}</td>
+        <td>${daEsc(it.detected_language) || '-'}</td>
+        <td>${daEsc(it.lexicon_label)}</td>
+        <td>${daEsc(it.llm_label) || '-'}</td>
+        <td>${it.agreement === true ? '<span class="green">Ya</span>' : (it.agreement === false ? '<span class="red">Tidak</span>' : '-')}</td>
+      </tr>`).join('');
+    }
+    renderPagination('sa-history-pagination', pag.page, pag.total_pages, pag.total, 'saLoadHistory');
+  } catch(e) { console.error(e); tbody.innerHTML = '<tr><td colspan="6">Gagal memuat.</td></tr>'; }
+}
+
+async function saLoadConfig() {
+  try {
+    const rs = await fetch(window.location.origin + '/api/v1/youtube/sentiment-agent/schedule');
+    const js = await rs.json();
+    const interval = js.data?.interval_minutes;
+    const allowed = js.data?.allowed_values || [15, 30, 60, 240];
+    document.getElementById('sa-interval-btns').innerHTML = allowed.map(m =>
+      `<button class="page-btn ${m === interval ? 'active' : ''}" style="${m === interval ? 'background:#1d4ed8;color:#fff' : ''}" onclick="saSetInterval(${m})">${m} mnt</button>`
+    ).join('');
+  } catch(e) { console.error(e); }
+
+  if (daToken()) {
+    try {
+      const rc = await fetch(window.location.origin + '/api/v1/youtube/sentiment-agent/config', { headers: daAuthHeaders() });
+      const jc = await rc.json();
+      if (rc.ok) {
+        document.getElementById('sa-model-input').placeholder = jc.data?.model || '';
+        document.getElementById('sa-key-current').textContent = jc.data?.api_key_set ? `(saat ini: ${jc.data.api_key_masked})` : '(belum diatur)';
+        document.getElementById('sa-tb-model-input').placeholder = jc.data?.tiebreaker_model || '';
+        document.getElementById('sa-tb-key-current').textContent = jc.data?.tiebreaker_api_key_set ? `(saat ini: ${jc.data.tiebreaker_api_key_masked})` : '(belum diatur)';
+
+        const bs = jc.data?.batch_size;
+        const allowedBatch = jc.data?.allowed_batch_size || [10, 20, 50, 100];
+        document.getElementById('sa-batch-btns').innerHTML = allowedBatch.map(s =>
+          `<button class="page-btn ${s === bs ? 'active' : ''}" style="${s === bs ? 'background:#1d4ed8;color:#fff' : ''}" onclick="saSetBatchSize(${s})">${s}</button>`
+        ).join('');
+      }
+    } catch(e) { console.error(e); }
+  } else {
+    document.getElementById('sa-batch-btns').innerHTML = '<span style="color:#64748b;font-size:0.78rem">Login dulu (paste token di atas) utk mengatur.</span>';
+  }
+}
+
+async function saSetInterval(minutes) {
+  const msg = document.getElementById('sa-config-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/sentiment-agent/schedule', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify({ interval_minutes: minutes }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.style.color = '#4ade80';
+      msg.textContent = `Interval diubah ke ${minutes} menit.`;
+      saLoadConfig();
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).';
+    }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function saSetBatchSize(size) {
+  const msg = document.getElementById('sa-config-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/sentiment-agent/config', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify({ batch_size: size }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.style.color = '#4ade80';
+      msg.textContent = `Batch diubah ke ${size} komentar/run.`;
+      saLoadConfig();
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).';
+    }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function saSaveConfig() {
+  const msg = document.getElementById('sa-config-msg');
+  const model = document.getElementById('sa-model-input').value.trim();
+  const apiKey = document.getElementById('sa-apikey-input').value.trim();
+  const tbModel = document.getElementById('sa-tb-model-input').value.trim();
+  const tbApiKey = document.getElementById('sa-tb-apikey-input').value.trim();
+
+  if (!model && !apiKey && !tbModel && !tbApiKey) { msg.style.color = '#fbbf24'; msg.textContent = 'Isi minimal salah satu kolom dulu.'; return; }
+
+  try {
+    const body = {};
+    if (model) body.model = model;
+    if (apiKey) body.api_key = apiKey;
+    if (tbModel) body.tiebreaker_model = tbModel;
+    if (tbApiKey) body.tiebreaker_api_key = tbApiKey;
+    const r = await fetch(window.location.origin + '/api/v1/youtube/sentiment-agent/config', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify(body),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.style.color = '#4ade80';
+      msg.textContent = 'Tersimpan.';
+      document.getElementById('sa-apikey-input').value = '';
+      document.getElementById('sa-tb-apikey-input').value = '';
+      saLoadConfig();
+    } else {
+      msg.style.color = '#f87171';
+      msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).';
+    }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function saLoadSuggestions() {
+  const tbody = document.getElementById('sa-suggestions-tbody');
+  tbody.innerHTML = '<tr><td colspan="4">Memuat...</td></tr>';
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/sentiment-agent/lexicon-suggestions?min_evidence=2&limit=20');
+    const json = await r.json();
+    const items = json.data?.items || [];
+    if (items.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="4">Belum ada usulan (min. 2x kemunculan).</td></tr>';
+    } else {
+      tbody.innerHTML = items.map(it => `<tr>
+        <td><b>${daEsc(it.word)}</b></td>
+        <td>${it.suggested_polarity === 'positif' ? '<span class="green">positif</span>' : '<span class="red">negatif</span>'}</td>
+        <td>${it.evidence_count}x</td>
+        <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${daEsc(it.example_comment)}">${daEsc(it.example_comment)}</td>
+      </tr>`).join('');
+    }
+  } catch(e) { console.error(e); tbody.innerHTML = '<tr><td colspan="4">Gagal memuat.</td></tr>'; }
+}
+
+saLoadStatus();
+saStatusTimer = setInterval(() => { if (saActiveTab === 'status') saLoadStatus(); }, 15000);
+
+// ── Views Refresh Agent (agent kedua, kuota YouTube API terpisah) ──
+async function vrLoadStatus() {
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/views-refresh-agent/status');
+    const json = await r.json();
+    const d = json.data || {};
+    const banner = document.getElementById('vr-status-banner');
+    const dot = document.getElementById('vr-dot');
+    const text = document.getElementById('vr-status-text');
+
+    if (d.is_running) {
+      banner.className = 'ed-banner unknown';
+      dot.className = 'alive-dot on';
+      text.innerHTML = '<span style="color:#60a5fa">SEDANG MEREFRESH...</span>';
+    } else if (d.last_run_at) {
+      banner.className = 'ed-banner active';
+      dot.className = 'alive-dot on';
+      text.innerHTML = '<span class="green">IDLE</span>';
+    } else {
+      banner.className = 'ed-banner unknown';
+      dot.className = 'alive-dot off';
+      text.innerHTML = '<span style="color:#64748b">BELUM PERNAH JALAN</span>';
+    }
+    document.getElementById('vr-last-run-at').textContent = d.last_run_at ? ('Terakhir: ' + new Date(d.last_run_at).toLocaleString('id-ID')) : '-';
+    document.getElementById('vr-pending').textContent = (d.pending_refresh ?? 0).toLocaleString('id-ID');
+  } catch(e) { console.error(e); }
+}
+
+async function vrLoadConfig() {
+  try {
+    const rs = await fetch(window.location.origin + '/api/v1/youtube/views-refresh-agent/schedule');
+    const js = await rs.json();
+    const interval = js.data?.interval_minutes;
+    const allowed = js.data?.allowed_values || [15, 30, 60, 240];
+    document.getElementById('vr-interval-btns').innerHTML = allowed.map(m =>
+      `<button class="page-btn ${m === interval ? 'active' : ''}" style="${m === interval ? 'background:#1d4ed8;color:#fff' : ''}" onclick="vrSetInterval(${m})">${m} mnt</button>`
+    ).join('');
+  } catch(e) { console.error(e); }
+
+  if (daToken()) {
+    try {
+      const rc = await fetch(window.location.origin + '/api/v1/youtube/views-refresh-agent/config', { headers: daAuthHeaders() });
+      const jc = await rc.json();
+      if (rc.ok) {
+        document.getElementById('vr-key-current').textContent = jc.data?.api_key_set ? `(saat ini: ${jc.data.api_key_masked})` : '(belum diatur)';
+
+        const bs = jc.data?.batch_size;
+        const allowedBatch = jc.data?.allowed_batch_size || [10, 20, 50, 100];
+        document.getElementById('vr-batch-btns').innerHTML = allowedBatch.map(s =>
+          `<button class="page-btn ${s === bs ? 'active' : ''}" style="${s === bs ? 'background:#1d4ed8;color:#fff' : ''}" onclick="vrSetBatchSize(${s})">${s}</button>`
+        ).join('');
+
+        const age = jc.data?.refresh_age_hours;
+        const allowedAge = jc.data?.allowed_refresh_age_hours || [1, 3, 6, 12, 24];
+        document.getElementById('vr-age-btns').innerHTML = allowedAge.map(h =>
+          `<button class="page-btn ${h === age ? 'active' : ''}" style="${h === age ? 'background:#1d4ed8;color:#fff' : ''}" onclick="vrSetAgeHours(${h})">${h} jam</button>`
+        ).join('');
+      }
+    } catch(e) { console.error(e); }
+  } else {
+    document.getElementById('vr-batch-btns').innerHTML = '<span style="color:#64748b;font-size:0.78rem">Login dulu (paste token di atas) utk mengatur.</span>';
+    document.getElementById('vr-age-btns').innerHTML = '<span style="color:#64748b;font-size:0.78rem">Login dulu (paste token di atas) utk mengatur.</span>';
+  }
+}
+
+async function vrSetInterval(minutes) {
+  const msg = document.getElementById('vr-config-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/views-refresh-agent/schedule', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify({ interval_minutes: minutes }),
+    });
+    const json = await r.json();
+    if (r.ok) { msg.style.color = '#4ade80'; msg.textContent = `Interval diubah ke ${minutes} menit.`; vrLoadConfig(); }
+    else { msg.style.color = '#f87171'; msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).'; }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function vrSetBatchSize(size) {
+  const msg = document.getElementById('vr-config-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/views-refresh-agent/config', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify({ batch_size: size }),
+    });
+    const json = await r.json();
+    if (r.ok) { msg.style.color = '#4ade80'; msg.textContent = `Batch diubah ke ${size} video/run.`; vrLoadConfig(); }
+    else { msg.style.color = '#f87171'; msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).'; }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function vrSetAgeHours(hours) {
+  const msg = document.getElementById('vr-config-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/views-refresh-agent/config', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify({ refresh_age_hours: hours }),
+    });
+    const json = await r.json();
+    if (r.ok) { msg.style.color = '#4ade80'; msg.textContent = `Ambang basi diubah ke ${hours} jam.`; vrLoadConfig(); }
+    else { msg.style.color = '#f87171'; msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).'; }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+async function vrSaveConfig() {
+  const msg = document.getElementById('vr-config-msg');
+  const apiKey = document.getElementById('vr-apikey-input').value.trim();
+  if (!apiKey) { msg.style.color = '#fbbf24'; msg.textContent = 'Isi API key dulu.'; return; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/youtube/views-refresh-agent/config', {
+      method: 'PATCH', headers: daAuthHeaders(), body: JSON.stringify({ api_key: apiKey }),
+    });
+    const json = await r.json();
+    if (r.ok) {
+      msg.style.color = '#4ade80'; msg.textContent = 'Tersimpan.';
+      document.getElementById('vr-apikey-input').value = '';
+      vrLoadConfig();
+    } else { msg.style.color = '#f87171'; msg.textContent = json.error?.message || json.detail || 'Gagal (butuh token valid?).'; }
+  } catch(e) { msg.style.color = '#f87171'; msg.textContent = 'Gagal terhubung.'; }
+}
+
+vrLoadStatus();
+vrLoadConfig();
+setInterval(vrLoadStatus, 15000);
+
 load();
 setInterval(load, 15000);
 setInterval(() => {
@@ -1561,6 +3712,9 @@ API_PREFIX = "/api/v1"
 
 app.include_router(auth.router, prefix=API_PREFIX)
 app.include_router(users.router, prefix=API_PREFIX)
+app.include_router(credentials.router, prefix=API_PREFIX)
+app.include_router(apify_pool.router, prefix=API_PREFIX)
+app.include_router(ensembledata_pool.router, prefix=API_PREFIX)
 app.include_router(keywords.router, prefix=API_PREFIX)
 app.include_router(collectors.router, prefix=API_PREFIX)
 app.include_router(processing.router, prefix=API_PREFIX)
@@ -1579,5 +3733,6 @@ app.include_router(facebook_router, prefix=API_PREFIX)
 app.include_router(tiktok_router, prefix=API_PREFIX)
 app.include_router(twitter_router, prefix=API_PREFIX)
 app.include_router(news_router, prefix=API_PREFIX)
+app.include_router(threads_router, prefix=API_PREFIX)
 app.include_router(trend_discovery_router, prefix=API_PREFIX)
 app.include_router(trend_recommendations.router, prefix=API_PREFIX)

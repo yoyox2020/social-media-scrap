@@ -1,4 +1,53 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# ── Override layer utk credential third-party (halaman "Kelola API Key",
+# permintaan user 2026-07-18) -- 9 credential di bawah ini ORIGINALNYA
+# cuma bisa diubah lewat .env + rebuild image. Field pydantic aslinya
+# di-rename jadi "<nama>_env" (tetap baca env var ASLI via validation_alias,
+# TIDAK breaking .env yg sudah ada), lalu properti `<nama>` publik cek
+# override Redis dulu SEBELUM jatuh ke nilai .env -- supaya 69 titik kode yg
+# SUDAH baca `settings.<nama>` di seluruh project TIDAK PERLU diubah SAMA
+# SEKALI, cukup ganti nilai lewat dashboard baru & langsung kepakai run
+# berikutnya (async ATAU sync context, krn property access biasa bukan
+# `await`). Redis client di sini SENGAJA sync (bukan redis.asyncio) supaya
+# properti ini bisa diakses dari mana saja tanpa perlu `await`.
+import redis as _redis_sync
+
+_sync_redis_client: "_redis_sync.Redis | None" = None
+_credential_test_overrides: dict[str, str] = {}
+OVERRIDABLE_CREDENTIAL_NAMES = (
+    "apify_api_token", "ensemble_data_api_token", "anthropic_api_key",
+    "openai_api_key", "firecrawl_api_key", "tavily_api_key",
+    "youtube_data_api_key", "facebook_access_token",
+    "instagram_session_id", "instagram_csrf_token",
+)
+
+
+def _get_sync_redis():
+    global _sync_redis_client
+    if _sync_redis_client is None:
+        _sync_redis_client = _redis_sync.from_url(
+            settings.redis_url, decode_responses=True,
+            socket_connect_timeout=1, socket_timeout=1,
+        )
+    return _sync_redis_client
+
+
+def _resolve_credential(name: str, env_value: str) -> str:
+    if name in _credential_test_overrides:
+        return _credential_test_overrides[name]
+    try:
+        val = _get_sync_redis().get(f"credentials:{name}")
+    except Exception:
+        val = None
+    return val if val else env_value
+
+
+def _set_credential_test_override(name: str, value: str) -> None:
+    """Dipakai HANYA oleh property setter (test manual mock/restore
+    settings.xxx = "..." spt sebelumnya) -- TIDAK menulis ke Redis produksi."""
+    _credential_test_overrides[name] = value
 
 
 class Settings(BaseSettings):
@@ -29,12 +78,12 @@ class Settings(BaseSettings):
 
     # EnsembleData API
     ensemble_data_base_url: str = "https://ensembledata.com/apis"
-    ensemble_data_api_token: str = ""
+    ensemble_data_api_token_env: str = Field(default="", validation_alias="ENSEMBLE_DATA_API_TOKEN")
     ensemble_data_timeout: int = 30
     ensemble_data_max_retries: int = 3
 
     # Apify (pengganti EnsembleData untuk scraping Instagram)
-    apify_api_token: str = ""
+    apify_api_token_env: str = Field(default="", validation_alias="APIFY_API_TOKEN")
     apify_actor_id: str = "ycQuEFDDZmgX7BAsL"  # social-media-sentiment-analysis-tool
 
     # Apify — Facebook SEARCH by keyword (beda dari apify_actor_id di atas yang
@@ -62,7 +111,10 @@ class Settings(BaseSettings):
 
     # Instagram search provider — cari & scrape profil by username, dengan
     # auto-fallback antar provider (lihat app/services/instagram/providers/)
-    instagram_search_provider_order: str = "apify,ensembledata"  # urutan fallback, config-only
+    # 2026-07-20: apify_post_scraper jadi PRIMARY (fix gap thumbnail, actor
+    # "apify" lama TERBUKTI tidak pernah kirim foto sama sekali) -- "apify"
+    # lama tetap fallback kalau primary gagal/kuota habis, lihat registry.py
+    instagram_search_provider_order: str = "apify_post_scraper,apify,ensembledata"  # urutan fallback, config-only
     instagram_search_daily_min: int = 3       # minimal panggilan search dijamin tersedia/hari
     instagram_shared_daily_budget: int = 10   # total kuota harian: search + panggilan Instagram ad-hoc lain
 
@@ -81,18 +133,18 @@ class Settings(BaseSettings):
     # (Tavily, lihat tavily_api_key) — OpenAI belum diberi tool ini.
     ai_discovery_provider: str = "anthropic"
 
-    anthropic_api_key: str = ""
+    anthropic_api_key_env: str = Field(default="", validation_alias="ANTHROPIC_API_KEY")
     anthropic_model: str = "claude-opus-4-8"
 
-    openai_api_key: str = ""
+    openai_api_key_env: str = Field(default="", validation_alias="OPENAI_API_KEY")
     openai_model: str = "gpt-4o"
 
     # Web search untuk provider Ollama (model lokal tidak punya browsing
     # bawaan, jadi butuh tool search eksternal) — auto-switch: Firecrawl
     # dicoba dulu (hasil lebih relevan/spesifik per tes), fallback ke Tavily
     # kalau Firecrawl gagal/limit/key kosong. Isi minimal salah satu.
-    firecrawl_api_key: str = ""   # daftar di firecrawl.dev
-    tavily_api_key: str = ""      # daftar di tavily.com
+    firecrawl_api_key_env: str = Field(default="", validation_alias="FIRECRAWL_API_KEY")   # daftar di firecrawl.dev
+    tavily_api_key_env: str = Field(default="", validation_alias="TAVILY_API_KEY")      # daftar di tavily.com
 
     viral_discovery_max_topics: int = 5   # maks topik/hari dari AI discovery, ubah via .env
 
@@ -174,12 +226,12 @@ class Settings(BaseSettings):
     smart_search_ai_discovery_schedule_minute: int = 0
 
     # YouTube Data API v3 (fallback saat EnsembleData quota habis)
-    youtube_data_api_key: str = ""
+    youtube_data_api_key_env: str = Field(default="", validation_alias="YOUTUBE_DATA_API_KEY")
 
     # Facebook / Meta Graph API — token resmi cuma bisa akses Page yang
     # dikelola sendiri (terverifikasi live 05 Juli 2026, lihat
     # docs/flow scrape/flow-scrap-facebook.md), dipakai GET /facebook/posts
-    facebook_access_token: str = ""
+    facebook_access_token_env: str = Field(default="", validation_alias="FACEBOOK_ACCESS_TOKEN")
 
     # Facebook — provider abstraction untuk pipeline trend_recommendations
     # (Subsistem B khusus Facebook, terpisah dari Instagram). Apify satu-
@@ -204,6 +256,17 @@ class Settings(BaseSettings):
     tiktok_trend_scrape_schedule_hour: int = 11
     tiktok_trend_scrape_schedule_minute: int = 0
 
+    # Threads (2026-07-19) -- budget KECIL sengaja krn EnsembleData berbayar
+    # & kuota harian TERBUKTI kecil saat live test (habis dari ~10 panggilan
+    # uji coba). posts_per_topic dibatasi kecil krn search TIDAK terbukti
+    # bisa pagination (1x panggilan = 1 batch tetap dari provider). Jadwal
+    # 12:00 WIB (beda jam dari TikTok 11:00) biar tidak numpuk.
+    threads_trend_daily_budget: int = 3
+    threads_trend_posts_per_topic: int = 10
+    threads_trend_comments_top_n: int = 3
+    threads_trend_scrape_schedule_hour: int = 12
+    threads_trend_scrape_schedule_minute: int = 0
+
     # Apify — Twitter/X. SATU actor untuk scrape profil, search by keyword,
     # DAN reply/comment (mode "responses" via post_id) — lihat
     # app/integrations/apify/twitter.py.
@@ -222,8 +285,8 @@ class Settings(BaseSettings):
     twitter_trend_scrape_schedule_minute: int = 0
 
     # Instagram session (dari browser cookies — untuk scraping tanpa EnsembleData)
-    instagram_session_id: str = ""
-    instagram_csrf_token: str = ""
+    instagram_session_id_env: str = Field(default="", validation_alias="INSTAGRAM_SESSION_ID")
+    instagram_csrf_token_env: str = Field(default="", validation_alias="INSTAGRAM_CSRF_TOKEN")
 
     # Celery
     celery_broker_url: str = "redis://localhost:6379/0"
@@ -262,9 +325,97 @@ class Settings(BaseSettings):
     rate_limit_agents_max_requests: int = 10
     rate_limit_agents_window_seconds: int = 60
 
+    # Rate limiting endpoint publik (tanpa login, key berbasis IP bukan user.id)
+    # -- dipakai GET /youtube/trending-public, lihat app/infrastructure/rate_limit/ip_limiter.py
+    rate_limit_public_max_requests: int = 30
+    rate_limit_public_window_seconds: int = 60
+
     # Logging
     log_level: str = "INFO"
     log_format: str = "json"
+
+    # ── Properti credential yg bisa di-override Redis (lihat blok
+    # _resolve_credential() di atas) -- masing2 baca field "_env"-nya sbg
+    # fallback default kalau belum ada override tersimpan.
+    @property
+    def apify_api_token(self) -> str:
+        return _resolve_credential("apify_api_token", self.apify_api_token_env)
+
+    @apify_api_token.setter
+    def apify_api_token(self, value: str) -> None:
+        _set_credential_test_override("apify_api_token", value)
+
+    @property
+    def ensemble_data_api_token(self) -> str:
+        return _resolve_credential("ensemble_data_api_token", self.ensemble_data_api_token_env)
+
+    @ensemble_data_api_token.setter
+    def ensemble_data_api_token(self, value: str) -> None:
+        _set_credential_test_override("ensemble_data_api_token", value)
+
+    @property
+    def anthropic_api_key(self) -> str:
+        return _resolve_credential("anthropic_api_key", self.anthropic_api_key_env)
+
+    @anthropic_api_key.setter
+    def anthropic_api_key(self, value: str) -> None:
+        _set_credential_test_override("anthropic_api_key", value)
+
+    @property
+    def openai_api_key(self) -> str:
+        return _resolve_credential("openai_api_key", self.openai_api_key_env)
+
+    @openai_api_key.setter
+    def openai_api_key(self, value: str) -> None:
+        _set_credential_test_override("openai_api_key", value)
+
+    @property
+    def firecrawl_api_key(self) -> str:
+        return _resolve_credential("firecrawl_api_key", self.firecrawl_api_key_env)
+
+    @firecrawl_api_key.setter
+    def firecrawl_api_key(self, value: str) -> None:
+        _set_credential_test_override("firecrawl_api_key", value)
+
+    @property
+    def tavily_api_key(self) -> str:
+        return _resolve_credential("tavily_api_key", self.tavily_api_key_env)
+
+    @tavily_api_key.setter
+    def tavily_api_key(self, value: str) -> None:
+        _set_credential_test_override("tavily_api_key", value)
+
+    @property
+    def youtube_data_api_key(self) -> str:
+        return _resolve_credential("youtube_data_api_key", self.youtube_data_api_key_env)
+
+    @youtube_data_api_key.setter
+    def youtube_data_api_key(self, value: str) -> None:
+        _set_credential_test_override("youtube_data_api_key", value)
+
+    @property
+    def facebook_access_token(self) -> str:
+        return _resolve_credential("facebook_access_token", self.facebook_access_token_env)
+
+    @facebook_access_token.setter
+    def facebook_access_token(self, value: str) -> None:
+        _set_credential_test_override("facebook_access_token", value)
+
+    @property
+    def instagram_session_id(self) -> str:
+        return _resolve_credential("instagram_session_id", self.instagram_session_id_env)
+
+    @instagram_session_id.setter
+    def instagram_session_id(self, value: str) -> None:
+        _set_credential_test_override("instagram_session_id", value)
+
+    @property
+    def instagram_csrf_token(self) -> str:
+        return _resolve_credential("instagram_csrf_token", self.instagram_csrf_token_env)
+
+    @instagram_csrf_token.setter
+    def instagram_csrf_token(self, value: str) -> None:
+        _set_credential_test_override("instagram_csrf_token", value)
 
 
 settings = Settings()
