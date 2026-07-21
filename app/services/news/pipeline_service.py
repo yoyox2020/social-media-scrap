@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.posts.models import Post
+from app.services.processing.normalizer import _detect_lang, _extract_hashtags, _media_list
 
 # Batas wajar 1 artikel -- jaga-jaga kalau markdown hasil scrape ternyata
 # jauh lebih panjang dari artikel normal (misal salah scrape halaman index/
@@ -62,11 +63,14 @@ async def save_news_articles(
         if ext_id in existing_ext_ids:
             continue
 
+        content = article["content"][:MAX_CONTENT_CHARS]
+        title = article.get("title")
+
         post_obj = Post(
             id=uuid.uuid4(),
             external_id=ext_id,
             platform="news",
-            content=article["content"][:MAX_CONTENT_CHARS],
+            content=content,
             author=article.get("author"),
             url=url,
             # Tanggal publish ASLI dari metadata situs sumber (JSON-LD/OG tag),
@@ -76,8 +80,13 @@ async def save_news_articles(
             # collected_at, itu bukan waktu kejadian asli.
             published_at=article.get("published_at"),
             collected_at=datetime.now(timezone.utc),
+            title=title,
+            tags=_extract_hashtags(content),
+            media=_media_list(article.get("image_url")),
+            metrics={"views": 0, "likes": 0, "comments": 0, "shares": 0},  # artikel berita tidak punya metrik engagement
+            language=_detect_lang((title or "") + " " + content),
             metadata_={
-                "title":     article.get("title"),
+                "title":     title,
                 "image_url": article.get("image_url"),
                 "source":    "firecrawl",
             },

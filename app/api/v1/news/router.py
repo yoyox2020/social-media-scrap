@@ -38,9 +38,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from pydantic import BaseModel, Field
+
 from app.domain.users.models import User
 from app.infrastructure.database.connection import get_db
-from app.services.auth.dependencies import get_current_user
+from app.services.auth.dependencies import get_current_user, require_admin
+from app.shared.exceptions import ValidationError
 from app.shared.utils import build_success_response
 
 router = APIRouter(prefix="/news", tags=["news"])
@@ -384,3 +387,63 @@ async def get_news_trending(
         "source": "news_daily_discovery (mandiri, lihat docstring endpoint)",
         "items": items,
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pool key Firecrawl KHUSUS News + auto-rotasi (permintaan user 2026-07-19:
+# "ganti key firecrawl untuk news + auto switch jika kuota habis, minimal 5
+# key firecrawl bisa dipakai"). Admin-only (credential sensitif). TERPISAH
+# dari /api/v1/credentials (kelola key single-value) krn ini konsep POOL
+# (banyak key + status exhausted per-key), lihat app/services/news/config.py.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FirecrawlKeyRequest(BaseModel):
+    key: str = Field(..., description="Firecrawl API key (mis. fc-...)")
+
+
+@router.get("/firecrawl-keys", response_model=dict)
+async def list_firecrawl_keys(_admin: User = Depends(require_admin)):
+    """Daftar SEMUA key Firecrawl News di pool (masked) + status exhausted
+    tiap key. Kalau pool kosong, News jatuh ke FIRECRAWL_API_KEY .env
+    (satu key, tanpa rotasi) -- lihat /api/v1/credentials utk itu."""
+    from app.services.news import config as news_cfg
+
+    status = await news_cfg.get_pool_status()
+    return build_success_response({
+        "pool_size": len(status),
+        "keys": status,
+        "note": "Pool kosong -> News jatuh ke FIRECRAWL_API_KEY .env (satu key, TANPA rotasi)." if not status else None,
+    })
+
+
+@router.post("/firecrawl-keys", response_model=dict)
+async def add_firecrawl_key(body: FirecrawlKeyRequest, _admin: User = Depends(require_admin)):
+    """Tambah SATU key ke pool -- efek langsung aktif (dipakai run
+    berikutnya), tanpa restart. Ulangi panggilan ini utk isi sampai 5+ key."""
+    from app.services.news import config as news_cfg
+
+    try:
+        pool = await news_cfg.add_key(body.key)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+    return build_success_response({"pool_size": len(pool)})
+
+
+@router.post("/firecrawl-keys/remove", response_model=dict)
+async def remove_firecrawl_key(body: FirecrawlKeyRequest, _admin: User = Depends(require_admin)):
+    """Hapus SATU key dari pool by nilai key-nya (bukan by index -- hindari
+    ambiguitas kalau urutan pool berubah)."""
+    from app.services.news import config as news_cfg
+
+    pool = await news_cfg.remove_key(body.key)
+    return build_success_response({"pool_size": len(pool)})
+
+
+@router.post("/firecrawl-keys/reset", response_model=dict)
+async def reset_firecrawl_keys(_admin: User = Depends(require_admin)):
+    """Reset SEMUA tanda 'exhausted' sekarang juga (jangan tunggu TTL 6 jam)
+    -- pakai kalau tau quota bulanan Firecrawl baru saja reset."""
+    from app.services.news import config as news_cfg
+
+    reset_count = await news_cfg.reset_all_exhausted()
+    return build_success_response({"reset_count": reset_count})

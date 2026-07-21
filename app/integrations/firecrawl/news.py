@@ -15,8 +15,13 @@ per situs) — kode ini ambil best-effort beberapa kandidat key umum
 (`title`/`og:title`, `og:image`/`ogImage`, `author`), JANGAN diasumsikan
 semua field selalu ada.
 
-settings.firecrawl_api_key SAMA dengan yang sudah dipakai AI viral discovery
-provider Ollama — tidak perlu API key baru.
+Key Firecrawl: SEJAK 2026-07-19, pakai POOL key khusus News (lihat
+app/services/news/config.py) dgn AUTO-ROTASI kalau key aktif kena
+quota/rate-limit (HTTP 429/402) -- permintaan user "auto switch jika kuota
+habis, minimal 5 key firecrawl bisa dipakai". Kalau pool KOSONG (belum
+pernah diisi), fallback ke settings.firecrawl_api_key (satu key, TANPA
+rotasi, SAMA dgn yg dipakai AI viral discovery provider Ollama) --
+backward-compatible.
 """
 from __future__ import annotations
 
@@ -26,12 +31,66 @@ from typing import Any
 
 import httpx
 
+from app.services.news import config as news_cfg
 from app.shared.config import settings
 from app.shared.exceptions import ExternalAPIError
 
 logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://api.firecrawl.dev/v1"
+
+# HTTP status yg dianggap sinyal "kuota/rate-limit habis" utk key ini --
+# 429 (rate limit, paling umum) + 402 (payment required, dipakai sejumlah
+# provider utk "insufficient credits"). Status LAIN (500, network error,
+# dll) TIDAK memicu rotasi -- itu bukan masalah quota, ganti key tidak
+# akan membantu, malah bisa menutupi bug asli.
+_QUOTA_ERROR_STATUS_CODES = {429, 402}
+
+
+async def _call_firecrawl_with_rotation(path: str, json_body: dict[str, Any], timeout: float) -> httpx.Response:
+    """Panggil Firecrawl dgn ROTASI OTOMATIS -- kalau key yg dipakai kena
+    quota/rate-limit, tandai exhausted lalu coba key BERIKUTNYA di pool,
+    sampai berhasil atau SEMUA key di pool sudah dicoba. Key yg SUDAH
+    diketahui exhausted (dari panggilan SEBELUMNYA, masih dlm window TTL)
+    dicoba PALING TERAKHIR (jangan buang waktu ke key yg kemungkinan besar
+    masih habis), tapi TETAP dicoba kalau semua key "segar" sudah gagal --
+    jaga2 kalau ternyata sudah pulih lebih cepat dari TTL asumsi kita."""
+    pool = await news_cfg.get_pool()
+    keys_to_try = pool if pool else ([settings.firecrawl_api_key] if settings.firecrawl_api_key else [])
+    if not keys_to_try:
+        raise ExternalAPIError(service="Firecrawl", message="Belum ada Firecrawl API key (pool News kosong & FIRECRAWL_API_KEY .env jg kosong)")
+
+    if pool:
+        exhausted_flags = {k: await news_cfg.is_exhausted(k) for k in keys_to_try}
+        ordered_keys = sorted(keys_to_try, key=lambda k: exhausted_flags[k])
+    else:
+        ordered_keys = keys_to_try
+
+    last_resp: httpx.Response | None = None
+    for key in ordered_keys:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                f"{_BASE_URL}{path}",
+                headers={"Authorization": f"Bearer {key}"},
+                json=json_body,
+            )
+        if resp.status_code in _QUOTA_ERROR_STATUS_CODES:
+            logger.warning(
+                "[Firecrawl] key %s kena quota/rate-limit (status=%s) di %s -- rotasi ke key berikutnya (pool=%d key)",
+                news_cfg.mask_key(key), resp.status_code, path, len(ordered_keys),
+            )
+            if pool:
+                await news_cfg.mark_exhausted(key)
+            last_resp = resp
+            continue
+        return resp
+
+    logger.error(
+        "[Firecrawl] SEMUA %d key di pool kena quota/rate-limit utk %s -- request gagal total",
+        len(ordered_keys), path,
+    )
+    last_resp.raise_for_status()
+    return last_resp
 
 
 def _first(val: Any) -> str | None:
@@ -94,18 +153,9 @@ async def search_news_by_keyword(query: str, max_results: int = 5) -> list[dict[
     pendek (~150 karakter), untuk isi LENGKAP panggil scrape_article() per
     URL hasil ini.
     """
-    if not settings.firecrawl_api_key:
-        raise ExternalAPIError(service="Firecrawl", message="FIRECRAWL_API_KEY belum di-set di .env")
-
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(
-            f"{_BASE_URL}/search",
-            headers={"Authorization": f"Bearer {settings.firecrawl_api_key}"},
-            json={"query": query, "limit": max_results},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
+    resp = await _call_firecrawl_with_rotation("/search", {"query": query, "limit": max_results}, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
     return data.get("data") or []
 
 
@@ -115,18 +165,10 @@ async def scrape_article(url: str) -> dict[str, Any] | None:
     `/v1/scrape`. Return None (BUKAN raise) kalau gagal — dipanggil per-artikel
     dalam batch oleh pemanggil, satu URL gagal tidak boleh menggagalkan semua.
     """
-    if not settings.firecrawl_api_key:
-        raise ExternalAPIError(service="Firecrawl", message="FIRECRAWL_API_KEY belum di-set di .env")
-
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{_BASE_URL}/scrape",
-                headers={"Authorization": f"Bearer {settings.firecrawl_api_key}"},
-                json={"url": url, "formats": ["markdown"]},
-            )
-            resp.raise_for_status()
-            payload = resp.json()
+        resp = await _call_firecrawl_with_rotation("/scrape", {"url": url, "formats": ["markdown"]}, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
     except Exception as exc:
         logger.warning("[Firecrawl] scrape_article gagal untuk url=%r: %s", url, exc)
         return None

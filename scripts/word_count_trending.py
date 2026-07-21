@@ -13,14 +13,15 @@ sudah berisi itu — script ini sengaja cuma tampilkan ringkasannya.
 Requires:
     pip install requests
 
-Cara pakai:
+Cara pakai — DUA cara login, pilih salah satu:
+
+    # 1) Token siap pakai (dari POST /auth/login manual sebelumnya)
     python scripts/word_count_trending.py --token <ACCESS_TOKEN> \
         --date-from 2026-06-01 --date-to 2026-07-10 --top-n 10
 
-    # Token bisa didapat dari:
-    curl -X POST http://187.77.125.10:8000/api/v1/auth/login \
-        -H "Content-Type: application/json" \
-        -d '{"email":"EMAIL","password":"PASSWORD"}'
+    # 2) Auto-login pakai email+password (script yang urus ambil token-nya)
+    python scripts/word_count_trending.py --email you@example.com --password ***** \
+        --date-from 2026-06-01 --date-to 2026-07-10 --top-n 10
 
     # Filter opsional ke satu platform saja:
     python scripts/word_count_trending.py --token <ACCESS_TOKEN> \
@@ -29,11 +30,24 @@ Cara pakai:
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 
 import requests
 
 API_BASE_URL = os.environ.get("TREND_API_BASE_URL", "http://187.77.125.10:8000")
+
+
+def login(email: str, password: str) -> str:
+    """POST /auth/login, return access_token. Raise kalau gagal (email/password
+    salah, dst) -- pesan errornya diteruskan apa adanya dari API."""
+    resp = requests.post(
+        f"{API_BASE_URL}/api/v1/auth/login",
+        json={"email": email, "password": password},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["data"]["access_token"]
 
 
 def get_word_count(
@@ -63,17 +77,27 @@ def get_word_count(
     word_counts.sort(key=lambda item: item[1], reverse=True)
     return word_counts
 
-
+ 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ambil word count trending dari /trend-discovery/timeline")
-    parser.add_argument("--token", required=True, help="Access token (JWT), dari POST /auth/login")
+    parser.add_argument("--token", default=None, help="Access token (JWT) siap pakai -- kalau kosong, pakai --email/--password")
+    parser.add_argument("--email", default=None, help="Email login -- alternatif dari --token, script yang auto-login")
+    parser.add_argument("--password", default=None, help="Password login -- kalau kosong tapi --email diisi, akan ditanya interaktif (tersembunyi)")
     parser.add_argument("--date-from", required=True, help="YYYY-MM-DD")
     parser.add_argument("--date-to", required=True, help="YYYY-MM-DD")
     parser.add_argument("--top-n", type=int, default=10)
     parser.add_argument("--platform", default=None, help="instagram/facebook/tiktok/twitter/youtube/news, kosong = semua")
     args = parser.parse_args()
 
-    results = get_word_count(args.token, args.date_from, args.date_to, args.top_n, args.platform)
+    if args.token:
+        token = args.token
+    elif args.email:
+        password = args.password or getpass.getpass("Password: ")
+        token = login(args.email, password)
+    else:
+        parser.error("wajib isi --token ATAU --email (+ --password)")
+
+    results = get_word_count(token, args.date_from, args.date_to, args.top_n, args.platform)
 
     print(f"\nWord count - {args.date_from} s/d {args.date_to}"
           + (f" ({args.platform})" if args.platform else " (semua platform)") + "\n")
