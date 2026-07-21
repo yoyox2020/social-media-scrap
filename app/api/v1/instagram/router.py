@@ -1155,3 +1155,42 @@ async def get_trend_scrape_status(
     from app.services.instagram_trending.trend_scrape_service import get_trend_scrape_summary
 
     return build_success_response(await get_trend_scrape_summary(db, recent_limit=recent_limit))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Instagram Thumbnail Backfill Agent -- 2026-07-20, isi ulang photo_url post
+# LAMA yg genuinely kosong (scrape sebelum fix provider apify_post_scraper),
+# lihat app/services/instagram_thumbnail_backfill/service.py.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/thumbnail-backfill/run", response_model=dict, status_code=202,
+             summary="Trigger manual backfill thumbnail Instagram (tanpa nunggu jadwal 05:00)")
+async def trigger_thumbnail_backfill_run(
+    current_user: User = Depends(get_current_user),
+):
+    """Trigger manual proses backfill foto post Instagram lama (sama seperti
+    yang jalan otomatis jam 05:00 WIB via Celery Beat). Provider dipilih
+    ACAK per akun (Apify-baru/EnsembleData) supaya beban kuota tersebar."""
+    from app.workers.instagram_thumbnail_backfill_worker import instagram_thumbnail_backfill_daily_task
+
+    task = instagram_thumbnail_backfill_daily_task.delay()
+    return build_success_response({
+        "status": "queued",
+        "task_id": task.id,
+        "message": "Backfill thumbnail dijadwalkan di background.",
+    })
+
+
+@router.get("/thumbnail-backfill/status", response_model=dict,
+            summary="Monitoring backfill thumbnail Instagram (berapa post masih kosong, riwayat run)")
+async def get_thumbnail_backfill_status(
+    recent_limit: int = Query(default=10, ge=1, le=50),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Snapshot status agent backfill thumbnail: berapa akun/post Instagram
+    yang masih kosong foto, konfigurasi (enabled/budget), dan riwayat run
+    terakhir (akun mana, provider mana yg dipakai, berapa post ter-update)."""
+    from app.services.instagram_thumbnail_backfill.service import get_backfill_status
+
+    return build_success_response(await get_backfill_status(db, recent_limit=recent_limit))

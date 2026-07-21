@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.domain.comments.models import Comment
 from app.domain.entities.models import Entity
 from app.domain.posts.models import Post
+from app.services.processing.normalizer import _detect_lang, _extract_hashtags, _media_list
 from app.domain.youtube_analysis.models import LexiconAnalysis
 from app.services.instagram.providers.registry import search_profile_with_fallback
 
@@ -169,6 +170,10 @@ async def scrape_instagram_posts(
                 except ValueError:
                     published_at = None
 
+            likes = meta_row.get("postLikesCount", 0)
+            comments = meta_row.get("postCommentsCount", 0)
+            photo_url = meta_row.get("photoUrl")
+
             post_obj = Post(
                 id=uuid.uuid4(),
                 keyword_id=keyword_id,
@@ -179,11 +184,15 @@ async def scrape_instagram_posts(
                 url=post_url,
                 published_at=published_at,
                 collected_at=datetime.now(timezone.utc),
+                tags=_extract_hashtags(caption),
+                media=_media_list(photo_url),
+                metrics={"views": 0, "likes": likes, "comments": comments, "shares": 0},
+                language=_detect_lang(caption),
                 metadata_={
-                    "likes":     meta_row.get("postLikesCount", 0),
-                    "comments":  meta_row.get("postCommentsCount", 0),
+                    "likes":     likes,
+                    "comments":  comments,
                     "shortcode": shortcode,
-                    "photo_url": meta_row.get("photoUrl"),
+                    "photo_url": photo_url,
                     "source":    provider_used,
                 },
             )
@@ -318,6 +327,10 @@ async def save_instagram_keyword_search_results(
             except ValueError:
                 published_at = None
 
+        likes = item.get("likesCount", 0)
+        comments = item.get("commentsCount", 0)
+        photo_url = item.get("displayUrl")
+
         post_obj = Post(
             id=uuid.uuid4(),
             external_id=shortcode,
@@ -327,11 +340,15 @@ async def save_instagram_keyword_search_results(
             url=item.get("url") or f"https://www.instagram.com/p/{shortcode}/",
             published_at=published_at,
             collected_at=datetime.now(timezone.utc),
+            tags=_extract_hashtags(caption),
+            media=_media_list(photo_url),
+            metrics={"views": 0, "likes": likes, "comments": comments, "shares": 0},
+            language=_detect_lang(caption),
             metadata_={
-                "likes":     item.get("likesCount", 0),
-                "comments":  item.get("commentsCount", 0),
+                "likes":     likes,
+                "comments":  comments,
                 "shortcode": shortcode,
-                "photo_url": item.get("displayUrl"),
+                "photo_url": photo_url,
                 "source":    "apify_keyword_search",
             },
         )

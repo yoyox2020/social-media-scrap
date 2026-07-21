@@ -1,7 +1,13 @@
 """
 Registry provider pencarian Instagram — cari & scrape profil by username,
 dengan auto-fallback antar provider sesuai urutan di
-`settings.instagram_search_provider_order` (default: "apify,ensembledata").
+`settings.instagram_search_provider_order` (default:
+"apify_post_scraper,apify,ensembledata" -- 2026-07-20, `apify_post_scraper`
+jadi PRIMARY krn `apify` lama TERBUKTI tidak pernah kirim thumbnail sama
+sekali, lihat apify_post_scraper_provider.py. `apify` lama TETAP dipertahankan
+sbg fallback -- kalau `apify_post_scraper` gagal/kuota Apify habis, otomatis
+jatuh ke provider berikutnya di urutan, TIDAK ada downtime, cuma thumbnail-nya
+kosong lagi sementara spt sebelumnya).
 
 Untuk ganti urutan/nonaktifkan provider: cukup ubah config, tidak perlu ubah
 kode. Untuk tambah provider baru: buat class baru yang implement
@@ -13,6 +19,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from app.services.instagram.providers.apify_post_scraper_provider import ApifyPostScraperInstagramProvider
 from app.services.instagram.providers.apify_provider import ApifyInstagramProvider
 from app.services.instagram.providers.base import BaseInstagramSearchProvider
 from app.services.instagram.providers.ensemble_data_provider import EnsembleDataInstagramProvider
@@ -20,6 +27,7 @@ from app.services.instagram.providers.ensemble_data_provider import EnsembleData
 logger = logging.getLogger(__name__)
 
 PROVIDERS: dict[str, type[BaseInstagramSearchProvider]] = {
+    "apify_post_scraper": ApifyPostScraperInstagramProvider,
     "apify": ApifyInstagramProvider,
     "ensembledata": EnsembleDataInstagramProvider,
 }
