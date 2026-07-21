@@ -115,6 +115,7 @@ class YouTubeConnector:
         self,
         video_id: str,
         cursor: str = "",
+        skip_ensemble: bool = False,
     ) -> dict[str, Any]:
         """
         Ambil komentar video.
@@ -124,8 +125,22 @@ class YouTubeConnector:
         Args:
             video_id: YouTube video ID (contoh: 'cKkb5tperxc')
             cursor:   Token halaman berikutnya. "" untuk halaman pertama.
+            skip_ensemble: Lewati percobaan EnsembleData sama sekali, langsung ke
+                YouTube Data API v3. Dipakai caller yg SUDAH tahu EnsembleData
+                pasti gagal utk endpoint ini (mis. Metadata Agent, terkonfirmasi
+                2026-07-18 lewat log produksi selalu 495/quota habis) supaya
+                tidak buang satu panggilan HTTP percuma tiap halaman.
         """
         from app.shared.exceptions import ExternalAPIError
+
+        if skip_ensemble:
+            from app.shared.config import settings
+            from app.integrations.youtube_data_api.client import YouTubeDataAPIClient
+
+            if not settings.youtube_data_api_key:
+                raise ExternalAPIError("YouTube", "YOUTUBE_DATA_API_KEY belum di-set, tidak bisa skip EnsembleData")
+            yt_client = YouTubeDataAPIClient(api_key=settings.youtube_data_api_key)
+            return await yt_client.list_comment_threads(video_id, page_token=cursor or None)
 
         page_label = "halaman pertama" if not cursor else f"cursor={cursor[:20]}…"
         logger.info("[YouTube] get_video_comments: video_id=%s (%s)", video_id, page_label)

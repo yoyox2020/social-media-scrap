@@ -15,6 +15,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, desc, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,6 +27,7 @@ from app.domain.users.models import User
 from app.domain.viral_tracking.models import FlaggedAccount, ViralChannelTracker, ViralKeywordTracker
 from app.domain.youtube_analysis.models import LexiconAnalysis
 from app.infrastructure.database.connection import get_db
+from app.infrastructure.rate_limit.ip_limiter import IPRateLimiter
 from app.services.auth.dependencies import get_current_user
 from app.services.youtube.pipeline_service import (
     fetch_and_store_trending,
@@ -33,6 +35,7 @@ from app.services.youtube.pipeline_service import (
     get_keyword_pipeline_status,
     get_sentiment_distribution,
     get_sentiment_table,
+    get_trending_public_dashboard,
     get_wordcloud_data,
 )
 from app.services.youtube.schemas import (
@@ -43,7 +46,8 @@ from app.services.youtube.schemas import (
     YouTubeCollectRequest,
     YouTubePopularRequest,
 )
-from app.services.processing.normalizer import _utc_from_iso
+from app.services.processing.normalizer import _detect_lang, _extract_hashtags, _media_list, _utc_from_iso
+from app.shared.config import settings
 from app.shared.utils import build_success_response
 
 router = APIRouter(prefix="/youtube", tags=["youtube"])
@@ -245,7 +249,7 @@ async def smart_search_youtube(
 async def get_search_result(
     q: str = Query(..., min_length=1, max_length=200, description="Kata kunci yang dicari"),
     limit_videos: int = Query(default=20, ge=1, le=100, description="Jumlah video yang dikembalikan"),
-    limit_comments: int = Query(default=20, ge=1, le=200, description="Jumlah sample komentar"),
+    limit_comments: int = Query(default=20, ge=1, description="Jumlah komentar yang dikembalikan -- TANPA batas atas (2026-07-19, permintaan user: perlu dataset LENGKAP utk analisa sentiment, bukan sample terpotong). Kirim angka besar (mis. 999999) utk ambil SEMUA komentar keyword ini."),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -313,6 +317,62 @@ async def get_search_result(
         .order_by(Post.collected_at.desc())
         .limit(limit_videos)
     )).all())
+    posts_by_id = {p.id: p for p in posts}
+
+    # Komentar + sentimen -- TETAP independen (limit_comments PENUH, TIDAK
+    # dikurangi/dibatasi ke video yg sudah tampil di atas -- permintaan
+    # eksplisit user 2026-07-19 "jangan batasi pengambilan get datanya dari
+    # db ke user"). Videos & comments diurut kolom BEDA (collected_at vs
+    # created_at) jadi bisa saja komentar merujuk video yg BELUM ada di
+    # `posts` di atas -- ditangani di bawah dgn MENAMBAHKAN post yg
+    # direferensikan comments (bukan mengurangi comments), supaya
+    # comments[].video_url SELALU bisa di-join ke salah satu videos[]
+    # tanpa mengurangi jumlah data yg diterima user.
+    rows = (await db.execute(
+        select(Comment, LexiconAnalysis, Post)
+        .join(Post, Comment.post_id == Post.id)
+        .outerjoin(LexiconAnalysis, LexiconAnalysis.comment_id == Comment.id)
+        .where(Post.keyword_id == keyword.id)
+        .order_by(Comment.created_at.desc())
+        .limit(limit_comments)
+    )).all()
+
+    comments = [
+        {
+            "id": str(comment.id),
+            "content": comment.content,
+            "author": comment.author,
+            "post_id": str(post.id),
+            # final_label (mayoritas lexicon+LLM1+LLM2 tie-breaker, Sentiment
+            # Agent) dipakai kalau SUDAH direview -- jatuh ke label lexicon
+            # asli kalau belum (2026-07-18, permintaan user "samakan data
+            # sentiment"). TIDAK menimpa data lexicon asli, cuma pilih mana
+            # yg ditampilkan.
+            "sentiment": (analysis.final_label or analysis.label) if analysis else None,
+            "sentiment_source": ("llm_reviewed" if analysis and analysis.final_label else "lexicon_only") if analysis else None,
+            "score": round(analysis.score, 3) if analysis else None,
+            "video_url": post.url,
+        }
+        for comment, analysis, post in rows
+    ]
+
+    # Tambahkan post yg direferensikan comments TAPI belum ada di `posts`
+    # (video lama yg baru dpt komentar, tidak masuk top-N collected_at)
+    # -- supaya videos[] SELALU mencakup semua video yg dirujuk comments[].
+    for comment, analysis, post in rows:
+        if post.id not in posts_by_id:
+            posts_by_id[post.id] = post
+    posts = list(posts_by_id.values())
+
+    # Kelompokkan comments per post_id -- 2026-07-19, permintaan user "satu
+    # pemanggilan saja di jsonnya" (frontend tidak perlu join manual videos[]
+    # x comments[] pakai post_id, cukup baca videos[i].comments langsung).
+    # Nested LANGSUNG dari `comments` yg sudah dibangun di atas (bukan query
+    # ulang) -- data SAMA PERSIS, cuma dikelompokkan ulang, jadi relasinya
+    # tetap valid seperti yg sudah diverifikasi sebelumnya.
+    comments_by_post: dict[str, list] = {}
+    for c in comments:
+        comments_by_post.setdefault(c["post_id"], []).append(c)
 
     videos = []
     for p in posts:
@@ -332,34 +392,15 @@ async def get_search_result(
             "thumbnail_url": meta.get("thumbnail", meta.get("thumbnail_url", "")),
             "published_at": p.published_at.isoformat() if p.published_at else None,
             "collected_at": p.collected_at.isoformat() if p.collected_at else None,
+            "comment_count": len(comments_by_post.get(str(p.id), [])),
+            "comments": comments_by_post.get(str(p.id), []),
         })
 
-    # Komentar + sentimen
-    rows = (await db.execute(
-        select(Comment, LexiconAnalysis, Post)
-        .join(Post, Comment.post_id == Post.id)
-        .outerjoin(LexiconAnalysis, LexiconAnalysis.comment_id == Comment.id)
-        .where(Post.keyword_id == keyword.id)
-        .order_by(Comment.created_at.desc())
-        .limit(limit_comments)
-    )).all()
-
-    comments = [
-        {
-            "id": str(comment.id),
-            "content": comment.content,
-            "author": comment.author,
-            "sentiment": analysis.label if analysis else None,
-            "score": round(analysis.score, 3) if analysis else None,
-            "video_url": post.url,
-        }
-        for comment, analysis, post in rows
-    ]
-
-    # Distribusi sentimen
-    label_rows = list((await db.scalars(
-        select(LexiconAnalysis.label).where(LexiconAnalysis.keyword_id == keyword.id)
-    )).all())
+    # Distribusi sentimen -- pakai final_label kalau ada, jatuh ke lexicon
+    label_rows = list((await db.execute(
+        select(func.coalesce(LexiconAnalysis.final_label, LexiconAnalysis.label))
+        .where(LexiconAnalysis.keyword_id == keyword.id)
+    )).scalars().all())
     counter = _Counter(label_rows)
     total_analyzed = sum(counter.values())
 
@@ -388,9 +429,75 @@ async def get_search_result(
             "coverage_pct": round(total_analyzed / total_comments * 100, 1) if total_comments else 0.0,
         },
         "sentiment": {**sentiment, "dominant": counter.most_common(1)[0][0] if counter else "netral"},
+        # comments SUDAH nested di dalam videos[i].comments (2026-07-19,
+        # permintaan user "satu pemanggilan saja di jsonnya" -- frontend
+        # tidak perlu lagi join manual videos[] x comments[] pakai post_id).
+        # TIDAK ada lagi array comments terpisah di top-level -- data SAMA,
+        # cuma tidak diduplikasi supaya payload tidak bengkak 2x lipat.
         "videos": videos,
-        "comments": comments,
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEARCH VIDEO PALING BARU DIUPLOAD — beda dari smart-search (order=relevance)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/search-recent", response_model=dict)
+async def search_recent_youtube(
+    keyword: str = Query(..., min_length=1, max_length=200, description="Kata kunci pencarian"),
+    hours_back: int = Query(default=24, ge=1, le=168, description="Cari video ter-upload dalam N jam terakhir (maks 168 = 7 hari)"),
+    max_results: int = Query(default=50, ge=1, le=50, description="Maks video yang diambil (batas resmi YouTube Data API v3 = 50/call)"),
+    analyze_sentiment: bool = Query(default=True, description="Ambil komentar + jalankan lexicon sentiment utk video paling baru"),
+    sentiment_top_n: int = Query(default=5, ge=0, le=20, description="Jumlah video (paling baru) yg diambil komentar+sentiment-nya, 0 = skip"),
+    max_comments_per_video: int = Query(default=20, ge=1, le=100, description="Maks komentar diambil per video utk sentiment"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Cari video YouTube TERBARU (bukan paling relevan) untuk `keyword`,
+    dibatasi ke video yang di-upload dalam `hours_back` jam terakhir --
+    video yang BARU SAJA diupload (bahkan 1 jam lalu) tetap ketemu dan
+    langsung muncul di posisi teratas (urut tanggal upload, bukan relevansi).
+
+    Beda dari `POST /smart-search`: itu order=relevance dan tidak peduli
+    kapan video di-upload, ini KHUSUS untuk "apa yang baru saja tayang".
+
+    Pakai YouTube Data API v3 LANGSUNG (bukan EnsembleData) karena
+    parameter filter tanggal upload (`publishedAfter`) cuma tersedia resmi
+    di situ. Perlu login (menulis ke DB + pakai kuota API).
+
+    `analyze_sentiment=true` (default): `sentiment_top_n` video paling baru
+    langsung diambil komentar + sentiment-nya, hasilnya ada di field
+    `sentiment` response -- tidak perlu panggil endpoint terpisah untuk
+    lihat hasilnya. Untuk sentiment SEMUA post keyword ini (bukan cuma yg
+    baru ditemukan), pakai GET /youtube/sentiment/distribution?keyword_id=...
+
+    Di-cache 5 menit (Redis, per kombinasi SEMUA parameter di atas) --
+    LEBIH PENDEK dari /trending-public (10 menit) karena tujuan endpoint ini
+    memang "paling baru", cache terlalu lama jadi kontraproduktif. Cache HIT
+    berarti search_recent_uploads() SAMA SEKALI TIDAK dipanggil -- tidak ada
+    live call ke YouTube API (hemat kuota) DAN tidak ada tulis DB baru,
+    cukup kembalikan hasil panggilan sebelumnya apa adanya.
+    """
+    from app.infrastructure.cache.redis_cache import cache_get, cache_set
+    from app.services.youtube.pipeline_service import search_recent_uploads
+
+    cache_key = (
+        f"youtube:search_recent:{keyword.strip().lower()}:{hours_back}:{max_results}:"
+        f"{analyze_sentiment}:{sentiment_top_n}:{max_comments_per_video}"
+    )
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return build_success_response(cached)
+
+    result = await search_recent_uploads(
+        db=db, keyword=keyword, hours_back=hours_back, max_results=max_results,
+        analyze_sentiment=analyze_sentiment, sentiment_top_n=sentiment_top_n,
+        max_comments_per_video=max_comments_per_video,
+    )
+    if result.get("status") == "ok":
+        await cache_set(cache_key, result, ex=300)
+    return build_success_response(result)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -728,6 +835,7 @@ async def viral_videos(
             if len(bucket) < limit_comments:
                 bucket.append({
                     "id":        str(r["id"]),
+                    "post_id":   pid,
                     "content":   r["content"],
                     "author":    r["author"],
                     "sentiment": r["sentiment"],
@@ -735,6 +843,10 @@ async def viral_videos(
                 })
 
     # Build items dengan komentar nested per video + sentiment_summary per video
+    # (relasi comment->video SUDAH benar sejak awal krn cmt_rows difilter
+    # `WHERE c.post_id IN (post_ids)` -- post_id di bawah ini CUMA utk
+    # transparansi/audit client-side, konsisten dgn smart-search 2026-07-19,
+    # BUKAN fix relasi baru)
     items = []
     for i, r in enumerate(rows):
         pid      = str(r["id"])
@@ -744,6 +856,7 @@ async def viral_videos(
         total_sc = sum(sc.values())
         items.append({
             "rank":         i + 1,
+            "post_id":      pid,
             "video_id":     r["external_id"],
             "url":          r["url"] or f"https://youtube.com/watch?v={r['external_id']}",
             "title":        r["content"],
@@ -930,6 +1043,7 @@ async def viral_videos_post(
             if len(bucket) < body.limit_comments:
                 bucket.append({
                     "id":        str(r["id"]),
+                    "post_id":   pid,
                     "content":   r["content"],
                     "author":    r["author"],
                     "sentiment": r["sentiment"],
@@ -940,6 +1054,7 @@ async def viral_videos_post(
     items = []
     for item in items_raw:
         pid      = item.pop("_pid")
+        item["post_id"] = pid  # transparansi/audit client-side, konsisten dgn GET /videos/viral & smart-search
         vid_cmts = comments_by_post.get(pid, [])
         vid_lbls = [c["sentiment"] for c in vid_cmts if c["sentiment"]]
         sc       = _Counter(vid_lbls)
@@ -1590,6 +1705,11 @@ async def crawl_popular_videos(
                 content=it["title"],
                 author=it["channel"],
                 url=it["url"],
+                title=it["title"],
+                tags=_extract_hashtags(it["title"] + " " + it["description"]),
+                media=_media_list(it["thumbnail_url"]),
+                metrics={"views": it["view_count"], "likes": it["like_count"], "comments": it["comment_count"], "shares": 0},
+                language=_detect_lang(it["title"] + " " + it["description"]),
                 metadata_={
                     "views":       it["view_count"],
                     "likes":       it["like_count"],
@@ -2272,10 +2392,19 @@ async def scrape_monitor_public(
     ) or 0
 
     # ── EnsembleData status (dari error log di DB, tanpa hit API) ────────────
+    # Discovered di produksi 2026-07-15: subscription sempat expired (493),
+    # user renew, tapi dashboard TETAP bilang "expired" -- root cause: kode lama
+    # cuma cek "ada gak error 493 dalam 48 jam", TIDAK dibandingkan sama sukses
+    # TERAKHIR (jadi error lama yang sudah pulih tetap bikin status nyangkut di
+    # "expired" sampai 48 jam lewat). Juga tidak di-filter platform, jadi error
+    # 493 dari fallback Instagram (EnsembleData cuma fallback di sana) ikut
+    # dianggap sebagai status YouTube (provider utamanya). Diperbaiki: scope ke
+    # platform='youtube' + bandingkan timestamp mana yang lebih baru.
     ed_last_error_row = (await db.execute(text("""
         SELECT error_message, started_at
         FROM scrape_runs
-        WHERE (error_message ILIKE '%493%' OR error_message ILIKE '%subscription expired%'
+        WHERE platform = 'youtube'
+          AND (error_message ILIKE '%493%' OR error_message ILIKE '%subscription expired%'
                OR error_message ILIKE '%Subscription expired%')
           AND started_at > NOW() - INTERVAL '48 hours'
         ORDER BY started_at DESC
@@ -2284,15 +2413,14 @@ async def scrape_monitor_public(
 
     ed_last_success_row = (await db.execute(text("""
         SELECT finished_at FROM scrape_runs
-        WHERE status = 'success'
+        WHERE platform = 'youtube' AND status = 'success' AND api_source = 'ensembledata'
         ORDER BY finished_at DESC LIMIT 1
     """))).mappings().first()
 
-    ed_err_at   = ed_last_error_row["started_at"] if ed_last_error_row else None
-    last_err_at = ed_err_at
+    ed_err_at     = ed_last_error_row["started_at"] if ed_last_error_row else None
     ed_success_at = ed_last_success_row["finished_at"] if ed_last_success_row else None
 
-    if last_err_at:
+    if ed_err_at and (not ed_success_at or ed_err_at > ed_success_at):
         ed_status  = "expired"
         ed_message = "Subscription expired (HTTP 493) — scraping menunggu renewal"
     elif ed_success_at:
@@ -2301,6 +2429,98 @@ async def scrape_monitor_public(
     else:
         ed_status  = "unknown"
         ed_message = "Belum ada data scraping"
+
+    # ── YouTube Data API v3 quota status (fallback saat EnsembleData 493/495) ─
+    # Ditambahkan 2026-07-16 setelah insiden: EnsembleData expired -> fallback
+    # ke YouTube Data API v3 -> KUOTA GRATIS GOOGLE SENDIRI (10.000 unit/hari,
+    # ~100 pencarian) ikut habis (HTTP 429 "Search Queries"), tapi TIDAK ADA
+    # badge yang mendeteksi ini -- baru ketahuan lewat investigasi log manual.
+    # Pola query SAMA PERSIS dgn ensemble_data di atas (scope platform=youtube,
+    # bandingkan timestamp error vs sukses terakhir), tapi `api_source =
+    # 'youtube_data_api'` di sini baru akurat SETELAH fix used_fallback (lihat
+    # app/services/collector/schemas.py CollectionResult.used_fallback) --
+    # sebelum fix itu, run yang diam-diam fallback tercatat "ensembledata"
+    # jadi query lawas tidak akan pernah nemu baris yg benar di sini.
+    yt_last_error_row = (await db.execute(text("""
+        SELECT error_message, started_at
+        FROM scrape_runs
+        WHERE platform = 'youtube'
+          AND (error_message ILIKE '%429%' OR error_message ILIKE '%quota exceeded%'
+               OR error_message ILIKE '%quotaExceeded%')
+          AND error_message ILIKE '%YouTubeDataAPI%'
+          AND started_at > NOW() - INTERVAL '48 hours'
+        ORDER BY started_at DESC
+        LIMIT 1
+    """))).mappings().first()
+
+    yt_last_success_row = (await db.execute(text("""
+        SELECT finished_at FROM scrape_runs
+        WHERE platform = 'youtube' AND status = 'success' AND api_source = 'youtube_data_api'
+        ORDER BY finished_at DESC LIMIT 1
+    """))).mappings().first()
+
+    yt_err_at     = yt_last_error_row["started_at"] if yt_last_error_row else None
+    yt_success_at = yt_last_success_row["finished_at"] if yt_last_success_row else None
+
+    if yt_err_at and (not yt_success_at or yt_err_at > yt_success_at):
+        yt_quota_status  = "expired"
+        yt_quota_message = "Quota exceeded (HTTP 429) — kuota harian YouTube Data API v3 habis, reset otomatis tiap hari (~tengah malam Pacific Time)"
+    elif yt_success_at:
+        yt_quota_status  = "active"
+        yt_quota_message = "API berjalan normal"
+    else:
+        yt_quota_status  = "unknown"
+        yt_quota_message = "Belum pernah dipakai sbg fallback dalam 48 jam terakhir (EnsembleData mencukupi)"
+
+    # ── Backfill views/likes/comments post YouTube lama yg stuck 0 ────────────
+    # Status dibaca dari scrape_runs (platform='youtube_backfill') + flag Redis
+    # -- lihat app/workers/youtube_worker.py backfill_youtube_stats_task.
+    from app.infrastructure.redis.connection import get_redis
+    from app.workers.youtube_worker import BACKFILL_REDIS_KEY
+
+    _redis = await get_redis()
+    backfill_flag_on = (await _redis.get(BACKFILL_REDIS_KEY)) == "true"
+
+    backfill_last_run = (await db.execute(text("""
+        SELECT status, videos_fetched, videos_new, videos_duplicate,
+               started_at, finished_at, error_message
+        FROM scrape_runs
+        WHERE platform = 'youtube_backfill'
+        ORDER BY started_at DESC LIMIT 1
+    """))).mappings().first()
+
+    if backfill_last_run is None:
+        backfill_status = "never_run"
+        backfill_message = "Belum pernah dijalankan"
+        backfill_data = {"total_target": 0, "processed": 0, "updated": 0, "remaining": 0}
+    else:
+        total = backfill_last_run["videos_fetched"] or 0
+        updated = backfill_last_run["videos_new"] or 0
+        checked = updated + (backfill_last_run["videos_duplicate"] or 0)
+        remaining = max(0, total - checked)
+        backfill_data = {"total_target": total, "processed": checked, "updated": updated, "remaining": remaining}
+
+        if backfill_last_run["status"] == "running":
+            backfill_status = "running"
+            backfill_message = f"Sedang jalan — {checked}/{total} post diperiksa, {updated} diperbaiki"
+        elif remaining == 0 and backfill_last_run["status"] == "success":
+            backfill_status = "completed"
+            backfill_message = f"SELESAI — {updated} dari {total} post berhasil diperbaiki (sisanya genuinely 0 views/video sudah dihapus)"
+        elif backfill_last_run["status"] == "success":
+            backfill_status = "stopped"
+            backfill_message = f"Dihentikan manual — {checked}/{total} sempat diperiksa, {updated} diperbaiki. Nyalakan lagi utk lanjut."
+        else:
+            backfill_status = "error"
+            backfill_message = backfill_last_run["error_message"] or "Berhenti karena error, cek log worker"
+
+    youtube_backfill = {
+        "enabled": backfill_flag_on,
+        "status": backfill_status,
+        "message": backfill_message,
+        **backfill_data,
+        "started_at": backfill_last_run["started_at"].isoformat() if backfill_last_run and backfill_last_run["started_at"] else None,
+        "finished_at": backfill_last_run["finished_at"].isoformat() if backfill_last_run and backfill_last_run["finished_at"] else None,
+    }
 
     # ── Celery worker info via inspect ────────────────────────────────────────
     import asyncio
@@ -2393,7 +2613,7 @@ async def scrape_monitor_public(
         "ensemble_data": {
             "status":         ed_status,
             "message":        ed_message,
-            "last_error_at":  last_err_at.isoformat()    if last_err_at    else None,
+            "last_error_at":  ed_err_at.isoformat()       if ed_err_at      else None,
             "last_success_at": ed_success_at.isoformat() if ed_success_at  else None,
             # HANYA YouTube -- EnsembleData provider UTAMA di sana (fallback
             # YouTube Data API v3 kalau expired/quota). Instagram TIDAK
@@ -2410,6 +2630,15 @@ async def scrape_monitor_public(
                 "expired di sini TIDAK otomatis berarti Instagram macet. Cek `apify_quota` utk status provider utama Instagram."
             ),
         },
+        "youtube_data_api_quota": {
+            "status":          yt_quota_status,
+            "message":         yt_quota_message,
+            "last_error_at":   yt_err_at.isoformat()     if yt_err_at     else None,
+            "last_success_at": yt_success_at.isoformat() if yt_success_at else None,
+            "role": "Fallback YouTube saat EnsembleData 493/495 -- kuota gratis 10.000 unit/hari (~100 pencarian), TERPISAH dari kuota/subscription EnsembleData.",
+            "recovery": "Reset otomatis tiap hari (~tengah malam Pacific Time), atau minta quota increase di GCP Console (APIs & Services > YouTube Data API v3 > Quotas).",
+        },
+        "youtube_backfill": youtube_backfill,
         "instagram": {
             "total_posts":     ig_posts_total,
             "total_comments":  ig_comments_total,
@@ -2428,6 +2657,86 @@ async def scrape_monitor_public(
             "total": runs_total,
             "total_pages": max(1, (runs_total + runs_limit - 1) // runs_limit),
         },
+    })
+
+
+_trending_public_limiter = IPRateLimiter(
+    max_requests=settings.rate_limit_public_max_requests,
+    window_seconds=settings.rate_limit_public_window_seconds,
+)
+
+
+@router.get("/trending-public", response_model=dict, tags=["monitor"])
+async def trending_public(
+    geo: str = Query(default="ID", description="Kode negara Google Trends, mis. ID/US"),
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(_trending_public_limiter),
+):
+    """
+    Trending topic YouTube 7 hari terakhir + video terpopuler per topik --
+    TANPA AUTH, dirancang untuk di-share sbg link publik (frontend bikin
+    dashboard sekali, link-nya bisa dibagikan ke siapa saja tanpa perlu
+    login). Data GLOBAL (sama utk semua orang), bukan dashboard personal --
+    jadi satu URL ini SUDAH final, tidak perlu token per-share.
+
+    Di-cache 10 menit (Redis) supaya query berat (7 hari x N topik x cari
+    video per topik) tidak membebani DB tiap request -- data trending memang
+    tidak berubah tiap detik. Dibatasi IPRateLimiter (bukan RateLimiter biasa
+    yang butuh login) supaya tidak disalahgunakan/di-scrape berlebihan.
+    """
+    from app.infrastructure.cache.redis_cache import cache_get, cache_set
+
+    cache_key = f"youtube:trending_public:{geo}"
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return build_success_response(cached)
+
+    result = await get_trending_public_dashboard(db, geo=geo, days=7)
+    await cache_set(cache_key, result, ex=600)
+    return build_success_response(result)
+
+
+class BackfillToggleRequest(BaseModel):
+    enabled: bool = Field(..., description="true = nyalakan backfill (langsung trigger kalau belum jalan), false = matikan (berhenti aman di batch berikutnya)")
+
+
+@router.post("/backfill-stats/toggle", response_model=dict)
+async def toggle_youtube_backfill(
+    body: BackfillToggleRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Nyala/matikan backfill views/likes/comments post YouTube lama yang stuck
+    `views=0` (lihat app/workers/youtube_worker.py backfill_youtube_stats_task
+    untuk penjelasan lengkap kenapa & caranya). Perlu login -- ini kontrol
+    admin, bukan endpoint publik seperti /trending-public.
+
+    enabled=true: set flag Redis + trigger task SEKALI kalau belum ada yang
+    running (supaya tidak dobel-trigger kalau tombol dipencet berkali-kali).
+    enabled=false: cuma matikan flag -- task yang SEDANG jalan (kalau ada)
+    akan berhenti sendiri di batch berikutnya (baca flag tiap ~50 post),
+    BUKAN langsung di-terminate paksa.
+    """
+    from app.infrastructure.redis.connection import get_redis
+    from app.workers.youtube_worker import BACKFILL_REDIS_KEY, BACKFILL_SCRAPE_KEYWORD, backfill_youtube_stats_task
+
+    redis = await get_redis()
+    await redis.set(BACKFILL_REDIS_KEY, "true" if body.enabled else "false")
+
+    task_triggered = False
+    if body.enabled:
+        already_running = await db.scalar(text(
+            "SELECT COUNT(*) FROM scrape_runs WHERE platform = 'youtube_backfill' AND status = 'running'"
+        )) or 0
+        if not already_running:
+            backfill_youtube_stats_task.delay()
+            task_triggered = True
+
+    return build_success_response({
+        "enabled": body.enabled,
+        "task_triggered": task_triggered,
+        "keyword_text": BACKFILL_SCRAPE_KEYWORD,
     })
 
 
@@ -3072,3 +3381,993 @@ async def trigger_keyword_tracker_run(
         "status": "queued",
         "message": "Keyword scrape berjalan di background. Cek monitor dalam 2–5 menit.",
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: YouTube Discovery Agent (pencarian video viral/trending
+# otomatis via scheduler, lihat app/services/youtube_discovery/agent.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DiscoveryScheduleUpdateRequest(BaseModel):
+    interval_hours: int = Field(..., description="Salah satu dari: 1, 4, 8, 12")
+
+
+class DiscoveryConfigUpdateRequest(BaseModel):
+    model: str | None = Field(default=None, description="Nama model OpenRouter, mis. 'deepseek/deepseek-chat-v3-0324:free'")
+    api_key: str | None = Field(default=None, description="API key OpenRouter")
+    fallback_model: str | None = Field(default=None, description="Model CADANGAN ('agent 2') -- dipakai saat key/model utama kena rate-limit")
+    fallback_api_key: str | None = Field(default=None, description="API key OpenRouter CADANGAN ('agent 2')")
+    fallback_enabled: bool | None = Field(default=None, description="Tombol ON/OFF fallback ('agent 2') -- mati = reject konservatif spt biasa saat rate-limit")
+    youtube_api_key: str | None = Field(default=None, description="YouTube Data API key khusus agent ini (override YOUTUBE_DATA_API_KEY .env)")
+
+
+_discovery_agent_public_limiter = IPRateLimiter(
+    max_requests=settings.rate_limit_public_max_requests,
+    window_seconds=settings.rate_limit_public_window_seconds,
+)
+
+
+@router.get("/discovery-agent/status", response_model=dict, tags=["monitor"])
+async def get_discovery_agent_status(
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(_discovery_agent_public_limiter),
+):
+    """Status TERKINI agent (idle/running) + ringkasan run terakhir --
+    TANPA AUTH (dipoll dari /scraping-status yg memang halaman publik,
+    pola sama dgn /trending-public), dibatasi IPRateLimiter."""
+    from app.domain.search_topics.models import SearchTopic
+    from app.domain.youtube_discovery.models import YouTubeDiscoveryRun
+    from app.services.youtube_discovery import config as cfg
+
+    running_now = await cfg.is_running()
+    last_run = (await db.scalars(
+        select(YouTubeDiscoveryRun).where(YouTubeDiscoveryRun.agent_label == "agent1")
+        .order_by(YouTubeDiscoveryRun.started_at.desc()).limit(1)
+    )).first()
+
+    # Topik yg DICAKUP mode topic-guided -- filter PERSIS sama dgn
+    # run_discovery_agent() (app/services/youtube_discovery/agent.py):
+    # is_active=True DAN 'youtube' ada di platforms. Statis (bukan progress
+    # per-run), tujuannya biar jelas APA yg akan dicari agent ini, terlepas
+    # dari status run yg sedang/baru selesai jalan (2026-07-18, permintaan
+    # user "kenapa gak ditampilkan yang dicari apa aja").
+    active_topics = (await db.scalars(
+        select(SearchTopic).where(SearchTopic.is_active == True)  # noqa: E712
+    )).all()
+    topics_covered = []
+    for topic in active_topics:
+        if "youtube" not in (topic.platforms or []):
+            continue
+        kw_rows = (await db.execute(text(
+            "SELECT keyword_text FROM search_topic_keywords WHERE topic_id = :tid"
+        ), {"tid": str(topic.id)})).scalars().all()
+        topics_covered.append({"topic": topic.name, "keywords": list(kw_rows)})
+
+    return build_success_response({
+        "is_running": running_now,
+        "topics_covered": topics_covered,
+        "last_run": None if not last_run else {
+            "id": str(last_run.id),
+            "status": last_run.status,
+            "started_at": last_run.started_at.isoformat(),
+            "finished_at": last_run.finished_at.isoformat() if last_run.finished_at else None,
+            "topics_checked": last_run.topics_checked,
+            "candidates_found": last_run.candidates_found,
+            "candidates_validated": last_run.candidates_validated,
+            "candidates_rejected": last_run.candidates_rejected,
+            "posts_saved": last_run.posts_saved,
+            "fallback_used": last_run.fallback_used,
+            "model_used": last_run.model_used,
+            "error_message": last_run.error_message,
+        },
+    })
+
+
+@router.get("/discovery-agent/runs", response_model=dict, tags=["monitor"])
+async def list_discovery_agent_runs(
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(_discovery_agent_public_limiter),
+):
+    """Riwayat lengkap tiap run TERMASUK `details` per-kandidat (video mana
+    lolos/ditolak+alasan LLM-nya) -- ini yg dipakai utk analisis, bukan cuma
+    angka ringkasan di /status. TANPA AUTH (lihat catatan /status)."""
+    from app.domain.youtube_discovery.models import YouTubeDiscoveryRun
+
+    base_filter = YouTubeDiscoveryRun.agent_label == "agent1"
+    total = (await db.scalar(select(func.count(YouTubeDiscoveryRun.id)).where(base_filter))) or 0
+    rows = (await db.scalars(
+        select(YouTubeDiscoveryRun).where(base_filter).order_by(YouTubeDiscoveryRun.started_at.desc())
+        .offset((page - 1) * limit).limit(limit)
+    )).all()
+
+    items = [{
+        "id": str(r.id),
+        "status": r.status,
+        "started_at": r.started_at.isoformat(),
+        "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+        "topics_checked": r.topics_checked,
+        "candidates_found": r.candidates_found,
+        "candidates_validated": r.candidates_validated,
+        "candidates_rejected": r.candidates_rejected,
+        "posts_saved": r.posts_saved,
+        "fallback_used": r.fallback_used,
+        "model_used": r.model_used,
+        "error_message": r.error_message,
+        "details": r.details,
+    } for r in rows]
+
+    return build_success_response({
+        "items": items,
+        "pagination": {"page": page, "limit": limit, "total": total, "total_pages": (total + limit - 1) // limit},
+    })
+
+
+@router.get("/discovery-agent/schedule", response_model=dict, tags=["monitor"])
+async def get_discovery_agent_schedule(
+    _rl: None = Depends(_discovery_agent_public_limiter),
+):
+    """TANPA AUTH (read-only, info interval bukan data sensitif) -- lihat
+    catatan /discovery-agent/status."""
+    from app.services.youtube_discovery import config as cfg
+
+    return build_success_response({
+        "interval_hours": await cfg.get_interval_hours(),
+        "allowed_values": sorted(cfg.ALLOWED_INTERVAL_HOURS),
+    })
+
+
+@router.patch("/discovery-agent/schedule", response_model=dict)
+async def update_discovery_agent_schedule(
+    body: DiscoveryScheduleUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Ubah interval scheduler -- LANGSUNG aktif di pengecekan jam
+    berikutnya (task selalu baca nilai terkini dari Redis), TIDAK perlu
+    restart apa pun."""
+    from app.services.youtube_discovery import config as cfg
+    from app.shared.exceptions import ValidationError
+
+    try:
+        updated = await cfg.set_interval_hours(body.interval_hours)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+
+    return build_success_response({"interval_hours": updated})
+
+
+@router.get("/discovery-agent/config", response_model=dict)
+async def get_discovery_agent_config(
+    current_user: User = Depends(get_current_user),
+):
+    """API key di-MASK (cuma 4 karakter terakhir) -- tidak pernah kekirim
+    utuh lewat response GET."""
+    from app.services.youtube_discovery import config as cfg
+
+    return build_success_response({
+        "model": await cfg.get_model(),
+        "api_key_masked": cfg.mask_api_key(await cfg.get_api_key()),
+        "api_key_set": bool(await cfg.get_api_key()),
+        "fallback_model": await cfg.get_fallback_model(),
+        "fallback_api_key_masked": cfg.mask_api_key(await cfg.get_fallback_api_key()),
+        "fallback_api_key_set": bool(await cfg.get_fallback_api_key()),
+        "fallback_enabled": await cfg.get_fallback_enabled(),
+        "youtube_api_key_masked": cfg.mask_api_key(await cfg.get_youtube_api_key()),
+        "youtube_api_key_set": bool(await cfg.get_youtube_api_key()),
+    })
+
+
+@router.patch("/discovery-agent/config", response_model=dict)
+async def update_discovery_agent_config(
+    body: DiscoveryConfigUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Ubah model/API key UTAMA dan/atau CADANGAN ("agent 2", dipakai
+    otomatis saat key utama kena rate-limit) -- LANGSUNG aktif di run
+    berikutnya. Kirim salah satu atau lebih (field kosong = tidak diubah)."""
+    from app.services.youtube_discovery import config as cfg
+    from app.shared.exceptions import ValidationError
+
+    fields = (body.model, body.api_key, body.fallback_model, body.fallback_api_key, body.fallback_enabled, body.youtube_api_key)
+    if all(v is None for v in fields):
+        raise ValidationError(
+            "Isi minimal salah satu dari 'model', 'api_key', 'fallback_model', "
+            "'fallback_api_key', 'fallback_enabled', atau 'youtube_api_key'"
+        )
+
+    result = {}
+    try:
+        if body.model is not None:
+            result["model"] = await cfg.set_model(body.model)
+        if body.api_key is not None:
+            await cfg.set_api_key(body.api_key)
+            result["api_key_masked"] = cfg.mask_api_key(body.api_key)
+        if body.fallback_model is not None:
+            result["fallback_model"] = await cfg.set_fallback_model(body.fallback_model)
+        if body.fallback_api_key is not None:
+            await cfg.set_fallback_api_key(body.fallback_api_key)
+            result["fallback_api_key_masked"] = cfg.mask_api_key(body.fallback_api_key)
+        if body.fallback_enabled is not None:
+            result["fallback_enabled"] = await cfg.set_fallback_enabled(body.fallback_enabled)
+        if body.youtube_api_key is not None:
+            await cfg.set_youtube_api_key(body.youtube_api_key)
+            result["youtube_api_key_masked"] = cfg.mask_api_key(body.youtube_api_key)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+
+    return build_success_response(result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: Discovery Agent 2 (AGENT TERPISAH dari Discovery Agent di atas --
+# BUKAN fallback, bawa YouTube Data API key + OpenRouter key/model SENDIRI,
+# jadwal SENDIRI (default 1 jam), HANYA mode topic-guided. Lihat
+# app/services/youtube_discovery/agent2_config.py dan
+# run_discovery_agent_2() di agent.py. Permintaan user 2026-07-18.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Discovery2ScheduleUpdateRequest(BaseModel):
+    interval_hours: int = Field(..., description="Salah satu dari: 1, 4, 8, 12")
+
+
+class Discovery2ConfigUpdateRequest(BaseModel):
+    model: str | None = Field(default=None, description="Nama model OpenRouter, mis. 'nvidia/nemotron-nano-9b-v2:free'")
+    api_key: str | None = Field(default=None, description="API key OpenRouter MILIK Agent 2 (kuota terpisah dari Agent 1)")
+    youtube_api_key: str | None = Field(default=None, description="YouTube Data API key MILIK Agent 2 (kuota terpisah, TIDAK ada fallback ke .env)")
+    enabled: bool | None = Field(default=None, description="Tombol ON/OFF Agent 2")
+
+
+_discovery2_agent_public_limiter = IPRateLimiter(
+    max_requests=settings.rate_limit_public_max_requests,
+    window_seconds=settings.rate_limit_public_window_seconds,
+)
+
+
+@router.get("/discovery-agent-2/status", response_model=dict, tags=["monitor"])
+async def get_discovery_agent2_status(
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(_discovery2_agent_public_limiter),
+):
+    """Status TERKINI Agent 2 (idle/running/ON-OFF) + ringkasan run terakhir
+    -- TANPA AUTH, pola sama dgn /discovery-agent/status."""
+    from app.domain.search_topics.models import SearchTopic
+    from app.domain.youtube_discovery.models import YouTubeDiscoveryRun
+    from app.services.youtube_discovery import agent2_config as cfg2
+
+    running_now = await cfg2.is_running()
+    enabled = await cfg2.get_enabled()
+    last_run = (await db.scalars(
+        select(YouTubeDiscoveryRun).where(YouTubeDiscoveryRun.agent_label == "agent2")
+        .order_by(YouTubeDiscoveryRun.started_at.desc()).limit(1)
+    )).first()
+
+    # Banner status "kuota" key YouTube MILIK Agent 2 -- pola SAMA dgn
+    # youtube_data_api_quota (key global, lihat get_monitor_summary() di
+    # bawah), tapi sumbernya youtube_discovery_runs agent_label='agent2'
+    # (Agent 2 TIDAK menulis ke scrape_runs). Heuristik: run GAGAL TERBARU
+    # yg pesannya mengandung sinyal quota/429 dibandingkan run SUKSES
+    # terbaru -- permintaan user 2026-07-18 "banner status api harus ada
+    # untuk agent dua".
+    yt2_last_error_row = (await db.execute(text("""
+        SELECT error_message, started_at FROM youtube_discovery_runs
+        WHERE agent_label = 'agent2' AND status = 'failed'
+          AND (error_message ILIKE '%429%' OR error_message ILIKE '%quota%')
+          AND started_at > NOW() - INTERVAL '48 hours'
+        ORDER BY started_at DESC LIMIT 1
+    """))).mappings().first()
+    yt2_last_success_row = (await db.execute(text("""
+        SELECT finished_at FROM youtube_discovery_runs
+        WHERE agent_label = 'agent2' AND status = 'success'
+        ORDER BY finished_at DESC LIMIT 1
+    """))).mappings().first()
+    yt2_err_at = yt2_last_error_row["started_at"] if yt2_last_error_row else None
+    yt2_success_at = yt2_last_success_row["finished_at"] if yt2_last_success_row else None
+    if yt2_err_at and (not yt2_success_at or yt2_err_at > yt2_success_at):
+        yt2_quota_status = "expired"
+        yt2_quota_message = "Quota exceeded (HTTP 429) -- kuota harian YouTube Data API v3 key Agent 2 habis, reset otomatis tiap hari (~tengah malam Pacific Time)"
+    elif yt2_success_at:
+        yt2_quota_status = "active"
+        yt2_quota_message = "API berjalan normal"
+    else:
+        yt2_quota_status = "unknown"
+        yt2_quota_message = "Belum ada run sukses tercatat"
+
+    active_topics = (await db.scalars(
+        select(SearchTopic).where(SearchTopic.is_active == True)  # noqa: E712
+        .order_by(SearchTopic.created_at.desc())
+    )).all()
+    topics_covered = []
+    for topic in active_topics:
+        if "youtube" not in (topic.platforms or []):
+            continue
+        kw_rows = (await db.execute(text(
+            "SELECT keyword_text FROM search_topic_keywords WHERE topic_id = :tid"
+        ), {"tid": str(topic.id)})).scalars().all()
+        topics_covered.append({"topic": topic.name, "keywords": list(kw_rows)})
+
+    return build_success_response({
+        "enabled": enabled,
+        "is_running": running_now,
+        "topics_covered": topics_covered,
+        "youtube_api_quota": {
+            "status": yt2_quota_status,
+            "message": yt2_quota_message,
+            "last_error_at": yt2_err_at.isoformat() if yt2_err_at else None,
+            "last_success_at": yt2_success_at.isoformat() if yt2_success_at else None,
+            "role": "Key YouTube Data API v3 MILIK Agent 2 (terpisah dari key global/Agent 1) -- kuota gratis 10.000 unit/hari.",
+        },
+        "last_run": None if not last_run else {
+            "id": str(last_run.id),
+            "status": last_run.status,
+            "started_at": last_run.started_at.isoformat(),
+            "finished_at": last_run.finished_at.isoformat() if last_run.finished_at else None,
+            "topics_checked": last_run.topics_checked,
+            "candidates_found": last_run.candidates_found,
+            "candidates_validated": last_run.candidates_validated,
+            "candidates_rejected": last_run.candidates_rejected,
+            "posts_saved": last_run.posts_saved,
+            "model_used": last_run.model_used,
+            "error_message": last_run.error_message,
+        },
+    })
+
+
+@router.get("/discovery-agent-2/runs", response_model=dict, tags=["monitor"])
+async def list_discovery_agent2_runs(
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(_discovery2_agent_public_limiter),
+):
+    """Riwayat lengkap run Agent 2 TERMASUK `details` per-kandidat --
+    TANPA AUTH (lihat catatan /discovery-agent-2/status)."""
+    from app.domain.youtube_discovery.models import YouTubeDiscoveryRun
+
+    base_filter = YouTubeDiscoveryRun.agent_label == "agent2"
+    total = (await db.scalar(select(func.count(YouTubeDiscoveryRun.id)).where(base_filter))) or 0
+    rows = (await db.scalars(
+        select(YouTubeDiscoveryRun).where(base_filter).order_by(YouTubeDiscoveryRun.started_at.desc())
+        .offset((page - 1) * limit).limit(limit)
+    )).all()
+
+    items = [{
+        "id": str(r.id),
+        "status": r.status,
+        "started_at": r.started_at.isoformat(),
+        "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+        "topics_checked": r.topics_checked,
+        "candidates_found": r.candidates_found,
+        "candidates_validated": r.candidates_validated,
+        "candidates_rejected": r.candidates_rejected,
+        "posts_saved": r.posts_saved,
+        "model_used": r.model_used,
+        "error_message": r.error_message,
+        "details": r.details,
+    } for r in rows]
+
+    return build_success_response({
+        "items": items,
+        "pagination": {"page": page, "limit": limit, "total": total, "total_pages": (total + limit - 1) // limit},
+    })
+
+
+@router.get("/discovery-agent-2/schedule", response_model=dict, tags=["monitor"])
+async def get_discovery_agent2_schedule(
+    _rl: None = Depends(_discovery2_agent_public_limiter),
+):
+    from app.services.youtube_discovery import agent2_config as cfg2
+
+    return build_success_response({
+        "interval_hours": await cfg2.get_interval_hours(),
+        "allowed_values": sorted(cfg2.ALLOWED_INTERVAL_HOURS),
+    })
+
+
+@router.patch("/discovery-agent-2/schedule", response_model=dict)
+async def update_discovery_agent2_schedule(
+    body: Discovery2ScheduleUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.youtube_discovery import agent2_config as cfg2
+    from app.shared.exceptions import ValidationError
+
+    try:
+        updated = await cfg2.set_interval_hours(body.interval_hours)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+
+    return build_success_response({"interval_hours": updated})
+
+
+@router.get("/discovery-agent-2/config", response_model=dict)
+async def get_discovery_agent2_config(
+    current_user: User = Depends(get_current_user),
+):
+    """API key/YouTube key di-MASK -- tidak pernah kekirim utuh lewat GET."""
+    from app.services.youtube_discovery import agent2_config as cfg2
+
+    return build_success_response({
+        "model": await cfg2.get_model(),
+        "api_key_masked": cfg2.mask_api_key(await cfg2.get_api_key()),
+        "api_key_set": bool(await cfg2.get_api_key()),
+        "youtube_api_key_masked": cfg2.mask_api_key(await cfg2.get_youtube_api_key()),
+        "youtube_api_key_set": bool(await cfg2.get_youtube_api_key()),
+        "enabled": await cfg2.get_enabled(),
+    })
+
+
+@router.patch("/discovery-agent-2/config", response_model=dict)
+async def update_discovery_agent2_config(
+    body: Discovery2ConfigUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Ubah model/API key/YouTube key/tombol ON-OFF Agent 2 -- LANGSUNG aktif
+    di run berikutnya. Kirim salah satu atau lebih (field kosong = tidak diubah)."""
+    from app.services.youtube_discovery import agent2_config as cfg2
+    from app.shared.exceptions import ValidationError
+
+    fields = (body.model, body.api_key, body.youtube_api_key, body.enabled)
+    if all(v is None for v in fields):
+        raise ValidationError("Isi minimal salah satu dari 'model', 'api_key', 'youtube_api_key', atau 'enabled'")
+
+    result = {}
+    try:
+        if body.model is not None:
+            result["model"] = await cfg2.set_model(body.model)
+        if body.api_key is not None:
+            await cfg2.set_api_key(body.api_key)
+            result["api_key_masked"] = cfg2.mask_api_key(body.api_key)
+        if body.youtube_api_key is not None:
+            await cfg2.set_youtube_api_key(body.youtube_api_key)
+            result["youtube_api_key_masked"] = cfg2.mask_api_key(body.youtube_api_key)
+        if body.enabled is not None:
+            result["enabled"] = await cfg2.set_enabled(body.enabled)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+
+    return build_success_response(result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: Metadata Agent (lengkapi info video+channel dari YouTube API
+# SETELAH post baru tersimpan, lihat app/services/youtube_metadata/agent.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MetadataScheduleUpdateRequest(BaseModel):
+    interval_minutes: int = Field(..., description="Salah satu dari: 15, 30, 60, 240")
+
+
+class MetadataConfigUpdateRequest(BaseModel):
+    model: str | None = Field(default=None, description="Nama model OpenRouter")
+    api_key: str | None = Field(default=None, description="API key OpenRouter")
+    refresh_age_hours: int | None = Field(default=None, description="Salah satu dari: 1, 3, 6, 12, 24")
+    refresh_batch_size: int | None = Field(default=None, description="Salah satu dari: 10, 20, 50, 100")
+    enrich_batch_size: int | None = Field(default=None, description="Salah satu dari: 10, 20, 50, 100 -- kecepatan mengejar backlog post baru")
+
+
+_metadata_agent_public_limiter = IPRateLimiter(
+    max_requests=settings.rate_limit_public_max_requests,
+    window_seconds=settings.rate_limit_public_window_seconds,
+)
+
+
+@router.get("/metadata-agent/status", response_model=dict, tags=["monitor"])
+async def get_metadata_agent_status(
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(_metadata_agent_public_limiter),
+):
+    """Status terkini Metadata Agent + hitung berapa post YouTube yang
+    MASIH BELUM ter-enrich (antrian) -- TANPA AUTH, pola sama dgn
+    discovery-agent/status."""
+    from app.services.youtube_metadata import config as cfg
+
+    pending = await db.scalar(text("""
+        SELECT count(*) FROM posts p
+        WHERE p.platform = 'youtube'
+          AND NOT EXISTS (SELECT 1 FROM youtube_video_metadata m WHERE m.post_id = p.id)
+    """))
+    total_enriched = await db.scalar(text("SELECT count(*) FROM youtube_video_metadata"))
+
+    refresh_age_hours = await cfg.get_refresh_age_hours()
+    pending_refresh = await db.scalar(text(f"""
+        SELECT count(*) FROM youtube_video_metadata
+        WHERE fetched_at < now() - interval '{refresh_age_hours} hours'
+    """))
+    title_mismatch_count = await db.scalar(text(
+        "SELECT count(*) FROM youtube_video_metadata WHERE title_mismatch = true"
+    ))
+
+    return build_success_response({
+        "is_running": await cfg.is_running(),
+        "pending_enrichment": pending or 0,
+        "total_enriched": total_enriched or 0,
+        "pending_refresh": pending_refresh or 0,
+        "refresh_age_hours": refresh_age_hours,
+        "title_mismatch_count": title_mismatch_count or 0,
+        "last_run_at": await cfg.get_last_run_at(),
+    })
+
+
+@router.get("/metadata-agent/history", response_model=dict, tags=["monitor"])
+async def list_metadata_agent_history(
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=100),
+    only_title_mismatch: bool = Query(default=False, description="Cuma tampilkan video yg judulnya berubah/beda dari YouTube asli (perlu ditinjau)"),
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(_metadata_agent_public_limiter),
+):
+    """Riwayat video yg SUDAH ter-enrich, terbaru dulu -- TANPA AUTH, pola
+    sama dgn /status. Beda dari Discovery Agent (yg py tabel run terpisah),
+    Metadata Agent tidak py konsep 'run' -- riwayatnya ya baris
+    youtube_video_metadata itu sendiri (fetched_at = kapan di-enrich)."""
+    from app.domain.youtube_video_metadata.models import YouTubeVideoMetadata
+
+    stmt = select(YouTubeVideoMetadata)
+    count_stmt = select(func.count(YouTubeVideoMetadata.id))
+    if only_title_mismatch:
+        stmt = stmt.where(YouTubeVideoMetadata.title_mismatch == True)  # noqa: E712
+        count_stmt = count_stmt.where(YouTubeVideoMetadata.title_mismatch == True)  # noqa: E712
+
+    total = (await db.scalar(count_stmt)) or 0
+    rows = (await db.scalars(
+        stmt.order_by(YouTubeVideoMetadata.fetched_at.desc())
+        .offset((page - 1) * limit).limit(limit)
+    )).all()
+
+    items = [{
+        "video_id": r.video_id,
+        "title": r.title,
+        "url": r.url,
+        "channel_name": r.channel_name,
+        "channel_subscriber_count": r.channel_subscriber_count,
+        "views": r.views,
+        "likes": r.likes,
+        "comments": r.comments,
+        "keyword_matched": r.keyword_matched,
+        "viral_context": r.viral_context,
+        "title_mismatch": r.title_mismatch,
+        "title_live": r.title_live,
+        "title_checked_at": r.title_checked_at.isoformat() if r.title_checked_at else None,
+        "fetched_at": r.fetched_at.isoformat() if r.fetched_at else None,
+    } for r in rows]
+
+    return build_success_response({
+        "items": items,
+        "pagination": {"page": page, "limit": limit, "total": total, "total_pages": (total + limit - 1) // limit},
+    })
+
+
+@router.get("/metadata-agent/schedule", response_model=dict, tags=["monitor"])
+async def get_metadata_agent_schedule(
+    _rl: None = Depends(_metadata_agent_public_limiter),
+):
+    from app.services.youtube_metadata import config as cfg
+
+    return build_success_response({
+        "interval_minutes": await cfg.get_interval_minutes(),
+        "allowed_values": sorted(cfg.ALLOWED_INTERVAL_MINUTES),
+    })
+
+
+@router.patch("/metadata-agent/schedule", response_model=dict)
+async def update_metadata_agent_schedule(
+    body: MetadataScheduleUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.youtube_metadata import config as cfg
+    from app.shared.exceptions import ValidationError
+
+    try:
+        updated = await cfg.set_interval_minutes(body.interval_minutes)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+
+    return build_success_response({"interval_minutes": updated})
+
+
+@router.get("/metadata-agent/config", response_model=dict)
+async def get_metadata_agent_config(
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.youtube_metadata import config as cfg
+
+    return build_success_response({
+        "model": await cfg.get_model(),
+        "api_key_masked": cfg.mask_api_key(await cfg.get_api_key()),
+        "api_key_set": bool(await cfg.get_api_key()),
+        "refresh_age_hours": await cfg.get_refresh_age_hours(),
+        "refresh_batch_size": await cfg.get_refresh_batch_size(),
+        "enrich_batch_size": await cfg.get_enrich_batch_size(),
+        "allowed_refresh_age_hours": sorted(cfg.ALLOWED_REFRESH_AGE_HOURS),
+        "allowed_refresh_batch_size": sorted(cfg.ALLOWED_REFRESH_BATCH_SIZE),
+        "allowed_enrich_batch_size": sorted(cfg.ALLOWED_ENRICH_BATCH_SIZE),
+    })
+
+
+@router.patch("/metadata-agent/config", response_model=dict)
+async def update_metadata_agent_config(
+    body: MetadataConfigUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.youtube_metadata import config as cfg
+    from app.shared.exceptions import ValidationError
+
+    if all(v is None for v in (body.model, body.api_key, body.refresh_age_hours, body.refresh_batch_size, body.enrich_batch_size)):
+        raise ValidationError("Isi minimal salah satu dari 'model', 'api_key', 'refresh_age_hours', 'refresh_batch_size', atau 'enrich_batch_size'")
+
+    result = {}
+    try:
+        if body.model is not None:
+            result["model"] = await cfg.set_model(body.model)
+        if body.api_key is not None:
+            await cfg.set_api_key(body.api_key)
+            result["api_key_masked"] = cfg.mask_api_key(body.api_key)
+        if body.refresh_age_hours is not None:
+            result["refresh_age_hours"] = await cfg.set_refresh_age_hours(body.refresh_age_hours)
+        if body.refresh_batch_size is not None:
+            result["refresh_batch_size"] = await cfg.set_refresh_batch_size(body.refresh_batch_size)
+        if body.enrich_batch_size is not None:
+            result["enrich_batch_size"] = await cfg.set_enrich_batch_size(body.enrich_batch_size)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+
+    return build_success_response(result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: Sentiment Agent (opini KEDUA dari LLM utk komentar yg lexicon
+# kemungkinan besar salah, lihat app/services/sentiment_agent/agent.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SentimentScheduleUpdateRequest(BaseModel):
+    interval_minutes: int = Field(..., description="Salah satu dari: 15, 30, 60, 240")
+
+
+class SentimentConfigUpdateRequest(BaseModel):
+    model: str | None = Field(default=None, description="Nama model OpenRouter")
+    api_key: str | None = Field(default=None, description="API key OpenRouter")
+    batch_size: int | None = Field(default=None, description="Salah satu dari: 10, 20, 50, 100")
+    tiebreaker_model: str | None = Field(default=None, description="Model OpenRouter utk LLM kedua (tie-breaker, provider beda dari 'model')")
+    tiebreaker_api_key: str | None = Field(default=None, description="API key OpenRouter utk tie-breaker")
+
+
+_sentiment_agent_public_limiter = IPRateLimiter(
+    max_requests=settings.rate_limit_public_max_requests,
+    window_seconds=settings.rate_limit_public_window_seconds,
+)
+
+
+@router.get("/sentiment-agent/status", response_model=dict, tags=["monitor"])
+async def get_sentiment_agent_status(
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(_sentiment_agent_public_limiter),
+):
+    """Status terkini Sentiment Agent + hitung komentar YouTube yg MASIH
+    BELUM direview -- TANPA AUTH, pola sama dgn metadata-agent/status."""
+    from app.services.sentiment_agent import config as cfg
+
+    pending = await db.scalar(text("""
+        SELECT count(*) FROM lexicon_analyses la
+        JOIN comments c ON c.id = la.comment_id
+        JOIN posts p ON p.id = c.post_id
+        WHERE p.platform = 'youtube' AND la.llm_checked_at IS NULL
+    """))
+    total_reviewed = await db.scalar(text(
+        "SELECT count(*) FROM lexicon_analyses WHERE llm_checked_at IS NOT NULL"
+    ))
+    reviewed_by_llm = await db.scalar(text(
+        "SELECT count(*) FROM lexicon_analyses WHERE llm_label IS NOT NULL"
+    ))
+    disagreements = await db.scalar(text(
+        "SELECT count(*) FROM lexicon_analyses WHERE sentiment_agreement = false"
+    ))
+    agreements = await db.scalar(text(
+        "SELECT count(*) FROM lexicon_analyses WHERE sentiment_agreement = true"
+    ))
+
+    return build_success_response({
+        "is_running": await cfg.is_running(),
+        "pending_review": pending or 0,
+        "total_reviewed": total_reviewed or 0,
+        "reviewed_by_llm": reviewed_by_llm or 0,
+        "agreements": agreements or 0,
+        "disagreements": disagreements or 0,
+        "last_run_at": await cfg.get_last_run_at(),
+    })
+
+
+@router.get("/sentiment-agent/history", response_model=dict, tags=["monitor"])
+async def list_sentiment_agent_history(
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=100),
+    only_disagreement: bool = Query(default=False, description="Cuma tampilkan kasus lexicon vs LLM BEDA pendapat"),
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(_sentiment_agent_public_limiter),
+):
+    """Riwayat komentar yg SUDAH direview LLM, terbaru dulu -- TANPA AUTH."""
+    filters = ["la.llm_label IS NOT NULL"]
+    if only_disagreement:
+        filters.append("la.sentiment_agreement = false")
+    where_clause = " AND ".join(filters)
+
+    total = (await db.scalar(text(
+        f"SELECT count(*) FROM lexicon_analyses la WHERE {where_clause}"
+    ))) or 0
+    rows = (await db.execute(text(f"""
+        SELECT c.content, la.label AS lexicon_label, la.detected_language,
+               la.llm_label, la.llm_model, la.sentiment_agreement, la.llm_checked_at,
+               la.llm2_label, la.llm2_model, la.final_label
+        FROM lexicon_analyses la
+        JOIN comments c ON c.id = la.comment_id
+        WHERE {where_clause}
+        ORDER BY la.llm_checked_at DESC
+        OFFSET :offset LIMIT :limit
+    """), {"offset": (page - 1) * limit, "limit": limit})).mappings().all()
+
+    items = [{
+        "content": r["content"],
+        "lexicon_label": r["lexicon_label"],
+        "detected_language": r["detected_language"],
+        "llm_label": r["llm_label"],
+        "llm_model": r["llm_model"],
+        "agreement": r["sentiment_agreement"],
+        "llm2_label": r["llm2_label"],
+        "llm2_model": r["llm2_model"],
+        "final_label": r["final_label"],
+        "checked_at": r["llm_checked_at"].isoformat() if r["llm_checked_at"] else None,
+    } for r in rows]
+
+    return build_success_response({
+        "items": items,
+        "pagination": {"page": page, "limit": limit, "total": total, "total_pages": (total + limit - 1) // limit},
+    })
+
+
+@router.get("/sentiment-agent/schedule", response_model=dict, tags=["monitor"])
+async def get_sentiment_agent_schedule(
+    _rl: None = Depends(_sentiment_agent_public_limiter),
+):
+    from app.services.sentiment_agent import config as cfg
+
+    return build_success_response({
+        "interval_minutes": await cfg.get_interval_minutes(),
+        "allowed_values": sorted(cfg.ALLOWED_INTERVAL_MINUTES),
+    })
+
+
+@router.patch("/sentiment-agent/schedule", response_model=dict)
+async def update_sentiment_agent_schedule(
+    body: SentimentScheduleUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.sentiment_agent import config as cfg
+    from app.shared.exceptions import ValidationError
+
+    try:
+        updated = await cfg.set_interval_minutes(body.interval_minutes)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+
+    return build_success_response({"interval_minutes": updated})
+
+
+@router.get("/sentiment-agent/config", response_model=dict)
+async def get_sentiment_agent_config(
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.sentiment_agent import config as cfg
+
+    return build_success_response({
+        "model": await cfg.get_model(),
+        "api_key_masked": cfg.mask_api_key(await cfg.get_api_key()),
+        "api_key_set": bool(await cfg.get_api_key()),
+        "batch_size": await cfg.get_batch_size(),
+        "allowed_batch_size": sorted(cfg.ALLOWED_BATCH_SIZE),
+        "tiebreaker_model": await cfg.get_tiebreaker_model(),
+        "tiebreaker_api_key_masked": cfg.mask_api_key(await cfg.get_tiebreaker_api_key()),
+        "tiebreaker_api_key_set": bool(await cfg.get_tiebreaker_api_key()),
+    })
+
+
+@router.patch("/sentiment-agent/config", response_model=dict)
+async def update_sentiment_agent_config(
+    body: SentimentConfigUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.sentiment_agent import config as cfg
+    from app.shared.exceptions import ValidationError
+
+    if all(v is None for v in (body.model, body.api_key, body.batch_size, body.tiebreaker_model, body.tiebreaker_api_key)):
+        raise ValidationError("Isi minimal salah satu dari 'model', 'api_key', 'batch_size', 'tiebreaker_model', atau 'tiebreaker_api_key'")
+
+    result = {}
+    try:
+        if body.model is not None:
+            result["model"] = await cfg.set_model(body.model)
+        if body.api_key is not None:
+            await cfg.set_api_key(body.api_key)
+            result["api_key_masked"] = cfg.mask_api_key(body.api_key)
+        if body.batch_size is not None:
+            result["batch_size"] = await cfg.set_batch_size(body.batch_size)
+        if body.tiebreaker_model is not None:
+            result["tiebreaker_model"] = await cfg.set_tiebreaker_model(body.tiebreaker_model)
+        if body.tiebreaker_api_key is not None:
+            await cfg.set_tiebreaker_api_key(body.tiebreaker_api_key)
+            result["tiebreaker_api_key_masked"] = cfg.mask_api_key(body.tiebreaker_api_key)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+
+    return build_success_response(result)
+
+
+@router.get("/sentiment-agent/lexicon-suggestions", response_model=dict, tags=["monitor"])
+async def list_lexicon_word_suggestions(
+    min_evidence: int = Query(default=1, ge=1, description="Cuma tampilkan kata yg muncul minimal segini kali"),
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(_sentiment_agent_public_limiter),
+):
+    """Usulan kata BARU utk kamus lexicon -- digali dari kasus dimana
+    mayoritas (lexicon+LLM1+LLM2) MENGALAHKAN lexicon. TANPA AUTH (cuma
+    baca, bukan ubah kamus -- itu manual lewat app/ai/lexicon/data/*.txt).
+    Urut evidence_count (kata paling sering muncul di kasus koreksi dulu)."""
+    from app.domain.youtube_analysis.models import LexiconWordSuggestion
+
+    total = (await db.scalar(
+        select(func.count(LexiconWordSuggestion.id)).where(LexiconWordSuggestion.evidence_count >= min_evidence)
+    )) or 0
+    rows = (await db.scalars(
+        select(LexiconWordSuggestion)
+        .where(LexiconWordSuggestion.evidence_count >= min_evidence)
+        .order_by(LexiconWordSuggestion.evidence_count.desc())
+        .offset((page - 1) * limit).limit(limit)
+    )).all()
+
+    items = [{
+        "word": r.word,
+        "suggested_polarity": r.suggested_polarity,
+        "evidence_count": r.evidence_count,
+        "example_comment": r.example_comment,
+        "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+    } for r in rows]
+
+    return build_success_response({
+        "items": items,
+        "pagination": {"page": page, "limit": limit, "total": total, "total_pages": (total + limit - 1) // limit},
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: Views Refresh Agent (agent KEDUA, key YouTube Data API TERPISAH,
+# MURNI mempercepat refresh views/likes/comments/subscriber -- lihat
+# app/services/views_refresh_agent/agent.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ViewsRefreshScheduleUpdateRequest(BaseModel):
+    interval_minutes: int = Field(..., description="Salah satu dari: 15, 30, 60, 240")
+
+
+class ViewsRefreshConfigUpdateRequest(BaseModel):
+    api_key: str | None = Field(default=None, description="API key YouTube Data API v3 (project Google Cloud TERPISAH dari Metadata Agent)")
+    batch_size: int | None = Field(default=None, description="Salah satu dari: 10, 20, 50, 100")
+    refresh_age_hours: int | None = Field(default=None, description="Salah satu dari: 1, 3, 6, 12, 24")
+
+
+_views_refresh_public_limiter = IPRateLimiter(
+    max_requests=settings.rate_limit_public_max_requests,
+    window_seconds=settings.rate_limit_public_window_seconds,
+)
+
+
+@router.get("/views-refresh-agent/status", response_model=dict, tags=["monitor"])
+async def get_views_refresh_agent_status(
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(_views_refresh_public_limiter),
+):
+    """Status Views Refresh Agent -- TANPA AUTH. `pending_refresh` dihitung
+    pakai `refresh_age_hours` MILIK AGENT INI SENDIRI (independen dari
+    Metadata Agent, bisa beda nilai)."""
+    from app.services.views_refresh_agent import config as cfg
+
+    refresh_age_hours = await cfg.get_refresh_age_hours()
+    pending_refresh = await db.scalar(text(f"""
+        SELECT count(*) FROM youtube_video_metadata
+        WHERE fetched_at < now() - interval '{refresh_age_hours} hours'
+    """))
+
+    return build_success_response({
+        "is_running": await cfg.is_running(),
+        "pending_refresh": pending_refresh or 0,
+        "refresh_age_hours": refresh_age_hours,
+        "last_run_at": await cfg.get_last_run_at(),
+    })
+
+
+@router.get("/views-refresh-agent/schedule", response_model=dict, tags=["monitor"])
+async def get_views_refresh_agent_schedule(
+    _rl: None = Depends(_views_refresh_public_limiter),
+):
+    from app.services.views_refresh_agent import config as cfg
+
+    return build_success_response({
+        "interval_minutes": await cfg.get_interval_minutes(),
+        "allowed_values": sorted(cfg.ALLOWED_INTERVAL_MINUTES),
+    })
+
+
+@router.patch("/views-refresh-agent/schedule", response_model=dict)
+async def update_views_refresh_agent_schedule(
+    body: ViewsRefreshScheduleUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.views_refresh_agent import config as cfg
+    from app.shared.exceptions import ValidationError
+
+    try:
+        updated = await cfg.set_interval_minutes(body.interval_minutes)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+
+    return build_success_response({"interval_minutes": updated})
+
+
+@router.get("/views-refresh-agent/config", response_model=dict)
+async def get_views_refresh_agent_config(
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.views_refresh_agent import config as cfg
+
+    return build_success_response({
+        "api_key_masked": cfg.mask_api_key(await cfg.get_api_key()),
+        "api_key_set": bool(await cfg.get_api_key()),
+        "batch_size": await cfg.get_batch_size(),
+        "allowed_batch_size": sorted(cfg.ALLOWED_BATCH_SIZE),
+        "refresh_age_hours": await cfg.get_refresh_age_hours(),
+        "allowed_refresh_age_hours": sorted(cfg.ALLOWED_REFRESH_AGE_HOURS),
+    })
+
+
+@router.patch("/views-refresh-agent/config", response_model=dict)
+async def update_views_refresh_agent_config(
+    body: ViewsRefreshConfigUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.views_refresh_agent import config as cfg
+    from app.shared.exceptions import ValidationError
+
+    if all(v is None for v in (body.api_key, body.batch_size, body.refresh_age_hours)):
+        raise ValidationError("Isi minimal salah satu dari 'api_key', 'batch_size', atau 'refresh_age_hours'")
+
+    result = {}
+    try:
+        if body.api_key is not None:
+            await cfg.set_api_key(body.api_key)
+            result["api_key_masked"] = cfg.mask_api_key(body.api_key)
+        if body.batch_size is not None:
+            result["batch_size"] = await cfg.set_batch_size(body.batch_size)
+        if body.refresh_age_hours is not None:
+            result["refresh_age_hours"] = await cfg.set_refresh_age_hours(body.refresh_age_hours)
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+
+
+@router.get("/api-keys/health", response_model=dict, tags=["monitor"])
+async def get_youtube_api_keys_health(current_user: User = Depends(get_current_user)):
+    """Cek status TERKINI (OK / kuota habis / rate-limit / key invalid) tiap
+    slot key YouTube Data API v3 yg dikenal aplikasi ini (Discovery Agent 1/2,
+    Views Refresh Agent, global/Metadata Agent) -- permintaan user 2026-07-20
+    ("buatkan monitoringnya... pastikan dia berotasi", lalu diperjelas
+    "tanpa ganggu system yg existing, fokus di scraping-status monitoring").
+
+    READ-ONLY: cuma baca key yg SUDAH dikonfigurasi + 1 panggilan tes ringan
+    (videos.list, 1 unit) per key UNIK ke Google -- TIDAK menyentuh/mengubah
+    perilaku agent manapun. Ganti key tetap lewat PATCH /api/v1/credentials/
+    {id} yg sudah ada (admin-only, live tanpa restart)."""
+    from app.services.youtube_key_monitor.service import check_all_keys_health
+
+    result = await check_all_keys_health()
+    return build_success_response(result)
+
+    return build_success_response(result)
