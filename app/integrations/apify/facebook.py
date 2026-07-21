@@ -21,40 +21,13 @@ docs/flow scrape/flow-scrap-facebook.md).
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
-from apify_client import ApifyClient
-
+from app.integrations.apify.rotation import call_apify_actor
 from app.shared.config import settings
-from app.shared.exceptions import ExternalAPIError
 
 logger = logging.getLogger(__name__)
-
-
-def _run_actor_sync(identifier: str, latest_posts: int, latest_comments: int) -> list[dict[str, Any]]:
-    if not settings.apify_api_token:
-        raise ExternalAPIError(service="Apify", message="APIFY_API_TOKEN belum di-set di .env")
-
-    client = ApifyClient(settings.apify_api_token)
-    run_input = {
-        "facebookProfileName": identifier,
-        "scrapeFacebook": True,
-        "scrapeInstagram": False,
-        "scrapeTiktok": False,
-        "sentimentAnalysis": False,
-        "latestPosts": latest_posts,
-        "latestComments": max(latest_comments, 1),
-    }
-
-    logger.info("[Apify] run actor (facebook) identifier=%s input=%s", identifier, run_input)
-    run = client.actor(settings.apify_actor_id).call(run_input=run_input)
-
-    if run.status != "SUCCEEDED":
-        raise ExternalAPIError(service="Apify", message=f"Run status={run.status} untuk identifier={identifier}")
-
-    return list(client.dataset(run.default_dataset_id).iterate_items())
 
 
 async def scrape_facebook_via_apify(
@@ -64,6 +37,19 @@ async def scrape_facebook_via_apify(
 ) -> list[dict[str, Any]]:
     """
     Scrape post + komentar Facebook untuk satu page/profile via Apify.
-    Berjalan di thread terpisah karena apify_client bersifat sinkron/blocking.
+
+    2026-07-20: pakai call_apify_actor() (pool token + rotasi otomatis,
+    SEKALIGUS fix bug lama `run.status`/`run.default_dataset_id` attribute
+    access -- lihat instagram.py utk kronologi penemuan bug ini).
     """
-    return await asyncio.to_thread(_run_actor_sync, identifier, latest_posts, latest_comments)
+    run_input = {
+        "facebookProfileName": identifier,
+        "scrapeFacebook": True,
+        "scrapeInstagram": False,
+        "scrapeTiktok": False,
+        "sentimentAnalysis": False,
+        "latestPosts": latest_posts,
+        "latestComments": max(latest_comments, 1),
+    }
+    logger.info("[Apify] run actor (facebook) identifier=%s input=%s", identifier, run_input)
+    return await call_apify_actor(settings.apify_actor_id, run_input)

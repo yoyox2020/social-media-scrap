@@ -34,13 +34,11 @@ apify.com/apify/instagram-hashtag-scraper).
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 from typing import Any
 
-from apify_client import ApifyClient
-
+from app.integrations.apify.rotation import call_apify_actor
 from app.shared.config import settings
 from app.shared.exceptions import ExternalAPIError
 
@@ -61,10 +59,17 @@ def _to_hashtag_slug(keyword: str) -> str:
     return _HASHTAG_UNSAFE_RE.sub("", keyword)
 
 
-def _run_search_sync(keyword: str, max_results: int) -> list[dict[str, Any]]:
-    if not settings.apify_api_token:
-        raise ExternalAPIError(service="Apify", message="APIFY_API_TOKEN belum di-set di .env")
+async def search_instagram_posts_by_keyword(keyword: str, max_results: int = 5) -> list[dict[str, Any]]:
+    """
+    Search Instagram LANGSUNG by keyword (bukan hashtag yang harus persis
+    ada, `keywordSearch=True` di actor menangani ini) — return list post
+    mentah dari Apify, sudah termasuk caption/author/likes/comments
+    count/timestamp/hashtag terstruktur.
 
+    2026-07-20: pakai call_apify_actor() (pool token + rotasi otomatis,
+    SEKALIGUS fix bug lama `run.status`/`run.default_dataset_id` attribute
+    access yang crash di apify_client versi sekarang -- lihat instagram.py).
+    """
     slug = _to_hashtag_slug(keyword)
     if not slug:
         raise ExternalAPIError(
@@ -72,31 +77,14 @@ def _run_search_sync(keyword: str, max_results: int) -> list[dict[str, Any]]:
             message=f"Keyword {keyword!r} tidak menyisakan karakter valid untuk hashtag setelah disanitasi",
         )
 
-    client = ApifyClient(settings.apify_api_token)
     run_input: dict[str, Any] = {
         "hashtags": [slug],
         "resultsType": "posts",
         "resultsLimit": max_results,
         "keywordSearch": True,
     }
-
     logger.info("[Apify] instagram-hashtag-scraper keyword=%r input=%s", keyword, run_input)
-    run = client.actor(settings.instagram_search_actor_id).call(run_input=run_input)
-
-    if run.status != "SUCCEEDED":
-        raise ExternalAPIError(service="Apify", message=f"Run status={run.status} untuk keyword={keyword!r}")
-
-    return list(client.dataset(run.default_dataset_id).iterate_items())
-
-
-async def search_instagram_posts_by_keyword(keyword: str, max_results: int = 5) -> list[dict[str, Any]]:
-    """
-    Search Instagram LANGSUNG by keyword (bukan hashtag yang harus persis
-    ada, `keywordSearch=True` di actor menangani ini) — return list post
-    mentah dari Apify, sudah termasuk caption/author/likes/comments
-    count/timestamp/hashtag terstruktur.
-    """
-    return await asyncio.to_thread(_run_search_sync, keyword, max_results)
+    return await call_apify_actor(settings.instagram_search_actor_id, run_input)
 
 
 def extract_comments(item: dict[str, Any]) -> list[dict[str, str]]:

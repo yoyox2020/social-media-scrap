@@ -17,40 +17,13 @@ tidak menghasilkan baris output sama sekali walau post berhasil di-fetch.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
-from apify_client import ApifyClient
-
+from app.integrations.apify.rotation import call_apify_actor
 from app.shared.config import settings
-from app.shared.exceptions import ExternalAPIError
 
 logger = logging.getLogger(__name__)
-
-
-def _run_actor_sync(username: str, latest_posts: int, latest_comments: int) -> list[dict[str, Any]]:
-    if not settings.apify_api_token:
-        raise ExternalAPIError(service="Apify", message="APIFY_API_TOKEN belum di-set di .env")
-
-    client = ApifyClient(settings.apify_api_token)
-    run_input = {
-        "instagramProfileName": username,
-        "scrapeFacebook": False,
-        "scrapeInstagram": True,
-        "scrapeTiktok": False,
-        "sentimentAnalysis": False,  # sentimen dianalisis sendiri via lexicon, bukan bawaan Apify
-        "latestPosts": latest_posts,
-        "latestComments": max(latest_comments, 1),
-    }
-
-    logger.info("[Apify] run actor username=%s input=%s", username, run_input)
-    run = client.actor(settings.apify_actor_id).call(run_input=run_input)
-
-    if run.status != "SUCCEEDED":
-        raise ExternalAPIError(service="Apify", message=f"Run status={run.status} untuk username={username}")
-
-    return list(client.dataset(run.default_dataset_id).iterate_items())
 
 
 async def scrape_instagram_via_apify(
@@ -60,6 +33,22 @@ async def scrape_instagram_via_apify(
 ) -> list[dict[str, Any]]:
     """
     Scrape post + komentar Instagram untuk satu username via Apify.
-    Berjalan di thread terpisah karena apify_client bersifat sinkron/blocking.
+
+    2026-07-20: DIPINDAH ke call_apify_actor() (pool token + rotasi
+    otomatis, lihat app/integrations/apify/rotation.py) -- SEKALIGUS
+    memperbaiki bug lama `run.status`/`run.default_dataset_id` (attribute
+    access) yang crash "'dict' object has no attribute 'status'" krn
+    apify_client versi sekarang balikin dict, bukan object (ketahuan dari
+    error produksi run search:sby 2026-07-18).
     """
-    return await asyncio.to_thread(_run_actor_sync, username, latest_posts, latest_comments)
+    run_input = {
+        "instagramProfileName": username,
+        "scrapeFacebook": False,
+        "scrapeInstagram": True,
+        "scrapeTiktok": False,
+        "sentimentAnalysis": False,  # sentimen dianalisis sendiri via lexicon, bukan bawaan Apify
+        "latestPosts": latest_posts,
+        "latestComments": max(latest_comments, 1),
+    }
+    logger.info("[Apify] run actor username=%s input=%s", username, run_input)
+    return await call_apify_actor(settings.apify_actor_id, run_input)

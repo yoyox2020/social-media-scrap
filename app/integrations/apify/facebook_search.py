@@ -16,15 +16,12 @@ apify.com/danek/facebook-search-ppr). Akun Apify FREE dibatasi 5 hasil saja
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 from typing import Any
 
-from apify_client import ApifyClient
-
+from app.integrations.apify.rotation import call_apify_actor
 from app.shared.config import settings
-from app.shared.exceptions import ExternalAPIError
 
 logger = logging.getLogger(__name__)
 
@@ -70,29 +67,6 @@ def extract_identifier(author: dict[str, Any] | None) -> str | None:
     return None
 
 
-def _run_search_sync(query: str, max_results: int, recent_only: bool, location: str | None) -> list[dict[str, Any]]:
-    if not settings.apify_api_token:
-        raise ExternalAPIError(service="Apify", message="APIFY_API_TOKEN belum di-set di .env")
-
-    client = ApifyClient(settings.apify_api_token)
-    run_input: dict[str, Any] = {
-        "query": query,
-        "search_type": "posts",
-        "max_posts": max_results,
-        "recent_posts": recent_only,
-    }
-    if location:
-        run_input["location"] = location
-
-    logger.info("[Apify] facebook-search-ppr query=%r input=%s", query, run_input)
-    run = client.actor(settings.facebook_search_actor_id).call(run_input=run_input)
-
-    if run.status != "SUCCEEDED":
-        raise ExternalAPIError(service="Apify", message=f"Run status={run.status} untuk query={query!r}")
-
-    return list(client.dataset(run.default_dataset_id).iterate_items())
-
-
 async def search_facebook_by_keyword(
     query: str,
     max_results: int = 10,
@@ -104,5 +78,19 @@ async def search_facebook_by_keyword(
     diketahui) — return list post mentah dari Apify, masing-masing punya
     field `author` (dict dengan id/url/name) yang bisa diparse via
     extract_identifier().
+
+    2026-07-20: pakai call_apify_actor() (pool token + rotasi otomatis,
+    SEKALIGUS fix bug lama `run.status`/`run.default_dataset_id` attribute
+    access -- lihat instagram.py utk kronologi penemuan bug ini).
     """
-    return await asyncio.to_thread(_run_search_sync, query, max_results, recent_only, location)
+    run_input: dict[str, Any] = {
+        "query": query,
+        "search_type": "posts",
+        "max_posts": max_results,
+        "recent_posts": recent_only,
+    }
+    if location:
+        run_input["location"] = location
+
+    logger.info("[Apify] facebook-search-ppr query=%r input=%s", query, run_input)
+    return await call_apify_actor(settings.facebook_search_actor_id, run_input)
