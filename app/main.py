@@ -693,14 +693,17 @@ async function tpaDelete(apiId) {
 
 // ── Tab Target Curl (2026-07-22) ──
 function buildCurlCommand(t) {
-  let cmd = 'curl -X ' + t.method + ' "' + t.url + '"';
+  const NL = String.fromCharCode(10);
+  const BS = String.fromCharCode(92);
+  function shQuote(s) { return "'" + String(s).split("'").join("'" + BS + "''") + "'"; }
+  let cmd = 'curl -X ' + t.method + ' ' + shQuote(t.url);
   if (t.headers) {
-    t.headers.split('\n').map(h => h.trim()).filter(Boolean).forEach(h => {
-      cmd += " \\\n  -H '" + h.replace(/'/g, "'\\''") + "'";
+    t.headers.split(NL).map(h => h.trim()).filter(Boolean).forEach(h => {
+      cmd += ' ' + BS + NL + '  -H ' + shQuote(h);
     });
   }
   if (t.body) {
-    cmd += " \\\n  --data '" + t.body.replace(/'/g, "'\\''") + "'";
+    cmd += ' ' + BS + NL + '  --data ' + shQuote(t.body);
   }
   return cmd;
 }
