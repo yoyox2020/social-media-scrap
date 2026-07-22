@@ -19,16 +19,16 @@ from app.agents.youtube import api_client, crawler_client
 AGENT_NAME = "agent_youtube"
 
 
-async def run_children(db: AsyncSession, run_id: uuid.UUID, keywords: list[dict]) -> dict:
+async def run_children(db: AsyncSession, run_id: uuid.UUID, keywords: list[dict], max_results: int = 15) -> dict:
     primary_keyword = next((k["keyword"] for k in keywords if k.get("priority") == 1), keywords[0]["keyword"] if keywords else "")
 
     await log_activity(
         db, run_id, AGENT_NAME, "dispatch_children",
-        f"Memerintahkan agent_youtube01 (API, keyword='{primary_keyword}') + agent_youtube02 (Crawler) jalan paralel",
+        f"Memerintahkan agent_youtube01 (API, keyword='{primary_keyword}', max_results={max_results}) + agent_youtube02 (Crawler) jalan paralel",
     )
 
     results = await asyncio.gather(
-        api_client.fetch_videos_by_keyword(db, primary_keyword),
+        api_client.fetch_videos_by_keyword(db, primary_keyword, max_results=max_results),
         crawler_client.fetch_via_curl_targets(db),
         return_exceptions=True,
     )

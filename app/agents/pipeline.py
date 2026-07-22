@@ -21,7 +21,7 @@ from app.agents.youtube import coordinator
 from app.domain.scrape_runs.models import ScrapeRun
 
 
-async def run_youtube_pipeline(db: AsyncSession, topic: str) -> dict:
+async def run_youtube_pipeline(db: AsyncSession, topic: str, max_results: int = 15) -> dict:
     run_id = uuid.uuid4()
     started_at = datetime.now(timezone.utc)
 
@@ -37,7 +37,7 @@ async def run_youtube_pipeline(db: AsyncSession, topic: str) -> dict:
     try:
         topic_result = await agent_topic.determine_topic(db, run_id, topic, platform="youtube")
         search_result = await agent_search.build_keywords(db, run_id, topic_result["topic"], platform="youtube")
-        children_result = await coordinator.run_children(db, run_id, search_result["keywords"])
+        children_result = await coordinator.run_children(db, run_id, search_result["keywords"], max_results=max_results)
         struktur_result = await agent_struktur_data.process_and_save(
             db, run_id, topic_result["topic"],
             children_result["api_videos"], children_result["api_channels"], children_result["crawler_videos"],

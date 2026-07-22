@@ -18,6 +18,7 @@ router = APIRouter(prefix="/pipeline/youtube", tags=["pipeline-youtube"])
 
 class RunPipelineRequest(BaseModel):
     topic: str = Field(..., min_length=1, max_length=255)
+    max_results: int = Field(default=15, ge=1, le=50)
 
 
 @router.post("/run", response_model=dict)
@@ -29,7 +30,7 @@ async def run_pipeline(
     """Jalankan pipeline SEKARANG (sinkron, tunggu sampai selesai) --
     agent_topic -> agent_search -> agent_youtube (+2 child) ->
     agent-struktur-data -> simpan DB."""
-    result = await pipeline.run_youtube_pipeline(db, body.topic)
+    result = await pipeline.run_youtube_pipeline(db, body.topic, max_results=body.max_results)
     return build_success_response(result)
 
 
