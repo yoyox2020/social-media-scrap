@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.api.v1 import agent_registry, auth, credentials, third_party_apis, users
+from app.api.v1 import agent_curl_targets, agent_registry, auth, credentials, third_party_apis, users
 # Import domain models agar SQLAlchemy mapper bisa resolve relationship.
 # SEMUA tabel lama TETAP di-import (data tidak dihapus), walau endpoint
 # API utk masing2 platform sudah tidak ada -- lihat catatan modul.
@@ -39,6 +39,7 @@ import app.domain.trend_recommendations.platform_usage_models  # noqa: F401
 import app.domain.agent_registry.models  # noqa: F401
 import app.domain.agent_registry.pool_models  # noqa: F401
 import app.domain.third_party_apis.models  # noqa: F401
+import app.domain.agent_curl_targets.models  # noqa: F401
 import app.domain.youtube_discovery.models  # noqa: F401
 import app.domain.youtube_video_metadata.models  # noqa: F401
 import app.domain.threads.models  # noqa: F401
@@ -175,6 +176,7 @@ async def kelola_agent_page():
 <div class="da-tabbar" style="display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid #1e293b">
   <button class="da-tab-btn active" id="tabbtn-agents" onclick="switchMainTab('agents')" style="background:none;border:none;color:#60a5fa;border-bottom:2px solid #60a5fa;padding:8px 16px;font-size:0.85rem;font-weight:600;cursor:pointer">Kelola Agent</button>
   <button class="da-tab-btn" id="tabbtn-apis" onclick="switchMainTab('apis')" style="background:none;border:none;color:#64748b;border-bottom:2px solid transparent;padding:8px 16px;font-size:0.85rem;font-weight:600;cursor:pointer">API Pihak Ketiga</button>
+  <button class="da-tab-btn" id="tabbtn-curl" onclick="switchMainTab('curl')" style="background:none;border:none;color:#64748b;border-bottom:2px solid transparent;padding:8px 16px;font-size:0.85rem;font-weight:600;cursor:pointer">Target Curl</button>
 </div>
 
 <div id="tabpanel-agents">
@@ -246,16 +248,51 @@ async def kelola_agent_page():
 </div>
 </div>
 
+<div id="tabpanel-curl" style="display:none">
+<div style="max-width:640px;background:#1e293b;border-radius:8px;padding:16px">
+  <div style="font-size:0.85rem;font-weight:600;margin-bottom:10px">+ Tambah Target Curl</div>
+  <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:10px">
+    URL + parameter yg akan dipakai agent utk crawling. Satu agent bisa punya BEBERAPA target curl.
+  </div>
+  <select id="curl-new-agent">
+    <option value="">-- pilih agent --</option>
+  </select>
+  <input type="text" id="curl-new-name" placeholder="Nama target (mis. Trending Page TikTok)">
+  <input type="text" id="curl-new-url" placeholder="URL (mis. https://api.example.com/v1/search?q=...)">
+  <select id="curl-new-method">
+    <option value="GET">GET</option>
+    <option value="POST">POST</option>
+    <option value="PUT">PUT</option>
+    <option value="DELETE">DELETE</option>
+  </select>
+  <textarea id="curl-new-headers" placeholder="Header, 1 per baris (mis. Authorization: Bearer xxx)" rows="3" style="width:100%;padding:8px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.8rem;margin-bottom:8px;font-family:monospace"></textarea>
+  <textarea id="curl-new-body" placeholder="Body (opsional, utk POST/PUT)" rows="2" style="width:100%;padding:8px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.8rem;margin-bottom:8px;font-family:monospace"></textarea>
+  <input type="text" id="curl-new-desc" placeholder="Deskripsi singkat (opsional)">
+  <button class="retry-btn" onclick="curlAddNew()">Tambah Target</button>
+  <span id="curl-add-msg" style="margin-left:10px;font-size:0.82rem"></span>
+</div>
+
+<div style="margin-top:20px;margin-bottom:10px">
+  <button class="retry-btn" onclick="curlLoad()">Muat / Refresh Target Curl</button>
+  <span id="curl-msg" style="margin-left:10px;font-size:0.82rem;color:#64748b"></span>
+</div>
+<div id="curl-list" style="margin-bottom:20px">
+  <div style="color:#475569;font-style:italic;font-size:0.82rem">Klik "Muat / Refresh Target Curl" utk mulai.</div>
+</div>
+</div>
+
 <script>
 function switchMainTab(name) {
   document.getElementById('tabpanel-agents').style.display = name === 'agents' ? '' : 'none';
   document.getElementById('tabpanel-apis').style.display = name === 'apis' ? '' : 'none';
-  ['agents', 'apis'].forEach(n => {
+  document.getElementById('tabpanel-curl').style.display = name === 'curl' ? '' : 'none';
+  ['agents', 'apis', 'curl'].forEach(n => {
     const btn = document.getElementById('tabbtn-' + n);
     if (n === name) { btn.style.color = '#60a5fa'; btn.style.borderBottomColor = '#60a5fa'; }
     else { btn.style.color = '#64748b'; btn.style.borderBottomColor = 'transparent'; }
   });
   if (name === 'apis' && agToken()) tpaLoad();
+  if (name === 'curl' && agToken()) curlLoad();
 }
 function agToken() {
   return document.getElementById('ag-token').value || localStorage.getItem('ag_token') || '';
@@ -370,6 +407,13 @@ async function agRegLoad() {
       tpaSel.innerHTML = '<option value="">(Belum dihubungkan ke agent manapun)</option>' +
         window.__allAgentNames.map(n => `<option value="${n}">${n}</option>`).join('');
       tpaSel.value = cur;
+    }
+    const curlSel = document.getElementById('curl-new-agent');
+    if (curlSel) {
+      const cur2 = curlSel.value;
+      curlSel.innerHTML = '<option value="">-- pilih agent --</option>' +
+        window.__allAgentNames.map(n => `<option value="${n}">${n}</option>`).join('');
+      curlSel.value = cur2;
     }
     msgEl.style.color = '#64748b';
     msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID') + ` (${agents.length} agent)`;
@@ -647,6 +691,132 @@ async function tpaDelete(apiId) {
   }
 }
 
+// ── Tab Target Curl (2026-07-22) ──
+function buildCurlCommand(t) {
+  let cmd = 'curl -X ' + t.method + ' "' + t.url + '"';
+  if (t.headers) {
+    t.headers.split('\n').map(h => h.trim()).filter(Boolean).forEach(h => {
+      cmd += " \\\n  -H '" + h.replace(/'/g, "'\\''") + "'";
+    });
+  }
+  if (t.body) {
+    cmd += " \\\n  --data '" + t.body.replace(/'/g, "'\\''") + "'";
+  }
+  return cmd;
+}
+
+async function curlLoad() {
+  const msgEl = document.getElementById('curl-msg');
+  msgEl.style.color = '#60a5fa';
+  msgEl.textContent = 'Memuat...';
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/agent-curl-targets', { headers: agAuthHeaders() });
+    const j = await r.json();
+    if (!r.ok) {
+      msgEl.style.color = '#f87171';
+      msgEl.textContent = 'Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'isi token login dulu');
+      return;
+    }
+    const targets = j.data.targets;
+    if (targets.length === 0) {
+      document.getElementById('curl-list').innerHTML = '<div style="color:#475569;font-style:italic;font-size:0.82rem">Belum ada target curl terdaftar. Tambah lewat form di atas.</div>';
+      msgEl.style.color = '#64748b';
+      msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID') + ' (0 target)';
+      return;
+    }
+    let html = '';
+    let lastAgent = null;
+    targets.forEach(t => {
+      if (t.agent_name !== lastAgent) {
+        html += `<div style="font-size:0.78rem;font-weight:600;color:#60a5fa;margin:14px 0 6px">${t.agent_name}</div>`;
+        lastAgent = t.agent_name;
+      }
+      const cmd = buildCurlCommand(t);
+      html += `
+        <div style="background:#1e293b;border-radius:8px;padding:12px 16px;margin-bottom:10px">
+          <div style="margin-bottom:6px;display:flex;align-items:center;gap:6px">
+            <b>${t.name}</b>
+            <span class="pill" style="background:#1e3a5f;color:#60a5fa">${t.method}</span>
+            ${!t.enabled ? '<span class="pill" style="background:#450a0a;color:#f87171">nonaktif</span>' : ''}
+            <button class="retry-btn" style="margin-left:auto;padding:4px 10px;font-size:0.7rem;background:#7f1d1d" onclick="curlDelete('${t.id}')">Hapus</button>
+          </div>
+          <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:6px">${t.description || ''}</div>
+          <pre style="background:#0f172a;border:1px solid #334155;border-radius:4px;padding:8px;font-size:0.72rem;color:#a5f3fc;overflow-x:auto;white-space:pre-wrap;word-break:break-all;margin-bottom:6px">${cmd.replace(/</g, '&lt;')}</pre>
+          <button class="retry-btn" style="padding:4px 10px;font-size:0.7rem" onclick="curlCopy('${t.id}')">Copy Command</button>
+        </div>`;
+    });
+    document.getElementById('curl-list').innerHTML = html;
+    window.__curlTargets = {};
+    targets.forEach(t => { window.__curlTargets[t.id] = t; });
+    msgEl.style.color = '#64748b';
+    msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID') + ` (${targets.length} target)`;
+  } catch (e) {
+    msgEl.style.color = '#f87171';
+    msgEl.textContent = 'Gagal: ' + e.message;
+  }
+}
+
+function curlCopy(id) {
+  const t = (window.__curlTargets || {})[id];
+  if (!t) return;
+  const cmd = buildCurlCommand(t);
+  navigator.clipboard.writeText(cmd).then(() => alert('Command curl disalin!')).catch(() => alert('Gagal menyalin, salin manual dari kotak di atas.'));
+}
+
+async function curlAddNew() {
+  const agentName = document.getElementById('curl-new-agent').value;
+  const name = document.getElementById('curl-new-name').value.trim();
+  const url = document.getElementById('curl-new-url').value.trim();
+  if (!agentName) { alert('Pilih agent dulu'); return; }
+  if (!name || !url) { alert('Nama dan URL wajib diisi'); return; }
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  const body = {
+    agent_name: agentName, name, url,
+    method: document.getElementById('curl-new-method').value,
+    headers: document.getElementById('curl-new-headers').value.trim() || null,
+    body: document.getElementById('curl-new-body').value.trim() || null,
+    description: document.getElementById('curl-new-desc').value.trim() || null,
+  };
+  const msgEl = document.getElementById('curl-add-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/agent-curl-targets', {
+      method: 'POST', headers: agAuthHeaders(), body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok) {
+      msgEl.style.color = '#f87171';
+      msgEl.textContent = 'Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown');
+      return;
+    }
+    msgEl.style.color = '#4ade80';
+    msgEl.textContent = 'Target ditambahkan!';
+    ['name', 'url', 'headers', 'body', 'desc'].forEach(f => {
+      document.getElementById('curl-new-' + f).value = '';
+    });
+    document.getElementById('curl-new-agent').value = '';
+    document.getElementById('curl-new-method').value = 'GET';
+    curlLoad();
+  } catch (e) {
+    msgEl.style.color = '#f87171';
+    msgEl.textContent = 'Gagal: ' + e.message;
+  }
+}
+
+async function curlDelete(id) {
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  if (!confirm('Hapus target curl ini? Tidak bisa dibatalkan.')) return;
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/agent-curl-targets/' + id, {
+      method: 'DELETE', headers: agAuthHeaders(),
+    });
+    const j = await r.json();
+    if (!r.ok) { alert('Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown')); return; }
+    curlLoad();
+  } catch (e) {
+    alert('Gagal: ' + e.message);
+  }
+}
+
 const savedToken = localStorage.getItem('ag_token');
 if (savedToken) { document.getElementById('ag-token').value = savedToken; agRegLoad(); }
 </script>
@@ -664,3 +834,4 @@ app.include_router(users.router, prefix=API_PREFIX)
 app.include_router(credentials.router, prefix=API_PREFIX)
 app.include_router(agent_registry.router, prefix=API_PREFIX)
 app.include_router(third_party_apis.router, prefix=API_PREFIX)
+app.include_router(agent_curl_targets.router, prefix=API_PREFIX)
