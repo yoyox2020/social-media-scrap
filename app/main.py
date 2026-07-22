@@ -150,7 +150,15 @@ async def kelola_agent_page():
   tr:hover td { background: #1e293b44; }
   .retry-btn { background: #1d4ed8; border: none; color: #fff; padding: 6px 16px; border-radius: 6px; cursor: pointer; font-size: 0.8rem; font-weight: 600; transition: background 0.15s; }
   .retry-btn:hover { background: #1e40af; }
-  input[type=text], input[type=password] { width: 100%; margin-bottom: 8px; padding: 7px 10px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0; font-size: 0.82rem; }
+  input[type=text], input[type=password], select { width: 100%; margin-bottom: 8px; padding: 7px 10px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0; font-size: 0.82rem; }
+  details.ag-parent { background: #1e293b; border-radius: 8px; padding: 12px 16px; margin-bottom: 10px; }
+  details.ag-parent > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px; }
+  details.ag-parent > summary::-webkit-details-marker { display: none; }
+  details.ag-parent > summary::before { content: '▶'; font-size: 0.7rem; color: #64748b; transition: transform 0.15s; }
+  details.ag-parent[open] > summary::before { transform: rotate(90deg); }
+  .ag-child-count { font-size: 0.7rem; color: #64748b; margin-left: auto; }
+  .ag-child-box { background: #0f172a; border-radius: 6px; padding: 10px 12px; margin-top: 8px; margin-left: 14px; }
+  .ag-child-box + .ag-child-box { margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -177,6 +185,9 @@ async def kelola_agent_page():
     Ini CUMA mencatat nama/key/model agent baru -- TIDAK otomatis membuat kode scraping baru.
   </div>
   <input type="text" id="agreg-new-name" placeholder="Nama agent (mis. TikTok Discovery Agent)">
+  <select id="agreg-new-parent">
+    <option value="">(Tidak ada -- agent mandiri/parent baru)</option>
+  </select>
   <input type="text" id="agreg-new-category" placeholder="Kategori (mis. TikTok)">
   <input type="text" id="agreg-new-desc" placeholder="Deskripsi singkat (opsional)">
   <input type="text" id="agreg-new-keylabel" placeholder="Label key (mis. OpenRouter)">
@@ -200,6 +211,76 @@ function agSaveToken() {
   if (t) { localStorage.setItem('ag_token', t); agRegLoad(); }
 }
 
+function agKeyTable(a) {
+  return `
+    <table>
+      <thead><tr><th>Key</th><th>Nilai</th><th>Model</th><th>Akun</th><th>Aksi</th></tr></thead>
+      <tbody>
+      ${a.keys.map(k => `
+        <tr>
+          <td style="font-size:0.78rem">${k.key_label}</td>
+          <td style="font-family:monospace;font-size:0.75rem">${k.masked_value || '-'}</td>
+          <td style="font-size:0.75rem">${k.model || '-'}</td>
+          <td style="font-size:0.75rem">${k.account_email || '-'}</td>
+          <td style="font-size:0.72rem;color:#64748b">
+            ${k.editable_here
+              ? `<input type="password" id="agreg-edit-${k.id}" placeholder="Key baru..." style="width:110px;display:inline-block;padding:4px 6px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.7rem">
+                 <button class="retry-btn" style="padding:4px 8px;font-size:0.7rem" onclick="agRegEditCustom('${k.id}')">Ganti</button>`
+              : (k.note || 'Lihat /api/v1/credentials')}
+          </td>
+        </tr>
+      `).join('')}
+      </tbody>
+    </table>`;
+}
+
+function renderAgentTree(agents) {
+  const parents = agents.filter(a => !a.parent_agent_name);
+  const childrenByParent = {};
+  agents.filter(a => a.parent_agent_name).forEach(a => {
+    (childrenByParent[a.parent_agent_name] = childrenByParent[a.parent_agent_name] || []).push(a);
+  });
+  // Child yg parent_agent_name-nya tidak cocok agent manapun yg ada (orphan) --
+  // tetap ditampilkan sbg parent sendiri drpd hilang diam-diam dari tampilan.
+  const parentNames = new Set(parents.map(p => p.agent_name));
+  Object.keys(childrenByParent).forEach(pname => {
+    if (!parentNames.has(pname)) parents.push({ agent_name: pname, category: '?', description: '(parent tidak ditemukan)', keys: [] });
+  });
+
+  document.getElementById('agreg-list').innerHTML = parents.map(p => {
+    const children = childrenByParent[p.agent_name] || [];
+    return `
+      <details class="ag-parent">
+        <summary>
+          <b>${p.agent_name}</b>
+          <span class="pill" style="background:#1e3a5f;color:#60a5fa">${p.category}</span>
+          <span class="ag-child-count">${children.length} child</span>
+        </summary>
+        <div style="font-size:0.72rem;color:#94a3b8;margin:8px 0">${p.description || ''}</div>
+        ${p.keys.length ? agKeyTable(p) : ''}
+        ${children.map(c => `
+          <div class="ag-child-box">
+            <div style="margin-bottom:6px">
+              <b style="font-size:0.85rem">${c.agent_name}</b>
+              <span class="pill" style="background:#334155;color:#94a3b8;margin-left:6px">child</span>
+            </div>
+            <div style="font-size:0.7rem;color:#94a3b8;margin-bottom:6px">${c.description || ''}</div>
+            ${agKeyTable(c)}
+          </div>
+        `).join('')}
+      </details>`;
+  }).join('');
+}
+
+function populateParentDropdown(agents) {
+  const sel = document.getElementById('agreg-new-parent');
+  const currentValue = sel.value;
+  const parentNames = [...new Set(agents.filter(a => !a.parent_agent_name).map(a => a.agent_name))].sort();
+  sel.innerHTML = '<option value="">(Tidak ada -- agent mandiri/parent baru)</option>' +
+    parentNames.map(n => `<option value="${n}">${n}</option>`).join('');
+  sel.value = currentValue;
+}
+
 async function agRegLoad() {
   const msgEl = document.getElementById('agreg-msg');
   msgEl.style.color = '#60a5fa';
@@ -213,36 +294,10 @@ async function agRegLoad() {
       return;
     }
     const agents = j.data.agents;
-    document.getElementById('agreg-list').innerHTML = agents.map(a => `
-      <div style="background:#1e293b;border-radius:8px;padding:12px 16px;margin-bottom:10px">
-        <div style="margin-bottom:6px">
-          <b>${a.agent_name}</b>
-          <span class="pill" style="background:#1e3a5f;color:#60a5fa;margin-left:6px">${a.category}</span>
-        </div>
-        <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:8px">${a.description || ''}</div>
-        <table>
-          <thead><tr><th>Key</th><th>Nilai</th><th>Model</th><th>Akun</th><th>Aksi</th></tr></thead>
-          <tbody>
-          ${a.keys.map(k => `
-            <tr>
-              <td style="font-size:0.78rem">${k.key_label}</td>
-              <td style="font-family:monospace;font-size:0.75rem">${k.masked_value || '-'}</td>
-              <td style="font-size:0.75rem">${k.model || '-'}</td>
-              <td style="font-size:0.75rem">${k.account_email || '-'}</td>
-              <td style="font-size:0.72rem;color:#64748b">
-                ${k.editable_here
-                  ? `<input type="password" id="agreg-edit-${k.id}" placeholder="Key baru..." style="width:110px;display:inline-block;padding:4px 6px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.7rem">
-                     <button class="retry-btn" style="padding:4px 8px;font-size:0.7rem" onclick="agRegEditCustom('${k.id}')">Ganti</button>`
-                  : (k.note || 'Lihat /api/v1/credentials')}
-              </td>
-            </tr>
-          `).join('')}
-          </tbody>
-        </table>
-      </div>
-    `).join('');
+    renderAgentTree(agents);
+    populateParentDropdown(agents);
     msgEl.style.color = '#64748b';
-    msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID');
+    msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID') + ` (${agents.length} agent)`;
   } catch (e) {
     msgEl.style.color = '#f87171';
     msgEl.textContent = 'Gagal: ' + e.message;
@@ -279,6 +334,7 @@ async function agRegAddNew() {
     api_key: document.getElementById('agreg-new-apikey').value.trim() || null,
     model: document.getElementById('agreg-new-model').value.trim() || null,
     account_email: document.getElementById('agreg-new-account').value.trim() || null,
+    parent_agent_name: document.getElementById('agreg-new-parent').value || null,
   };
   const msgEl = document.getElementById('agreg-add-msg');
   try {
@@ -293,7 +349,7 @@ async function agRegAddNew() {
     }
     msgEl.style.color = '#4ade80';
     msgEl.textContent = 'Agent ditambahkan!';
-    ['name', 'category', 'desc', 'keylabel', 'apikey', 'model', 'account'].forEach(f => {
+    ['name', 'category', 'desc', 'keylabel', 'apikey', 'model', 'account', 'parent'].forEach(f => {
       document.getElementById('agreg-new-' + f).value = '';
     });
     agRegLoad();
