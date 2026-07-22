@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import json
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.youtube.api_client import fetch_comments_for_video, is_valid_video_id, looks_like_youtube_key
 from app.domain.agent_curl_targets.models import AgentCurlTarget
 from app.services.agent_curl_targets.service import execute_target, get_targets_for_agent
+from app.services.agent_registry.service import get_key_for_agent
 
 
 def _uses_keyword_placeholder(target: AgentCurlTarget) -> bool:
@@ -30,13 +33,17 @@ def _uses_keyword_placeholder(target: AgentCurlTarget) -> bool:
 
 def _extract_video_items(response_json: dict) -> list[dict]:
     """YouTube search.list balikin id.videoId (nested), videos.list
-    balikin id sbg string langsung -- tangani dua-duanya."""
+    balikin id sbg string langsung -- tangani dua-duanya. Item yg
+    id-nya BUKAN format video ID YouTube asli (11 karakter valid)
+    DIBUANG, bukan diterima asal ada nilainya -- mencegah data salah
+    kalau curl target ternyata bukan endpoint video (mis. keliru
+    tertaut ke channel/playlist)."""
     items = response_json.get("items", [])
     normalized = []
     for item in items:
         raw_id = item.get("id")
         video_id = raw_id.get("videoId") if isinstance(raw_id, dict) else raw_id
-        if not video_id:
+        if not is_valid_video_id(video_id):
             continue
         normalized.append({
             "id": video_id,
@@ -87,6 +94,21 @@ async def fetch_via_curl_targets(db: AsyncSession, agent_name: str, keywords: li
                 errors.append({"target_name": target.name, "keyword": kw, "error": error})
             else:
                 all_videos.extend(videos)
+
+    # Ambil komentar JUGA utk video dari crawler (2026-07-22, permintaan
+    # user) -- CUMA kalau agent ini (mis. agent_youtube02) KEBETULAN py
+    # key YouTube Data API asli sendiri (bukan OpenRouter). Kalau
+    # belum, video crawler tetap tanpa komentar spt sebelumnya (bukan
+    # error, cuma kemampuan tambahan yg butuh key yg sesuai).
+    key_info = await get_key_for_agent(db, agent_name)
+    if key_info and looks_like_youtube_key(key_info.get("api_key")):
+        api_key = key_info["api_key"]
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for v in all_videos:
+                v["_comments"] = await fetch_comments_for_video(client, api_key, v["id"])
+    else:
+        for v in all_videos:
+            v["_comments"] = []
 
     return {
         "success": True, "videos": all_videos,
