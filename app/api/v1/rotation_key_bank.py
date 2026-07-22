@@ -51,6 +51,20 @@ async def disable_bank_key(
     return build_success_response({"id": str(entry.id), "status": entry.status})
 
 
+@router.post("/{key_id}/reset", response_model=dict)
+async def reset_bank_key(
+    key_id: uuid.UUID,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Kembalikan key exhausted/disabled jadi 'available' -- masuk
+    antrian rotasi lagi dari awal."""
+    entry = await service.reset_bank_key(db, key_id)
+    if not entry:
+        raise NotFoundError(f"Key bank {key_id} tidak ditemukan")
+    return build_success_response({"id": str(entry.id), "status": entry.status})
+
+
 @router.delete("/{key_id}", response_model=dict)
 async def delete_bank_key(
     key_id: uuid.UUID,

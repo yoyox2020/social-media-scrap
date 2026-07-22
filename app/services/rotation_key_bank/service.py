@@ -82,6 +82,23 @@ async def disable_bank_key(db: AsyncSession, key_id: uuid.UUID) -> RotationKeyBa
     return entry
 
 
+async def reset_bank_key(db: AsyncSession, key_id: uuid.UUID) -> RotationKeyBank | None:
+    """Kembalikan 1 key (exhausted/disabled) jadi 'available' lagi --
+    masuk antrian rotasi dari awal, lepas dari agent yg tadi
+    pakai (kalau ada), bersihkan last_error."""
+    entry = await db.get(RotationKeyBank, key_id)
+    if not entry:
+        return None
+    entry.status = "available"
+    entry.assigned_to_agent = None
+    entry.assigned_at = None
+    entry.last_error = None
+    entry.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(entry)
+    return entry
+
+
 async def get_working_key_for_agent(db: AsyncSession, agent_name: str) -> dict | None:
     """Key yg BENERAN dipakai agent ini sekarang -- cek dulu apakah
     bank sudah assign key pengganti (krn key asli pernah dilaporkan

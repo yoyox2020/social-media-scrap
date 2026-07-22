@@ -1008,7 +1008,7 @@ async function rotasiLoad() {
     }
     const statusColor = { available: '#166534', assigned: '#1e3a5f', exhausted: '#7f1d1d', disabled: '#334155' };
     const statusLabel = { available: 'tersedia', assigned: 'terpakai', exhausted: 'habis/gagal', disabled: 'dimatikan' };
-    document.getElementById('rotasi-list').innerHTML = keys.map(k => `
+    const renderCard = (k, isLog) => `
       <div style="background:#1e293b;border-radius:8px;padding:12px 16px;margin-bottom:10px">
         <div style="margin-bottom:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
           <span class="pill" style="background:#1e3a5f;color:#60a5fa">${k.provider}</span>
@@ -1016,7 +1016,9 @@ async function rotasiLoad() {
           <span class="pill" style="background:${statusColor[k.status] || '#334155'};color:#fff">${statusLabel[k.status] || k.status}</span>
           ${k.assigned_to_agent ? `<span class="pill" style="background:#3a2f18;color:#d1a441">dipakai: ${k.assigned_to_agent}</span>` : ''}
           <div style="margin-left:auto;display:flex;gap:6px">
-            ${k.status !== 'disabled' ? `<button class="retry-btn" style="padding:4px 10px;font-size:0.7rem;background:#78350f" onclick="rotasiDisable('${k.id}')">Matikan</button>` : ''}
+            ${isLog
+              ? `<button class="retry-btn" style="padding:4px 10px;font-size:0.7rem;background:#166534" onclick="rotasiReset('${k.id}')">Reload (masuk antrian lagi)</button>`
+              : `<button class="retry-btn" style="padding:4px 10px;font-size:0.7rem;background:#78350f" onclick="rotasiDisable('${k.id}')">Matikan</button>`}
             <button class="retry-btn" style="padding:4px 10px;font-size:0.7rem;background:#7f1d1d" onclick="rotasiDelete('${k.id}')">Hapus</button>
           </div>
         </div>
@@ -1025,7 +1027,22 @@ async function rotasiLoad() {
           ${k.account_email ? ' &middot; Akun: ' + k.account_email : ''}
         </div>
         ${k.last_error ? `<div style="font-size:0.7rem;color:#c96f5c">Error terakhir: ${k.last_error.slice(0, 200)}</div>` : ''}
-      </div>`).join('');
+      </div>`;
+
+    const activeKeys = keys.filter(k => k.status === 'available' || k.status === 'assigned');
+    const logKeys = keys.filter(k => k.status === 'exhausted' || k.status === 'disabled');
+
+    let html = '';
+    html += `<div style="font-size:0.78rem;font-weight:600;color:#60a5fa;margin-bottom:6px">Aktif (${activeKeys.length})</div>`;
+    html += activeKeys.length
+      ? activeKeys.map(k => renderCard(k, false)).join('')
+      : '<div style="color:#475569;font-style:italic;font-size:0.82rem;margin-bottom:14px">Tidak ada key aktif.</div>';
+    html += `<div style="font-size:0.78rem;font-weight:600;color:#d1a441;margin:16px 0 6px">Log: Sudah Habis / Diganti (${logKeys.length})</div>`;
+    html += logKeys.length
+      ? logKeys.map(k => renderCard(k, true)).join('')
+      : '<div style="color:#475569;font-style:italic;font-size:0.82rem">Belum ada key yg habis/diganti.</div>';
+
+    document.getElementById('rotasi-list').innerHTML = html;
     msgEl.style.color = '#64748b';
     msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID') + ` (${keys.length} key)`;
   } catch (e) {
@@ -1071,6 +1088,20 @@ async function rotasiDisable(id) {
   if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
   try {
     const r = await fetch(window.location.origin + '/api/v1/rotation-bank/' + id + '/disable', {
+      method: 'POST', headers: agAuthHeaders(),
+    });
+    const j = await r.json();
+    if (!r.ok) { alert('Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown')); return; }
+    rotasiLoad();
+  } catch (e) {
+    alert('Gagal: ' + e.message);
+  }
+}
+
+async function rotasiReset(id) {
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/rotation-bank/' + id + '/reset', {
       method: 'POST', headers: agAuthHeaders(),
     });
     const j = await r.json();
