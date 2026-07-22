@@ -23,9 +23,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.activity_log import log_activity
 from app.domain.comments.models import Comment
 from app.domain.posts.models import Post
-from app.services.agent_registry.service import get_key_for_agent
+from app.services.rotation_key_bank.service import get_working_key_for_agent, report_key_failure
 
 AGENT_NAME = "agent-struktur-data"
+AI_KEY_FAILURE_STATUS_CODES = {401, 402, 403, 429}
 AI_SUMMARY_LIMIT = 10
 FALLBACK_AI_MODEL = "openai/gpt-oss-20b:free"
 
@@ -120,7 +121,12 @@ def _compute_scores(item: dict, channels_by_id: dict) -> dict:
     }
 
 
-async def _generate_ai_summary(api_key: str, model: str, title: str, content: str) -> dict | None:
+async def _generate_ai_summary(api_key: str, model: str, title: str, content: str) -> dict:
+    """Balikin {"summary":..,"tags":..} kalau berhasil, ATAU
+    {"error": "<pesan>", "status_code": int|None} kalau gagal --
+    status_code dipakai caller utk tentukan apakah ini kegagalan KEY
+    (401/402/403/429, layak trigger rotasi) atau kegagalan lain
+    (mis. model lagi down sesaat, bukan berarti key-nya mati)."""
     prompt = (
         f"Judul video YouTube: {title}\n"
         f"Deskripsi: {content[:500]}\n\n"
@@ -135,7 +141,7 @@ async def _generate_ai_summary(api_key: str, model: str, title: str, content: st
                 json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
             )
         if resp.status_code != 200:
-            return None
+            return {"error": f"HTTP {resp.status_code}: {resp.text[:300]}", "status_code": resp.status_code}
         data = resp.json()
         text = data["choices"][0]["message"]["content"].strip()
         if text.startswith("```"):
@@ -143,8 +149,8 @@ async def _generate_ai_summary(api_key: str, model: str, title: str, content: st
         import json
         parsed = json.loads(text)
         return {"summary": parsed.get("summary"), "tags": parsed.get("tags", [])}
-    except Exception:
-        return None
+    except Exception as exc:
+        return {"error": str(exc), "status_code": None}
 
 
 async def process_and_save(
@@ -177,21 +183,47 @@ async def process_and_save(
         f"{len(normalized)} video dinormalisasi+diberi skor, {failed_count} gagal validasi (judul/id kosong)",
     )
 
-    ai_key_info = await get_key_for_agent(db, "agent_youtube")
+    ai_key_info = await get_working_key_for_agent(db, "agent_youtube")
     ai_done = 0
+    rotated = False
     if ai_key_info and ai_key_info.get("api_key"):
         model = ai_key_info.get("model") or FALLBACK_AI_MODEL
         if "/" not in model:
             model = FALLBACK_AI_MODEL
         for item in normalized[:AI_SUMMARY_LIMIT]:
             ai_result = await _generate_ai_summary(ai_key_info["api_key"], model, item["title"], item["content"])
-            if ai_result:
+            if "error" not in ai_result:
                 item["ai_summary"] = ai_result.get("summary")
                 item["ai_tags"] = ai_result.get("tags", [])
                 ai_done += 1
-            else:
-                item["ai_summary"] = None
-                item["ai_tags"] = []
+                continue
+
+            item["ai_summary"] = None
+            item["ai_tags"] = []
+            if not rotated and ai_result.get("status_code") in AI_KEY_FAILURE_STATUS_CODES:
+                rotated = True
+                new_key = await report_key_failure(db, "agent_youtube", ai_result["error"])
+                if new_key:
+                    await log_activity(
+                        db, run_id, AGENT_NAME, "key_rotated",
+                        f"Key agent_youtube gagal (HTTP {ai_result.get('status_code')}), "
+                        f"otomatis diganti dgn key baru dari bank rotasi",
+                    )
+                    ai_key_info = new_key
+                    model = new_key.get("model") or FALLBACK_AI_MODEL
+                    if "/" not in model:
+                        model = FALLBACK_AI_MODEL
+                    retry = await _generate_ai_summary(ai_key_info["api_key"], model, item["title"], item["content"])
+                    if "error" not in retry:
+                        item["ai_summary"] = retry.get("summary")
+                        item["ai_tags"] = retry.get("tags", [])
+                        ai_done += 1
+                else:
+                    await log_activity(
+                        db, run_id, AGENT_NAME, "key_rotation_failed",
+                        f"Key agent_youtube gagal (HTTP {ai_result.get('status_code')}) TAPI bank rotasi kosong "
+                        f"(tidak ada key 'available' pengganti)", level="warning",
+                    )
         for item in normalized[AI_SUMMARY_LIMIT:]:
             item["ai_summary"] = None
             item["ai_tags"] = []

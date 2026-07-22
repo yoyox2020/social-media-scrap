@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.api.v1 import agent_curl_targets, agent_registry, auth, credentials, third_party_apis, users, youtube_metadata, youtube_pipeline
+from app.api.v1 import agent_curl_targets, agent_registry, auth, credentials, rotation_key_bank, third_party_apis, users, youtube_metadata, youtube_pipeline
 # Import domain models agar SQLAlchemy mapper bisa resolve relationship.
 # SEMUA tabel lama TETAP di-import (data tidak dihapus), walau endpoint
 # API utk masing2 platform sudah tidak ada -- lihat catatan modul.
@@ -41,6 +41,7 @@ import app.domain.agent_registry.pool_models  # noqa: F401
 import app.domain.third_party_apis.models  # noqa: F401
 import app.domain.agent_curl_targets.models  # noqa: F401
 import app.domain.agent_activity_log.models  # noqa: F401
+import app.domain.rotation_key_bank.models  # noqa: F401
 import app.domain.youtube_discovery.models  # noqa: F401
 import app.domain.youtube_video_metadata.models  # noqa: F401
 import app.domain.threads.models  # noqa: F401
@@ -178,6 +179,7 @@ async def kelola_agent_page():
   <button class="da-tab-btn active" id="tabbtn-agents" onclick="switchMainTab('agents')" style="background:none;border:none;color:#60a5fa;border-bottom:2px solid #60a5fa;padding:8px 16px;font-size:0.85rem;font-weight:600;cursor:pointer">Kelola Agent</button>
   <button class="da-tab-btn" id="tabbtn-apis" onclick="switchMainTab('apis')" style="background:none;border:none;color:#64748b;border-bottom:2px solid transparent;padding:8px 16px;font-size:0.85rem;font-weight:600;cursor:pointer">API Pihak Ketiga</button>
   <button class="da-tab-btn" id="tabbtn-curl" onclick="switchMainTab('curl')" style="background:none;border:none;color:#64748b;border-bottom:2px solid transparent;padding:8px 16px;font-size:0.85rem;font-weight:600;cursor:pointer">Target Curl</button>
+  <button class="da-tab-btn" id="tabbtn-rotasi" onclick="switchMainTab('rotasi')" style="background:none;border:none;color:#64748b;border-bottom:2px solid transparent;padding:8px 16px;font-size:0.85rem;font-weight:600;cursor:pointer">Rotasi API Key</button>
 </div>
 
 <div id="tabpanel-agents">
@@ -297,16 +299,41 @@ async def kelola_agent_page():
 </div>
 </div>
 
+<div id="tabpanel-rotasi" style="display:none">
+<div style="max-width:640px;background:#1e293b;border-radius:8px;padding:16px">
+  <div style="font-size:0.85rem;font-weight:600;margin-bottom:10px">+ Tambah Key ke Bank Rotasi</div>
+  <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:10px">
+    Bank key BERSAMA (OpenRouter, Grok/xAI, dll) -- kalau key aktif 1 agent gagal (401/402/429/dst) saat kerja, sistem OTOMATIS ambil key dari sini utk gantikan, tanpa perlu diklik manual.
+  </div>
+  <input type="text" id="rotasi-new-provider" list="tpa-provider-list" placeholder="Provider (mis. OpenRouter, Grok/xAI)">
+  <input type="password" id="rotasi-new-apikey" placeholder="API key">
+  <input type="text" id="rotasi-new-model" placeholder="Model (opsional, mis. openai/gpt-oss-20b:free)">
+  <input type="text" id="rotasi-new-account" placeholder="Akun/email (opsional)">
+  <button class="retry-btn" onclick="rotasiAddNew()">Tambah ke Bank</button>
+  <span id="rotasi-add-msg" style="margin-left:10px;font-size:0.82rem"></span>
+</div>
+
+<div style="margin-top:20px;margin-bottom:10px">
+  <button class="retry-btn" onclick="rotasiLoad()">Muat / Refresh Bank Rotasi</button>
+  <span id="rotasi-msg" style="margin-left:10px;font-size:0.82rem;color:#64748b"></span>
+</div>
+<div id="rotasi-list" style="margin-bottom:20px">
+  <div style="color:#475569;font-style:italic;font-size:0.82rem">Klik "Muat / Refresh Bank Rotasi" utk mulai.</div>
+</div>
+</div>
+
 <script>
 function switchMainTab(name) {
   document.getElementById('tabpanel-agents').style.display = name === 'agents' ? '' : 'none';
   document.getElementById('tabpanel-apis').style.display = name === 'apis' ? '' : 'none';
   document.getElementById('tabpanel-curl').style.display = name === 'curl' ? '' : 'none';
-  ['agents', 'apis', 'curl'].forEach(n => {
+  document.getElementById('tabpanel-rotasi').style.display = name === 'rotasi' ? '' : 'none';
+  ['agents', 'apis', 'curl', 'rotasi'].forEach(n => {
     const btn = document.getElementById('tabbtn-' + n);
     if (n === name) { btn.style.color = '#60a5fa'; btn.style.borderBottomColor = '#60a5fa'; }
     else { btn.style.color = '#64748b'; btn.style.borderBottomColor = 'transparent'; }
   });
+  if (name === 'rotasi' && agToken()) rotasiLoad();
   if (name === 'apis' && agToken()) tpaLoad();
   if (name === 'curl' && agToken()) curlLoad();
 }
@@ -959,6 +986,116 @@ async function curlExecute(id) {
   }
 }
 
+// ── Tab Rotasi API Key (2026-07-22) ──
+async function rotasiLoad() {
+  const msgEl = document.getElementById('rotasi-msg');
+  msgEl.style.color = '#60a5fa';
+  msgEl.textContent = 'Memuat...';
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/rotation-bank', { headers: agAuthHeaders() });
+    const j = await r.json();
+    if (!r.ok) {
+      msgEl.style.color = '#f87171';
+      msgEl.textContent = 'Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'isi token login dulu');
+      return;
+    }
+    const keys = j.data.keys;
+    if (keys.length === 0) {
+      document.getElementById('rotasi-list').innerHTML = '<div style="color:#475569;font-style:italic;font-size:0.82rem">Belum ada key di bank rotasi. Tambah lewat form di atas.</div>';
+      msgEl.style.color = '#64748b';
+      msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID') + ' (0 key)';
+      return;
+    }
+    const statusColor = { available: '#166534', assigned: '#1e3a5f', exhausted: '#7f1d1d', disabled: '#334155' };
+    const statusLabel = { available: 'tersedia', assigned: 'terpakai', exhausted: 'habis/gagal', disabled: 'dimatikan' };
+    document.getElementById('rotasi-list').innerHTML = keys.map(k => `
+      <div style="background:#1e293b;border-radius:8px;padding:12px 16px;margin-bottom:10px">
+        <div style="margin-bottom:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <span class="pill" style="background:#1e3a5f;color:#60a5fa">${k.provider}</span>
+          ${k.model ? `<span class="pill" style="background:#334155;color:#e2e8f0">${k.model}</span>` : '<span style="font-size:0.7rem;color:#475569;font-style:italic">model tidak diisi</span>'}
+          <span class="pill" style="background:${statusColor[k.status] || '#334155'};color:#fff">${statusLabel[k.status] || k.status}</span>
+          ${k.assigned_to_agent ? `<span class="pill" style="background:#3a2f18;color:#d1a441">dipakai: ${k.assigned_to_agent}</span>` : ''}
+          <div style="margin-left:auto;display:flex;gap:6px">
+            ${k.status !== 'disabled' ? `<button class="retry-btn" style="padding:4px 10px;font-size:0.7rem;background:#78350f" onclick="rotasiDisable('${k.id}')">Matikan</button>` : ''}
+            <button class="retry-btn" style="padding:4px 10px;font-size:0.7rem;background:#7f1d1d" onclick="rotasiDelete('${k.id}')">Hapus</button>
+          </div>
+        </div>
+        <div style="font-size:0.75rem;color:#94a3b8;margin-bottom:4px">
+          Key: <span style="font-family:monospace">${k.masked_key}</span>
+          ${k.account_email ? ' &middot; Akun: ' + k.account_email : ''}
+        </div>
+        ${k.last_error ? `<div style="font-size:0.7rem;color:#c96f5c">Error terakhir: ${k.last_error.slice(0, 200)}</div>` : ''}
+      </div>`).join('');
+    msgEl.style.color = '#64748b';
+    msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID') + ` (${keys.length} key)`;
+  } catch (e) {
+    msgEl.style.color = '#f87171';
+    msgEl.textContent = 'Gagal: ' + e.message;
+  }
+}
+
+async function rotasiAddNew() {
+  const provider = document.getElementById('rotasi-new-provider').value.trim();
+  const apiKey = document.getElementById('rotasi-new-apikey').value.trim();
+  if (!provider || !apiKey) { alert('Provider dan API key wajib diisi'); return; }
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  const body = {
+    provider, api_key: apiKey,
+    model: document.getElementById('rotasi-new-model').value.trim() || null,
+    account_email: document.getElementById('rotasi-new-account').value.trim() || null,
+  };
+  const msgEl = document.getElementById('rotasi-add-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/rotation-bank', {
+      method: 'POST', headers: agAuthHeaders(), body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok) {
+      msgEl.style.color = '#f87171';
+      msgEl.textContent = 'Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown');
+      return;
+    }
+    msgEl.style.color = '#4ade80';
+    msgEl.textContent = 'Key ditambahkan ke bank!';
+    ['provider', 'apikey', 'model', 'account'].forEach(f => {
+      document.getElementById('rotasi-new-' + f).value = '';
+    });
+    rotasiLoad();
+  } catch (e) {
+    msgEl.style.color = '#f87171';
+    msgEl.textContent = 'Gagal: ' + e.message;
+  }
+}
+
+async function rotasiDisable(id) {
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/rotation-bank/' + id + '/disable', {
+      method: 'POST', headers: agAuthHeaders(),
+    });
+    const j = await r.json();
+    if (!r.ok) { alert('Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown')); return; }
+    rotasiLoad();
+  } catch (e) {
+    alert('Gagal: ' + e.message);
+  }
+}
+
+async function rotasiDelete(id) {
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  if (!confirm('Hapus key ini dari bank rotasi? Tidak bisa dibatalkan.')) return;
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/rotation-bank/' + id, {
+      method: 'DELETE', headers: agAuthHeaders(),
+    });
+    const j = await r.json();
+    if (!r.ok) { alert('Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown')); return; }
+    rotasiLoad();
+  } catch (e) {
+    alert('Gagal: ' + e.message);
+  }
+}
+
 const savedToken = localStorage.getItem('ag_token');
 if (savedToken) { document.getElementById('ag-token').value = savedToken; agRegLoad(); }
 </script>
@@ -979,3 +1116,4 @@ app.include_router(third_party_apis.router, prefix=API_PREFIX)
 app.include_router(agent_curl_targets.router, prefix=API_PREFIX)
 app.include_router(youtube_pipeline.router, prefix=API_PREFIX)
 app.include_router(youtube_metadata.router, prefix=API_PREFIX)
+app.include_router(rotation_key_bank.router, prefix=API_PREFIX)
