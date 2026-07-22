@@ -788,6 +788,8 @@ async function curlLoad() {
           <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:6px">${t.description || ''}</div>
           <pre style="background:#0f172a;border:1px solid #334155;border-radius:4px;padding:8px;font-size:0.72rem;color:#a5f3fc;overflow-x:auto;white-space:pre-wrap;word-break:break-all;margin-bottom:6px">${cmd.replace(/</g, '&lt;')}</pre>
           <button class="retry-btn" style="padding:4px 10px;font-size:0.7rem" onclick="curlCopy('${t.id}')">Copy Command</button>
+          <button class="retry-btn" style="padding:4px 10px;font-size:0.7rem;background:#166534" onclick="curlExecute('${t.id}')">Jalankan (Test)</button>
+          <div id="curl-result-${t.id}" style="margin-top:8px"></div>
         </div>`;
     });
     document.getElementById('curl-list').innerHTML = html;
@@ -924,6 +926,35 @@ async function curlDelete(id) {
     curlLoad();
   } catch (e) {
     alert('Gagal: ' + e.message);
+  }
+}
+
+async function curlExecute(id) {
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  const resultEl = document.getElementById('curl-result-' + id);
+  resultEl.innerHTML = '<div style="font-size:0.72rem;color:#60a5fa">Menjalankan...</div>';
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/agent-curl-targets/' + id + '/execute', {
+      method: 'POST', headers: agAuthHeaders(),
+    });
+    const j = await r.json();
+    if (!r.ok) {
+      resultEl.innerHTML = '<div style="font-size:0.72rem;color:#f87171">Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown') + '</div>';
+      return;
+    }
+    const d = j.data;
+    if (d.success) {
+      resultEl.innerHTML =
+        '<div style="font-size:0.72rem;color:#4ade80;margin-bottom:4px">Berhasil -- HTTP ' + d.status_code + ' (' + d.response_length + ' karakter respons)</div>' +
+        '<div style="font-size:0.68rem;color:#64748b;margin-bottom:4px">URL yg benar-benar dikirim: ' + d.resolved_url + '</div>' +
+        '<pre style="background:#0f172a;border:1px solid #334155;border-radius:4px;padding:8px;font-size:0.7rem;color:#94a3b8;overflow-x:auto;white-space:pre-wrap;word-break:break-all;max-height:200px">' + d.response_preview.replace(/</g, '&lt;') + '</pre>';
+    } else {
+      resultEl.innerHTML =
+        '<div style="font-size:0.72rem;color:#f87171;margin-bottom:4px">Gagal dijalankan: ' + d.error + '</div>' +
+        '<div style="font-size:0.68rem;color:#64748b">URL yg dicoba: ' + d.resolved_url + '</div>';
+    }
+  } catch (e) {
+    resultEl.innerHTML = '<div style="font-size:0.72rem;color:#f87171">Gagal: ' + e.message + '</div>';
   }
 }
 

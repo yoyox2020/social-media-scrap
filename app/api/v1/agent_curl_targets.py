@@ -83,3 +83,19 @@ async def delete_curl_target(
     if not ok:
         raise NotFoundError(f"Target curl {target_id} tidak ditemukan")
     return build_success_response({"deleted": True})
+
+
+@router.post("/{target_id}/execute", response_model=dict)
+async def execute_curl_target(
+    target_id: uuid.UUID,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Jalankan target curl ini SUNGGUHAN sekarang (test manual) --
+    placeholder {{NOW}}/{{NOW-Nh}}/dst di-resolve dulu jadi timestamp
+    beneran (Python, bukan JS dashboard), baru request HTTP asli
+    dikirim. Balikin status code + preview response asli."""
+    result = await service.execute_target(db, target_id)
+    if not result:
+        raise NotFoundError(f"Target curl {target_id} tidak ditemukan")
+    return build_success_response(result)

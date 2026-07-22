@@ -1,10 +1,20 @@
 """Target curl per agent -- CRUD (2026-07-22). 1 agent bisa punya
-BANYAK target, beda dari third_party_apis (1:1)."""
+BANYAK target, beda dari third_party_apis (1:1).
+
+`resolve_placeholders()` + `execute_target()` (ditambah 2026-07-22,
+sesi sama) -- SEBELUM ini placeholder {{NOW}}/{{NOW-Nh}} cuma di-resolve
+di JavaScript dashboard (browser), jadi kalau nanti ada worker/agent
+Python yg baca `url` mentah dari tabel ini, dia akan dapat literal
+teks "{{NOW-24h}}" bukan tanggal beneran -- SALAH. Fungsi di sini
+mem-port ulang logika yg SAMA (unit h/d/m) ke Python, dipakai baik oleh
+`execute_target()` (test manual via endpoint) MAUPUN oleh agent/worker
+mana pun nanti yg mau benar2 menjalankan curl ini terjadwal."""
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -81,3 +91,112 @@ async def list_targets(db: AsyncSession) -> list[dict]:
         }
         for t in targets
     ]
+
+
+async def get_targets_for_agent(db: AsyncSession, agent_name: str) -> list[AgentCurlTarget]:
+    """Dipakai agent/worker Python nanti utk ambil SEMUA target curl
+    miliknya sendiri (by nama, cocok pola agent_registry/agent_key_pool)."""
+    return list((await db.scalars(
+        select(AgentCurlTarget).where(
+            AgentCurlTarget.agent_name == agent_name.strip(),
+            AgentCurlTarget.enabled.is_(True),
+        )
+    )).all())
+
+
+def resolve_placeholders(text: str | None) -> str | None:
+    """Ganti {{NOW}}/{{NOW-<n>h}}/{{NOW-<n>d}}/{{NOW-<n>m}} jadi timestamp
+    RFC3339 SUNGGUHAN, dihitung dari waktu saat fungsi ini dipanggil --
+    versi Python dari resolveCurlPlaceholders() di app/main.py (JS).
+    HARUS disinkronkan manual kalau salah satu diubah."""
+    if not text:
+        return text
+    now = datetime.now(timezone.utc)
+    now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    result = text.replace("{{NOW}}", now_str)
+
+    out: list[str] = []
+    i = 0
+    while True:
+        start = result.find("{{NOW-", i)
+        if start == -1:
+            out.append(result[i:])
+            break
+        end = result.find("}}", start)
+        if end == -1:
+            out.append(result[i:])
+            break
+        out.append(result[i:start])
+        token = result[start + 6:end]
+        unit = token[-1:] if token else ""
+        amount_str = token[:-1] if token else ""
+        try:
+            amount = int(amount_str)
+        except ValueError:
+            out.append(result[start:end + 2])
+            i = end + 2
+            continue
+        if unit == "h":
+            delta = timedelta(hours=amount)
+        elif unit == "d":
+            delta = timedelta(days=amount)
+        elif unit == "m":
+            delta = timedelta(minutes=amount)
+        else:
+            out.append(result[start:end + 2])
+            i = end + 2
+            continue
+        out.append((now - delta).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        i = end + 2
+    return "".join(out)
+
+
+def _parse_headers(headers_text: str | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    if not headers_text:
+        return result
+    for line in headers_text.split("\n"):
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        if key:
+            result[key] = value.strip()
+    return result
+
+
+async def execute_target(db: AsyncSession, target_id: uuid.UUID) -> dict | None:
+    """Jalankan target curl ini SUNGGUHAN (test manual dari dashboard) --
+    resolve placeholder dulu, baru kirim request beneran, balikin hasil
+    asli (status code + preview response) supaya user tahu langsung
+    apakah curl-nya jalan tanpa error atau datanya benar2 muncul."""
+    target = await db.get(AgentCurlTarget, target_id)
+    if not target:
+        return None
+
+    url = resolve_placeholders(target.url)
+    headers_resolved = resolve_placeholders(target.headers)
+    body_resolved = resolve_placeholders(target.body)
+    headers_dict = _parse_headers(headers_resolved)
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            resp = await client.request(
+                target.method, url, headers=headers_dict,
+                content=body_resolved.encode() if body_resolved else None,
+            )
+        return {
+            "success": True,
+            "status_code": resp.status_code,
+            "resolved_url": url,
+            "response_preview": resp.text[:2000],
+            "response_length": len(resp.text),
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "status_code": None,
+            "resolved_url": url,
+            "error": str(exc),
+        }
