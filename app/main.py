@@ -221,7 +221,19 @@ async def kelola_agent_page():
     Katalog bebas (Apify, OpenRouter, EnsembleData, Firecrawl, dll). Satu API cuma boleh dipakai satu agent -- pilih agent tujuannya sekalian di sini (opsional, bisa dihubungkan belakangan).
   </div>
   <input type="text" id="tpa-new-name" placeholder="Nama (mis. Apify Akun 1)">
-  <input type="text" id="tpa-new-provider" placeholder="Provider (mis. Apify, OpenRouter, EnsembleData)">
+  <input type="text" id="tpa-new-provider" list="tpa-provider-list" placeholder="Provider (pilih dari daftar atau ketik sendiri)">
+  <datalist id="tpa-provider-list">
+    <option value="Apify">
+    <option value="EnsembleData">
+    <option value="OpenRouter">
+    <option value="Anthropic">
+    <option value="OpenAI">
+    <option value="Firecrawl">
+    <option value="Tavily">
+    <option value="YouTube Data API v3">
+    <option value="Facebook / Meta Graph API">
+    <option value="Instagram (cookie)">
+  </datalist>
   <input type="password" id="tpa-new-apikey" placeholder="API key (opsional)">
   <input type="text" id="tpa-new-baseurl" placeholder="Base URL (opsional)">
   <input type="text" id="tpa-new-account" placeholder="Akun/email (opsional)">
