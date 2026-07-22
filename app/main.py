@@ -253,6 +253,7 @@ async def kelola_agent_page():
   <div style="font-size:0.85rem;font-weight:600;margin-bottom:10px">+ Tambah Target Curl</div>
   <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:10px">
     URL + parameter yg akan dipakai agent utk crawling. Satu agent bisa punya BEBERAPA target curl.
+    Pakai <code>{{NOW}}</code> atau <code>{{NOW-24h}}</code> / <code>{{NOW-7d}}</code> di URL/header/body kalau butuh tanggal yg selalu ikut waktu terkini (dihitung ulang tiap kali dilihat/di-copy, bukan tanggal beku).
   </div>
   <select id="curl-new-agent">
     <option value="">-- pilih agent --</option>
@@ -706,18 +707,45 @@ async function tpaDelete(apiId) {
 }
 
 // ── Tab Target Curl (2026-07-22) ──
+function resolveCurlPlaceholders(text) {
+  if (!text) return text;
+  let result = text.split('{{NOW}}').join(new Date().toISOString());
+  let out = '';
+  let i = 0;
+  while (true) {
+    const start = result.indexOf('{{NOW-', i);
+    if (start === -1) { out += result.slice(i); break; }
+    const end = result.indexOf('}}', start);
+    if (end === -1) { out += result.slice(i); break; }
+    out += result.slice(i, start);
+    const token = result.slice(start + 6, end);
+    const unit = token.slice(-1);
+    const amount = parseInt(token.slice(0, -1), 10);
+    let ms = NaN;
+    if (unit === 'h') ms = amount * 60 * 60 * 1000;
+    else if (unit === 'd') ms = amount * 24 * 60 * 60 * 1000;
+    else if (unit === 'm') ms = amount * 60 * 1000;
+    out += isNaN(ms) ? result.slice(start, end + 2) : new Date(Date.now() - ms).toISOString();
+    i = end + 2;
+  }
+  return out;
+}
+
 function buildCurlCommand(t) {
   const NL = String.fromCharCode(10);
   const BS = String.fromCharCode(92);
   function shQuote(s) { return "'" + String(s).split("'").join("'" + BS + "''") + "'"; }
-  let cmd = 'curl -X ' + t.method + ' ' + shQuote(t.url);
-  if (t.headers) {
-    t.headers.split(NL).map(h => h.trim()).filter(Boolean).forEach(h => {
+  const url = resolveCurlPlaceholders(t.url);
+  const headersResolved = resolveCurlPlaceholders(t.headers);
+  const bodyResolved = resolveCurlPlaceholders(t.body);
+  let cmd = 'curl -X ' + t.method + ' ' + shQuote(url);
+  if (headersResolved) {
+    headersResolved.split(NL).map(h => h.trim()).filter(Boolean).forEach(h => {
       cmd += ' ' + BS + NL + '  -H ' + shQuote(h);
     });
   }
-  if (t.body) {
-    cmd += ' ' + BS + NL + '  --data ' + shQuote(t.body);
+  if (bodyResolved) {
+    cmd += ' ' + BS + NL + '  --data ' + shQuote(bodyResolved);
   }
   return cmd;
 }
