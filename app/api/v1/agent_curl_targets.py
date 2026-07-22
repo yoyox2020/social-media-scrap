@@ -98,4 +98,5 @@ async def execute_curl_target(
     result = await service.execute_target(db, target_id)
     if not result:
         raise NotFoundError(f"Target curl {target_id} tidak ditemukan")
-    return build_success_response(result)
+    result_for_display = {k: v for k, v in result.items() if k != "response_text"}
+    return build_success_response(result_for_display)

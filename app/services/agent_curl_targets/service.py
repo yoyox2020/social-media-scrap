@@ -190,6 +190,7 @@ async def execute_target(db: AsyncSession, target_id: uuid.UUID) -> dict | None:
             "success": True,
             "status_code": resp.status_code,
             "resolved_url": url,
+            "response_text": resp.text,
             "response_preview": resp.text[:2000],
             "response_length": len(resp.text),
         }

@@ -134,6 +134,31 @@ async def update_custom_agent_key(
     return entry
 
 
+async def get_key_for_agent(db: AsyncSession, agent_name: str) -> dict | None:
+    """Ambil key AKTIF SEKARANG milik 1 agent (dipanggil oleh kode
+    agent/pipeline yg BENERAN jalan, 2026-07-22) -- SELALU query ulang
+    ke DB tiap dipanggil, TIDAK di-cache, supaya kalau user ganti key
+    lewat dashboard, pemanggilan BERIKUTNYA otomatis pakai yg baru
+    tanpa perlu redeploy kode. Ambil baris PERTAMA yg enabled+ada key."""
+    entries = (await db.scalars(
+        select(AgentRegistryEntry).where(
+            AgentRegistryEntry.agent_name == agent_name.strip(),
+            AgentRegistryEntry.enabled.is_(True),
+        )
+    )).all()
+    for entry in entries:
+        if entry.linked_credential_id:
+            from app.services.credentials import registry as cred_registry
+            cred_entry = next((e for e in cred_registry.ALL_ENTRIES if e.id == entry.linked_credential_id), None)
+            if cred_entry:
+                value = await cred_registry.get_credential_value(cred_entry)
+                if value:
+                    return {"api_key": value, "model": entry.custom_model, "account_email": entry.account_email}
+        elif entry.custom_api_key:
+            return {"api_key": entry.custom_api_key, "model": entry.custom_model, "account_email": entry.account_email}
+    return None
+
+
 async def delete_agent_entry(db: AsyncSession, entry_id: uuid.UUID) -> bool:
     entry = await db.get(AgentRegistryEntry, entry_id)
     if not entry:

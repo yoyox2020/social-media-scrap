@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.api.v1 import agent_curl_targets, agent_registry, auth, credentials, third_party_apis, users
+from app.api.v1 import agent_curl_targets, agent_registry, auth, credentials, third_party_apis, users, youtube_pipeline
 # Import domain models agar SQLAlchemy mapper bisa resolve relationship.
 # SEMUA tabel lama TETAP di-import (data tidak dihapus), walau endpoint
 # API utk masing2 platform sudah tidak ada -- lihat catatan modul.
@@ -40,6 +40,7 @@ import app.domain.agent_registry.models  # noqa: F401
 import app.domain.agent_registry.pool_models  # noqa: F401
 import app.domain.third_party_apis.models  # noqa: F401
 import app.domain.agent_curl_targets.models  # noqa: F401
+import app.domain.agent_activity_log.models  # noqa: F401
 import app.domain.youtube_discovery.models  # noqa: F401
 import app.domain.youtube_video_metadata.models  # noqa: F401
 import app.domain.threads.models  # noqa: F401
@@ -976,3 +977,4 @@ app.include_router(credentials.router, prefix=API_PREFIX)
 app.include_router(agent_registry.router, prefix=API_PREFIX)
 app.include_router(third_party_apis.router, prefix=API_PREFIX)
 app.include_router(agent_curl_targets.router, prefix=API_PREFIX)
+app.include_router(youtube_pipeline.router, prefix=API_PREFIX)
