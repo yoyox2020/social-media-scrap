@@ -21,13 +21,15 @@ from app.agents.youtube import coordinator
 from app.domain.scrape_runs.models import ScrapeRun
 
 
-async def run_youtube_pipeline(db: AsyncSession, topic: str, max_results: int = 15) -> dict:
+async def run_youtube_pipeline(
+    db: AsyncSession, topic: str, max_results: int = 15, triggered_by: str = "manual_api",
+) -> dict:
     run_id = uuid.uuid4()
     started_at = datetime.now(timezone.utc)
 
     scrape_run = ScrapeRun(
         keyword_text=topic, platform="youtube", api_source="youtube_data_api",
-        status="running", triggered_by="manual_api", started_at=started_at,
+        status="running", triggered_by=triggered_by, started_at=started_at,
     )
     db.add(scrape_run)
     await db.commit()

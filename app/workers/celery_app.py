@@ -1,29 +1,33 @@
 """
 Celery app -- API v2 (2026-07-22).
 
-Kosong (belum ada task/beat_schedule sama sekali) sengaja: SEMUA worker
-platform lama dihapus bersamaan restrukturisasi total (lihat docstring
-app/main.py & project_api_v2_restructure di memory). File ini
-dipertahankan minimal HANYA supaya container `worker`/`worker-ai`/
-`worker-beat` bisa hidup lagi (sebelumnya crash total krn modul
-`app.workers.celery_app` sempat tidak ada).
+Agent lain (agent_facebook, agent_tiktok, dst -- lihat tabel
+`agent_registry`) MASIH kosong tugasnya, tambahkan modul task-nya di
+sini via `include=[...]` dan jadwalnya di `beat_schedule` kalau sudah
+punya kode scraping asli, ikuti pola 6-lapis yang sudah dipakai project
+ini sebelumnya (config -> agent/service -> worker task -> beat schedule
+-> endpoint status -> dashboard).
 
-Kalau agent baru (agent_youtube, agent_facebook, dst -- lihat tabel
-`agent_registry`/`agent_key_pool`) mulai punya kode scraping asli,
-tambahkan modul task-nya di sini via `include=[...]` dan jadwalnya di
-`beat_schedule`, ikuti pola 6-lapis yang sudah dipakai project ini
-sebelumnya (config -> agent/service -> worker task -> beat schedule ->
-endpoint status -> dashboard).
-"""
+YouTube (2026-07-22, permintaan user "crawling otomatis tiap 1 jam
+utk top 20 topik") SUDAH punya jadwal -- lihat
+app/workers/youtube_auto_crawl_worker.py utk detail sumber topik &
+PERINGATAN KUOTA (baru 1 key YouTube asli, kuota bisa habis sblm jadwal
+berikutnya)."""
 from celery import Celery
 
-from app.shared.config import settings
+# Wajib diimport SEBELUM task apa pun jalan -- Celery proses TERPISAH
+# dari app.main (API), jadi mapper registry SQLAlchemy-nya juga
+# terpisah. Tanpa ini, task yg query model dgn relationship string
+# (mis. Comment -> "Sentiment") crash InvalidRequestError begitu ORM
+# pertama kali dipakai (ditemukan 2026-07-22 waktu build auto-crawl).
+import app.infrastructure.database.register_all_models  # noqa: F401,E402
+from app.shared.config import settings  # noqa: E402
 
 celery_app = Celery(
     "social_intelligence",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=[],  # tambahkan modul workers.<agent>_worker di sini kalau sudah ada task asli
+    include=["app.workers.youtube_auto_crawl_worker"],
 )
 
 celery_app.conf.update(
@@ -32,5 +36,10 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="Asia/Jakarta",
     enable_utc=True,
-    beat_schedule={},  # tambahkan jadwal per agent di sini kalau sudah ada task asli
+    beat_schedule={
+        "youtube-auto-crawl-hourly": {
+            "task": "youtube.auto_crawl_top_topics",
+            "schedule": 3600.0,
+        },
+    },
 )

@@ -16,36 +16,13 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.api.v1 import agent_curl_targets, agent_registry, auth, credentials, rotation_key_bank, third_party_apis, users, youtube_metadata, youtube_pipeline
-# Import domain models agar SQLAlchemy mapper bisa resolve relationship.
-# SEMUA tabel lama TETAP di-import (data tidak dihapus), walau endpoint
-# API utk masing2 platform sudah tidak ada -- lihat catatan modul.
-import app.domain.users.models  # noqa: F401
-import app.domain.projects.models  # noqa: F401
-import app.domain.keywords.models  # noqa: F401
-import app.domain.posts.models  # noqa: F401
-import app.domain.comments.models  # noqa: F401
-import app.domain.sentiments.models  # noqa: F401
-import app.domain.entities.models  # noqa: F401
-import app.domain.trends.models  # noqa: F401
-import app.domain.reports.models  # noqa: F401
-import app.domain.trending.models  # noqa: F401
-import app.domain.youtube_analysis.models  # noqa: F401
-import app.domain.search_topics.models  # noqa: F401
-import app.domain.scrape_runs.models  # noqa: F401
-import app.domain.instagram_trending.models  # noqa: F401
-import app.domain.trend_recommendations.models  # noqa: F401
-import app.domain.trend_recommendations.platform_usage_models  # noqa: F401
-import app.domain.agent_registry.models  # noqa: F401
-import app.domain.agent_registry.pool_models  # noqa: F401
-import app.domain.third_party_apis.models  # noqa: F401
-import app.domain.agent_curl_targets.models  # noqa: F401
-import app.domain.agent_activity_log.models  # noqa: F401
-import app.domain.rotation_key_bank.models  # noqa: F401
-import app.domain.youtube_discovery.models  # noqa: F401
-import app.domain.youtube_video_metadata.models  # noqa: F401
-import app.domain.threads.models  # noqa: F401
-import app.domain.viral_tracking.models  # noqa: F401
+from app.api.v1 import agent_curl_targets, agent_registry, auth, credentials, rotation_key_bank, third_party_apis, trend_recommendations, users, youtube_metadata, youtube_pipeline
+# Import SEMUA domain model agar SQLAlchemy mapper bisa resolve
+# relationship (tabel lama TETAP ada, walau endpoint API-nya sudah
+# tidak ada) -- daftar lengkapnya di register_all_models.py, dipakai
+# BARENG app.workers.celery_app supaya proses worker Celery juga py
+# mapper registry yg sama (lihat docstring modul itu).
+import app.infrastructure.database.register_all_models  # noqa: F401
 
 from app.infrastructure.database.connection import engine
 from app.infrastructure.logging.logger import get_logger, setup_logging
@@ -1150,3 +1127,4 @@ app.include_router(agent_curl_targets.router, prefix=API_PREFIX)
 app.include_router(youtube_pipeline.router, prefix=API_PREFIX)
 app.include_router(youtube_metadata.router, prefix=API_PREFIX)
 app.include_router(rotation_key_bank.router, prefix=API_PREFIX)
+app.include_router(trend_recommendations.router, prefix=API_PREFIX)
