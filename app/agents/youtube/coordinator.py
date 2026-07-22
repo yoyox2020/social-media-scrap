@@ -51,26 +51,42 @@ def _distribute_keywords(keywords: list[str], children: list[str]) -> dict[str, 
 
 
 async def _run_child(db: AsyncSession, agent_name: str, caps: dict, kws: list[str], max_results: int) -> dict:
-    videos: list[dict] = []
+    """Lacak video dari jalur API dan jalur curl TERPISAH (2026-07-23,
+    ditemukan saat audit menyeluruh) -- sebelumnya keduanya digabung
+    jadi 1 list lalu SEMUA dilabeli "api_videos" di run_children()
+    (crawler_videos selalu dilaporkan 0 walau curl beneran dapat data).
+    Totalnya tetap benar (tidak ada video hilang), tapi pelaporan
+    asal-data jadi salah -- penting utk monitoring yg diminta user."""
+    api_videos: list[dict] = []
+    curl_videos: list[dict] = []
     channels: dict = {}
     errors: list[str] = []
+    curl_targets_run = 0
+    curl_targets_failed = 0
 
     if caps["api"]:
         for kw in kws:
             r = await api_client.fetch_videos_by_keyword(db, kw, agent_name=agent_name, max_results=max_results)
             if r.get("success"):
-                videos.extend(r.get("videos", []))
+                api_videos.extend(r.get("videos", []))
                 channels.update(r.get("channels", {}))
             else:
                 errors.append(f"[api] {kw}: {r.get('error')}")
 
     if caps["curl"]:
         r = await crawler_client.fetch_via_curl_targets(db, agent_name, keywords=kws)
-        videos.extend(r.get("videos", []))
+        curl_videos.extend(r.get("videos", []))
+        channels.update(r.get("channels", {}))
+        curl_targets_run += r.get("targets_run", 0)
+        curl_targets_failed += r.get("targets_failed", 0)
         for e in r.get("errors", []):
             errors.append(f"[curl] {e.get('target_name')} ({e.get('keyword')}): {e.get('error')}")
 
-    return {"agent_name": agent_name, "keywords": kws, "videos": videos, "channels": channels, "errors": errors}
+    return {
+        "agent_name": agent_name, "keywords": kws, "api_videos": api_videos, "curl_videos": curl_videos,
+        "channels": channels, "errors": errors,
+        "curl_targets_run": curl_targets_run, "curl_targets_failed": curl_targets_failed,
+    }
 
 
 async def run_children(db: AsyncSession, run_id: uuid.UUID, keywords: list[dict], max_results: int = 15) -> dict:
@@ -99,25 +115,37 @@ async def run_children(db: AsyncSession, run_id: uuid.UUID, keywords: list[dict]
     tasks = [_run_child(db, name, candidates[name], kws, max_results) for name, kws in assignment.items()]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    all_videos: list[dict] = []
+    all_api_videos: list[dict] = []
+    all_curl_videos: list[dict] = []
     all_channels: dict = {}
+    total_curl_targets_run = 0
+    total_curl_targets_failed = 0
     for r in results:
         if isinstance(r, Exception):
             await log_activity(db, run_id, AGENT_NAME, "fetch_error", f"exception: {r}", level="error")
             continue
-        level = "error" if (r["errors"] and not r["videos"]) else "info"
+        total_videos_this_child = len(r["api_videos"]) + len(r["curl_videos"])
+        level = "error" if (r["errors"] and not total_videos_this_child) else "info"
         await log_activity(
             db, run_id, r["agent_name"], "fetch_done",
-            f"{r['agent_name']} (keyword={r['keywords']}): {len(r['videos'])} video mentah"
+            f"{r['agent_name']} (keyword={r['keywords']}): {total_videos_this_child} video mentah "
+            f"(api={len(r['api_videos'])}, curl={len(r['curl_videos'])})"
             + (f", error: {r['errors']}" if r["errors"] else ""),
             level=level,
         )
-        all_videos.extend(r["videos"])
+        all_api_videos.extend(r["api_videos"])
+        all_curl_videos.extend(r["curl_videos"])
         all_channels.update(r["channels"])
+        total_curl_targets_run += r["curl_targets_run"]
+        total_curl_targets_failed += r["curl_targets_failed"]
 
     await log_activity(
         db, run_id, AGENT_NAME, "children_merged",
-        f"Semua child selesai, total video mentah (blm dedupe): {len(all_videos)}",
+        f"Semua child selesai, total video mentah (blm dedupe): {len(all_api_videos) + len(all_curl_videos)} "
+        f"(api={len(all_api_videos)}, curl={len(all_curl_videos)})",
     )
 
-    return {"api_videos": all_videos, "api_channels": all_channels, "crawler_videos": [], "crawler_targets_run": 0, "crawler_targets_failed": 0}
+    return {
+        "api_videos": all_api_videos, "api_channels": all_channels, "crawler_videos": all_curl_videos,
+        "crawler_targets_run": total_curl_targets_run, "crawler_targets_failed": total_curl_targets_failed,
+    }

@@ -179,3 +179,22 @@ async def find_api_id_by_agent(db: AsyncSession, agent_name: str) -> uuid.UUID |
         select(ThirdPartyApiAgentLink).where(ThirdPartyApiAgentLink.agent_name == agent_name.strip())
     )
     return link.third_party_api_id if link else None
+
+
+async def get_next_available_key(db: AsyncSession, provider: str) -> ThirdPartyApi | None:
+    """Rotasi GENERIK lintas SEMUA entry `provider` ini yg enabled=True
+    (2026-07-23, permintaan user "auto rotasi berapapun API key yang
+    saya daftarkan") -- utamakan yg BELUM PERNAH error, lalu yg PALING
+    LAMA error (kasih 'istirahat' otomatis tanpa permanen dimatikan --
+    cocok utk kuota yg reset bulanan spt Apify, BUKAN exhausted
+    permanen spt token dicabut). Dipakai execute_target() (curl target)
+    via placeholder {{ROTATE:<Provider>}} -- generik lintas provider
+    APA PUN yg terdaftar di katalog ini, BUKAN Apify-only, supaya
+    provider baru tinggal didaftarkan lewat /manage-api-keys, TANPA
+    kode Python baru."""
+    result = await db.execute(
+        select(ThirdPartyApi)
+        .where(ThirdPartyApi.provider == provider, ThirdPartyApi.enabled.is_(True), ThirdPartyApi.api_key.isnot(None))
+        .order_by(ThirdPartyApi.last_error_at.asc().nulls_first())
+    )
+    return result.scalars().first()

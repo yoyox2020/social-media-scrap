@@ -1,15 +1,12 @@
-"""agent-struktur-data (2026-07-22) -- Data Processor. Terima hasil
-mentah dari agent_youtube01+agent_youtube02 (via coordinator), lalu:
-merge -> dedupe -> normalisasi -> validasi -> lengkapi field kosong ->
-hitung skor (trend/engagement/freshness/authority) -> AI summary+tags
-(best-effort) -> simpan ke DB (transaksi, rollback kalau gagal).
+"""agent-struktur-data utk TikTok (2026-07-23) -- merge/dedupe/
+normalize/score/AI-summary/save, pola SAMA PERSIS dgn versi YouTube
+(app/agents/agent_struktur_data.py) tapi field mapping beda krn bentuk
+data Apify TikTok beda total (playCount bukan viewCount, authorMeta.fans
+bukan subscriberCount, text bukan title+description terpisah, dst).
 
-MVP (versi sederhana): skor pakai formula dasar (bukan model ML),
-AI summary/tags DIBATASI ke video dgn trend_score tertinggi (default
-10) supaya durasi+biaya LLM terkendali -- video lain tetap tersimpan,
-cuma ai_summary/ai_tags-nya kosong. Reuse tabel `posts`/`comments` yg
-SUDAH ADA (bukan bikin tabel baru) -- skor+ai_summary/tags disimpan di
-kolom `metadata_` (JSON, sudah ada, fleksibel)."""
+MIN_VIEWS_FOR_ENGAGEMENT (2026-07-23) diterapkan SEJAK AWAL di sini --
+bug yg sama baru ditemukan+diperbaiki di versi YouTube (video nyaris 0
+views matematis jadi "engagement 100%"), jadi TIDAK diulang di sini."""
 from __future__ import annotations
 
 import math
@@ -29,6 +26,14 @@ AGENT_NAME = "agent-struktur-data"
 AI_KEY_FAILURE_STATUS_CODES = {401, 402, 403, 429}
 AI_SUMMARY_LIMIT = 10
 FALLBACK_AI_MODEL = "openai/gpt-oss-20b:free"
+MIN_VIEWS_FOR_ENGAGEMENT = 50
+
+
+def _safe_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -38,13 +43,6 @@ def _parse_dt(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-
-
-def _safe_int(value) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
 
 
 def _dedupe(videos: list[dict]) -> tuple[list[dict], int]:
@@ -63,44 +61,36 @@ def _dedupe(videos: list[dict]) -> tuple[list[dict], int]:
 
 def _normalize(video: dict) -> dict | None:
     vid = video.get("id")
-    snippet = video.get("snippet") or {}
-    statistics = video.get("statistics") or {}
-    title = snippet.get("title")
-    if not vid or not title:
+    text = video.get("text") or ""
+    author_meta = video.get("authorMeta") or {}
+    if not vid or not (text or author_meta.get("name")):
         return None
 
-    thumbnails = snippet.get("thumbnails") or {}
-    thumb_url = None
-    for size in ("high", "medium", "default"):
-        if thumbnails.get(size, {}).get("url"):
-            thumb_url = thumbnails[size]["url"]
-            break
+    video_meta = video.get("videoMeta") or {}
+    thumb_url = video_meta.get("coverUrl")
 
     return {
         "external_id": vid,
-        "platform": "youtube",
-        "title": title,
-        "content": snippet.get("description") or "",
-        "author": snippet.get("channelTitle") or "",
-        "channel_id": snippet.get("channelId"),
-        "url": f"https://www.youtube.com/watch?v={vid}",
+        "platform": "tiktok",
+        "title": text[:100] if text else (author_meta.get("name") or vid),
+        "content": text,
+        "author": author_meta.get("name") or author_meta.get("nickName") or "",
+        "author_fans": _safe_int(author_meta.get("fans")),
+        "url": video.get("webVideoUrl") or "",
         "media": [{"type": "image", "url": thumb_url}] if thumb_url else [],
         "metrics": {
-            "views": _safe_int(statistics.get("viewCount")),
-            "likes": _safe_int(statistics.get("likeCount")),
-            "comments": _safe_int(statistics.get("commentCount")),
-            "shares": 0,
+            "views": _safe_int(video.get("playCount")),
+            "likes": _safe_int(video.get("diggCount")),
+            "comments": _safe_int(video.get("commentCount")),
+            "shares": _safe_int(video.get("shareCount")),
         },
-        "published_at": _parse_dt(snippet.get("publishedAt")),
+        "published_at": _parse_dt(video.get("createTimeISO")),
         "raw_data": video,
         "comments_raw": video.get("_comments", []),
     }
 
 
-MIN_VIEWS_FOR_ENGAGEMENT = 50
-
-
-def _compute_scores(item: dict, channels_by_id: dict) -> dict:
+def _compute_scores(item: dict) -> dict:
     metrics = item["metrics"]
     views = metrics["views"]
     now = datetime.now(timezone.utc)
@@ -108,20 +98,14 @@ def _compute_scores(item: dict, channels_by_id: dict) -> dict:
     hours_since = max((now - published_at).total_seconds() / 3600, 0)
 
     freshness_score = max(0.0, 100.0 - (hours_since * 2))
-    # Video dgn views hampir 0 (mis. 1 view+1 like) matematis jadi
-    # "engagement 100%" kalau langsung dibagi -- bukan genuinely
-    # engaging, cuma sample terlalu kecil utk rasio bermakna (ditemukan
-    # 2026-07-23: video 0-1 views nangkring di atas ranking trend_score,
-    # ngalahin video jutaan views asli). Di bawah ambang ini, anggap
-    # data belum cukup -- engagement_score=0, bukan dihitung asal.
     if views < MIN_VIEWS_FOR_ENGAGEMENT:
         engagement_score = 0.0
     else:
-        engagement_score = min(100.0, ((metrics["likes"] + metrics["comments"] * 2) / views) * 100)
+        engagement_score = min(
+            100.0, ((metrics["likes"] + metrics["comments"] * 2 + metrics["shares"] * 3) / views) * 100
+        )
 
-    channel = channels_by_id.get(item.get("channel_id"), {})
-    subscriber_count = _safe_int((channel.get("statistics") or {}).get("subscriberCount"))
-    authority_score = min(100.0, math.log10(subscriber_count + 1) * 12) if subscriber_count else 40.0
+    authority_score = min(100.0, math.log10(item["author_fans"] + 1) * 12) if item["author_fans"] else 40.0
 
     trend_score = round((freshness_score * 0.4) + (engagement_score * 0.35) + (authority_score * 0.25), 2)
 
@@ -134,14 +118,9 @@ def _compute_scores(item: dict, channels_by_id: dict) -> dict:
 
 
 async def _generate_ai_summary(api_key: str, model: str, title: str, content: str) -> dict:
-    """Balikin {"summary":..,"tags":..} kalau berhasil, ATAU
-    {"error": "<pesan>", "status_code": int|None} kalau gagal --
-    status_code dipakai caller utk tentukan apakah ini kegagalan KEY
-    (401/402/403/429, layak trigger rotasi) atau kegagalan lain
-    (mis. model lagi down sesaat, bukan berarti key-nya mati)."""
     prompt = (
-        f"Judul video YouTube: {title}\n"
-        f"Deskripsi: {content[:500]}\n\n"
+        f"Caption video TikTok: {title}\n"
+        f"Isi: {content[:500]}\n\n"
         "Buat ringkasan singkat (maks 2 kalimat, Bahasa Indonesia) dan 3-5 tag topik singkat. "
         "Balas HANYA JSON valid format: {\"summary\": \"...\", \"tags\": [\"...\"]}"
     )
@@ -165,14 +144,9 @@ async def _generate_ai_summary(api_key: str, model: str, title: str, content: st
         return {"error": str(exc), "status_code": None}
 
 
-async def process_and_save(
-    db: AsyncSession, run_id: uuid.UUID, topic: str, api_videos: list[dict],
-    api_channels: dict, crawler_videos: list[dict],
-) -> dict:
-    all_videos = api_videos + crawler_videos
-    total_before_dedupe = len(all_videos)
-
-    deduped, duplicate_count = _dedupe(all_videos)
+async def process_and_save(db: AsyncSession, run_id: uuid.UUID, topic: str, videos: list[dict]) -> dict:
+    total_before_dedupe = len(videos)
+    deduped, duplicate_count = _dedupe(videos)
     await log_activity(
         db, run_id, AGENT_NAME, "merge_dedupe",
         f"Merge {total_before_dedupe} video mentah -> {len(deduped)} unik ({duplicate_count} duplikat dihapus)",
@@ -185,17 +159,16 @@ async def process_and_save(
         if n is None:
             failed_count += 1
             continue
-        n["scores"] = _compute_scores(n, api_channels)
+        n["scores"] = _compute_scores(n)
         normalized.append(n)
 
     normalized.sort(key=lambda x: x["scores"]["trend_score"], reverse=True)
-
     await log_activity(
         db, run_id, AGENT_NAME, "normalize_score",
-        f"{len(normalized)} video dinormalisasi+diberi skor, {failed_count} gagal validasi (judul/id kosong)",
+        f"{len(normalized)} video dinormalisasi+diberi skor, {failed_count} gagal validasi (id/teks kosong)",
     )
 
-    ai_key_info = await get_working_key_for_agent(db, "agent_youtube")
+    ai_key_info = await get_working_key_for_agent(db, "agent_tiktok")
     ai_done = 0
     rotated = False
     if ai_key_info and ai_key_info.get("api_key"):
@@ -209,18 +182,12 @@ async def process_and_save(
                 item["ai_tags"] = ai_result.get("tags", [])
                 ai_done += 1
                 continue
-
             item["ai_summary"] = None
             item["ai_tags"] = []
             if not rotated and ai_result.get("status_code") in AI_KEY_FAILURE_STATUS_CODES:
                 rotated = True
-                new_key = await report_key_failure(db, "agent_youtube", ai_result["error"])
+                new_key = await report_key_failure(db, "agent_tiktok", ai_result["error"])
                 if new_key:
-                    await log_activity(
-                        db, run_id, AGENT_NAME, "key_rotated",
-                        f"Key agent_youtube gagal (HTTP {ai_result.get('status_code')}), "
-                        f"otomatis diganti dgn key baru dari bank rotasi",
-                    )
                     ai_key_info = new_key
                     model = new_key.get("model") or FALLBACK_AI_MODEL
                     if "/" not in model:
@@ -230,19 +197,12 @@ async def process_and_save(
                         item["ai_summary"] = retry.get("summary")
                         item["ai_tags"] = retry.get("tags", [])
                         ai_done += 1
-                else:
-                    await log_activity(
-                        db, run_id, AGENT_NAME, "key_rotation_failed",
-                        f"Key agent_youtube gagal (HTTP {ai_result.get('status_code')}) TAPI bank rotasi kosong "
-                        f"(tidak ada key 'available' pengganti)", level="warning",
-                    )
         for item in normalized[AI_SUMMARY_LIMIT:]:
             item["ai_summary"] = None
             item["ai_tags"] = []
         await log_activity(
             db, run_id, AGENT_NAME, "ai_summary",
-            f"AI summary/tags berhasil utk {ai_done}/{min(len(normalized), AI_SUMMARY_LIMIT)} video "
-            f"(dibatasi {AI_SUMMARY_LIMIT} teratas by trend_score), model={model}",
+            f"AI summary/tags berhasil utk {ai_done}/{min(len(normalized), AI_SUMMARY_LIMIT)} video, model={model}",
         )
     else:
         for item in normalized:
@@ -250,7 +210,7 @@ async def process_and_save(
             item["ai_tags"] = []
         await log_activity(
             db, run_id, AGENT_NAME, "ai_summary",
-            "AI summary dilewati -- agent_youtube belum punya key aktif", level="warning",
+            "AI summary dilewati -- agent_tiktok belum punya key aktif", level="warning",
         )
 
     saved_count = 0
@@ -258,16 +218,11 @@ async def process_and_save(
     try:
         for item in normalized:
             existing = await db.scalar(
-                select(Post).where(Post.external_id == item["external_id"], Post.platform == "youtube")
+                select(Post).where(Post.external_id == item["external_id"], Post.platform == "tiktok")
             )
             old_meta = (existing.metadata_ or {}) if existing else {}
-            # JANGAN timpa ai_summary/ai_tags dgn None kalau run SEBELUMNYA
-            # sudah berhasil bikin ringkasan tapi run INI tidak
-            # mencakup video ini di top-10-nya sendiri -- pertahankan yg lama.
             ai_summary = item["ai_summary"] or old_meta.get("ai_summary")
             ai_tags = item["ai_tags"] or old_meta.get("ai_tags") or []
-            # source_topic jadi daftar SEMUA topik yg pernah nemuin video ini,
-            # bukan cuma topik run TERAKHIR (biar histori pencarian tidak hilang).
             prev_topics = old_meta.get("source_topics") or ([old_meta["source_topic"]] if old_meta.get("source_topic") else [])
             source_topics = list(dict.fromkeys([*prev_topics, topic]))
             metadata = {
@@ -277,9 +232,9 @@ async def process_and_save(
                 "authority_score": item["scores"]["authority_score"],
                 "ai_summary": ai_summary,
                 "ai_tags": ai_tags,
-                "source_topic": topic,  # topik run TERAKHIR (backward-compat)
-                "source_topics": source_topics,  # SEMUA topik yg pernah nemuin video ini
-                "channel_id": item.get("channel_id"),
+                "source_topic": topic,
+                "source_topics": source_topics,
+                "author_fans": item.get("author_fans"),
             }
             if existing:
                 existing.title = item["title"]
@@ -295,7 +250,7 @@ async def process_and_save(
                 post_row = existing
             else:
                 post_row = Post(
-                    external_id=item["external_id"], platform="youtube", title=item["title"],
+                    external_id=item["external_id"], platform="tiktok", title=item["title"],
                     content=item["content"], author=item["author"], url=item["url"],
                     media=item["media"], metrics=item["metrics"], metadata_=metadata,
                     raw_data=item["raw_data"], published_at=item["published_at"],
@@ -306,10 +261,8 @@ async def process_and_save(
                 saved_count += 1
 
             for c in item.get("comments_raw", []):
-                try:
-                    top_comment = c["snippet"]["topLevelComment"]["snippet"]
-                    external_comment_id = c["snippet"]["topLevelComment"]["id"]
-                except (KeyError, TypeError):
+                external_comment_id = c.get("cid")
+                if not external_comment_id:
                     continue
                 existing_comment = await db.scalar(
                     select(Comment).where(Comment.post_id == post_row.id, Comment.external_id == external_comment_id)
@@ -318,10 +271,10 @@ async def process_and_save(
                     continue
                 db.add(Comment(
                     post_id=post_row.id, external_id=external_comment_id,
-                    content=top_comment.get("textDisplay") or "",
-                    author=top_comment.get("authorDisplayName") or "",
-                    metadata_={"like_count": top_comment.get("likeCount")},
-                    published_at=_parse_dt(top_comment.get("publishedAt")),
+                    content=c.get("text") or "",
+                    author=c.get("uniqueId") or "",
+                    metadata_={"like_count": c.get("diggCount")},
+                    published_at=_parse_dt(c.get("createTimeISO")),
                 ))
 
         await db.commit()
@@ -330,8 +283,6 @@ async def process_and_save(
         await log_activity(db, run_id, AGENT_NAME, "save_failed", f"Rollback -- gagal simpan: {exc}", level="error")
         raise
 
-    unique_channels = len({v.get("channel_id") for v in normalized if v.get("channel_id")})
-
     await log_activity(
         db, run_id, AGENT_NAME, "save_done",
         f"Tersimpan: {saved_count} baru, {duplicate_in_db} diperbarui (sudah ada sebelumnya)",
@@ -339,7 +290,6 @@ async def process_and_save(
 
     return {
         "total_video": len(normalized),
-        "total_channel": unique_channels,
         "saved_to_database": saved_count,
         "duplicate_removed": duplicate_count + duplicate_in_db,
         "failed": failed_count,

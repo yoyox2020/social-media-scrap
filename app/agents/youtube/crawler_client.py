@@ -100,17 +100,35 @@ async def fetch_via_curl_targets(db: AsyncSession, agent_name: str, keywords: li
     # key YouTube Data API asli sendiri (bukan OpenRouter). Kalau
     # belum, video crawler tetap tanpa komentar spt sebelumnya (bukan
     # error, cuma kemampuan tambahan yg butuh key yg sesuai).
+    #
+    # Channel/subscriber count JUGA (2026-07-23, ditemukan saat audit
+    # menyeluruh) -- SEBELUM ini video dari jalur curl SELALU dapat
+    # authority_score default 40.0 (28% dari post YouTube tersimpan,
+    # verified via DB) krn crawler_client tidak pernah panggil
+    # channels.list spt jalur api_client. Sekarang disamakan -- kalau
+    # agent ini py key YouTube asli, ambil channel data jg.
     key_info = await get_key_for_agent(db, agent_name)
+    channels_by_id: dict = {}
     if key_info and looks_like_youtube_key(key_info.get("api_key")):
         api_key = key_info["api_key"]
         async with httpx.AsyncClient(timeout=30.0) as client:
             for v in all_videos:
                 v["_comments"] = await fetch_comments_for_video(client, api_key, v["id"])
+
+            channel_ids = list({v["snippet"]["channelId"] for v in all_videos if v.get("snippet", {}).get("channelId")})
+            if channel_ids:
+                resp = await client.get(
+                    "https://www.googleapis.com/youtube/v3/channels",
+                    params={"part": "snippet,statistics", "id": ",".join(channel_ids), "key": api_key},
+                )
+                if resp.status_code == 200:
+                    for ch in resp.json().get("items", []):
+                        channels_by_id[ch["id"]] = ch
     else:
         for v in all_videos:
             v["_comments"] = []
 
     return {
-        "success": True, "videos": all_videos,
+        "success": True, "videos": all_videos, "channels": channels_by_id,
         "targets_run": runs_attempted, "targets_failed": failed_count, "errors": errors,
     }
