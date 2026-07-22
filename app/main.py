@@ -278,7 +278,13 @@ function agKeyTable(a) {
         <tr>
           <td style="font-size:0.78rem">${k.key_label}</td>
           <td style="font-family:monospace;font-size:0.75rem">${k.masked_value || '-'}</td>
-          <td style="font-size:0.75rem">${k.model || '-'}</td>
+          <td style="font-size:0.75rem">
+            ${k.editable_here
+              ? `<div style="margin-bottom:2px">${k.model || '<i style="color:#475569">(kosong)</i>'}</div>
+                 <input type="text" id="agreg-editmodel-${k.id}" placeholder="Model baru..." style="width:110px;display:inline-block;padding:4px 6px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.7rem">
+                 <button class="retry-btn" style="padding:4px 8px;font-size:0.7rem" onclick="agRegEditModel('${k.id}')">Ganti</button>`
+              : (k.model || '-')}
+          </td>
           <td style="font-size:0.75rem">${k.account_email || '-'}</td>
           <td style="font-size:0.72rem;color:#64748b">
             ${k.editable_here
@@ -407,6 +413,24 @@ async function agRegEditCustom(id) {
   }
 }
 
+async function agRegEditModel(id) {
+  const input = document.getElementById('agreg-editmodel-' + id);
+  const value = input.value.trim();
+  if (!value) return;
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/agent-registry/' + id, {
+      method: 'PATCH', headers: agAuthHeaders(), body: JSON.stringify({ model: value }),
+    });
+    const j = await r.json();
+    if (!r.ok) { alert('Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown')); return; }
+    input.value = '';
+    agRegLoad();
+  } catch (e) {
+    alert('Gagal: ' + e.message);
+  }
+}
+
 async function agRegClearCustom(id) {
   if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
   if (!confirm('Hapus key agent ini? Agent akan tercatat tanpa key sampai diisi ulang.')) return;
@@ -479,7 +503,6 @@ async function tpaLoad() {
       msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID') + ' (0 API)';
       return;
     }
-    const agentOptions = (window.__allAgentNames || []).map(n => `<option value="${n}">${n}</option>`).join('');
     document.getElementById('tpa-list').innerHTML = apis.map(a => `
       <div style="background:#1e293b;border-radius:8px;padding:12px 16px;margin-bottom:10px">
         <div style="margin-bottom:6px;display:flex;align-items:center;gap:6px">
@@ -499,14 +522,13 @@ async function tpaLoad() {
             ? `<span class="pill" style="background:#334155;color:#e2e8f0">${a.linked_agent} <a href="#" onclick="tpaUnlink('${a.id}','${a.linked_agent}');return false" style="color:#f87171;text-decoration:none;margin-left:4px">&times;</a></span>`
             : '<i>belum ada</i>'}
         </div>
-        ${!a.linked_agent ? `
         <div style="display:flex;gap:6px">
           <select id="tpa-linksel-${a.id}" style="width:auto;flex:1;margin-bottom:0">
-            <option value="">-- pilih agent utk dihubungkan --</option>
-            ${agentOptions}
+            <option value="">-- tidak ada agent --</option>
+            ${(window.__allAgentNames || []).map(n => `<option value="${n}" ${n === a.linked_agent ? 'selected' : ''}>${n}</option>`).join('')}
           </select>
-          <button class="retry-btn" style="padding:6px 12px;font-size:0.75rem" onclick="tpaLink('${a.id}')">Hubungkan</button>
-        </div>` : ''}
+          <button class="retry-btn" style="padding:6px 12px;font-size:0.75rem" onclick="tpaReassign('${a.id}', ${a.linked_agent ? `'${a.linked_agent}'` : 'null'})">${a.linked_agent ? 'Ganti Agent' : 'Hubungkan'}</button>
+        </div>
       </div>
     `).join('');
     msgEl.style.color = '#64748b';
@@ -554,17 +576,24 @@ async function tpaAddNew() {
   }
 }
 
-async function tpaLink(apiId) {
+async function tpaReassign(apiId, currentAgent) {
   const sel = document.getElementById('tpa-linksel-' + apiId);
   const agentName = sel.value;
-  if (!agentName) { alert('Pilih agent dulu'); return; }
   if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  if (agentName === (currentAgent || '')) { return; }
+  if (!agentName) { return tpaUnlink(apiId, currentAgent); }
   try {
-    const r = await fetch(window.location.origin + '/api/v1/third-party-apis/' + apiId + '/link', {
+    if (currentAgent) {
+      const r1 = await fetch(window.location.origin + '/api/v1/third-party-apis/' + apiId + '/unlink', {
+        method: 'POST', headers: agAuthHeaders(), body: JSON.stringify({ agent_name: currentAgent }),
+      });
+      if (!r1.ok) { const j1 = await r1.json(); alert('Gagal lepas agent lama: ' + ((j1.error && j1.error.message) || 'unknown')); return; }
+    }
+    const r2 = await fetch(window.location.origin + '/api/v1/third-party-apis/' + apiId + '/link', {
       method: 'POST', headers: agAuthHeaders(), body: JSON.stringify({ agent_name: agentName }),
     });
-    const j = await r.json();
-    if (!r.ok) { alert('Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown')); return; }
+    const j2 = await r2.json();
+    if (!r2.ok) { alert('Gagal: ' + ((j2.error && j2.error.message) || j2.detail || j2.message || 'unknown')); return; }
     tpaLoad();
   } catch (e) {
     alert('Gagal: ' + e.message);
