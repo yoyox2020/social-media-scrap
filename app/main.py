@@ -258,15 +258,29 @@ async def kelola_agent_page():
     <option value="">-- pilih agent --</option>
   </select>
   <input type="text" id="curl-new-name" placeholder="Nama target (mis. Trending Page TikTok)">
-  <input type="text" id="curl-new-url" placeholder="URL (mis. https://api.example.com/v1/search?q=...)">
-  <select id="curl-new-method">
-    <option value="GET">GET</option>
-    <option value="POST">POST</option>
-    <option value="PUT">PUT</option>
-    <option value="DELETE">DELETE</option>
-  </select>
-  <textarea id="curl-new-headers" placeholder="Header, 1 per baris (mis. Authorization: Bearer xxx)" rows="3" style="width:100%;padding:8px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.8rem;margin-bottom:8px;font-family:monospace"></textarea>
-  <textarea id="curl-new-body" placeholder="Body (opsional, utk POST/PUT)" rows="2" style="width:100%;padding:8px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.8rem;margin-bottom:8px;font-family:monospace"></textarea>
+
+  <div style="display:flex;gap:4px;margin-bottom:10px">
+    <button type="button" class="retry-btn" id="curl-mode-btn-form" style="background:#1d4ed8" onclick="curlSwitchMode('form')">Form Terstruktur</button>
+    <button type="button" class="retry-btn" id="curl-mode-btn-paste" style="background:#334155" onclick="curlSwitchMode('paste')">Tempel Command Curl</button>
+  </div>
+
+  <div id="curl-mode-form">
+    <input type="text" id="curl-new-url" placeholder="URL (mis. https://api.example.com/v1/search?q=...)">
+    <select id="curl-new-method">
+      <option value="GET">GET</option>
+      <option value="POST">POST</option>
+      <option value="PUT">PUT</option>
+      <option value="DELETE">DELETE</option>
+    </select>
+    <textarea id="curl-new-headers" placeholder="Header, 1 per baris (mis. Authorization: Bearer xxx)" rows="3" style="width:100%;padding:8px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.8rem;margin-bottom:8px;font-family:monospace"></textarea>
+    <textarea id="curl-new-body" placeholder="Body (opsional, utk POST/PUT)" rows="2" style="width:100%;padding:8px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.8rem;margin-bottom:8px;font-family:monospace"></textarea>
+  </div>
+
+  <div id="curl-mode-paste" style="display:none">
+    <div style="font-size:0.7rem;color:#94a3b8;margin-bottom:6px">Tempel command curl lengkap, URL/method/header/body-nya akan diambil otomatis.</div>
+    <textarea id="curl-new-rawcmd" placeholder="curl -X POST 'https://api.example.com/v1/search' -H 'Authorization: Bearer xxx' --data '{&quot;q&quot;:&quot;test&quot;}'" rows="5" style="width:100%;padding:8px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.8rem;margin-bottom:8px;font-family:monospace"></textarea>
+  </div>
+
   <input type="text" id="curl-new-desc" placeholder="Deskripsi singkat (opsional)">
   <button class="retry-btn" onclick="curlAddNew()">Tambah Target</button>
   <span id="curl-add-msg" style="margin-left:10px;font-size:0.82rem"></span>
@@ -766,18 +780,82 @@ function curlCopy(id) {
   navigator.clipboard.writeText(cmd).then(() => alert('Command curl disalin!')).catch(() => alert('Gagal menyalin, salin manual dari kotak di atas.'));
 }
 
+window.__curlMode = 'form';
+function curlSwitchMode(mode) {
+  window.__curlMode = mode;
+  document.getElementById('curl-mode-form').style.display = mode === 'form' ? '' : 'none';
+  document.getElementById('curl-mode-paste').style.display = mode === 'paste' ? '' : 'none';
+  document.getElementById('curl-mode-btn-form').style.background = mode === 'form' ? '#1d4ed8' : '#334155';
+  document.getElementById('curl-mode-btn-paste').style.background = mode === 'paste' ? '#1d4ed8' : '#334155';
+}
+
+function parseCurlCommand(raw) {
+  const NL = String.fromCharCode(10);
+  const TAB = String.fromCharCode(9);
+  const CR = String.fromCharCode(13);
+  function isWS(ch) { return ch === ' ' || ch === TAB || ch === NL || ch === CR; }
+  const tokens = [];
+  const s = raw.trim();
+  let i = 0;
+  while (i < s.length) {
+    while (i < s.length && isWS(s[i])) i++;
+    if (i >= s.length) break;
+    if (s[i] === "'" || s[i] === '"') {
+      const quote = s[i]; i++;
+      let val = '';
+      while (i < s.length && s[i] !== quote) { val += s[i]; i++; }
+      i++;
+      tokens.push(val);
+    } else {
+      let val = '';
+      while (i < s.length && !isWS(s[i])) { val += s[i]; i++; }
+      tokens.push(val);
+    }
+  }
+  let method = 'GET';
+  let url = '';
+  const headerLines = [];
+  let body = null;
+  for (let idx = 0; idx < tokens.length; idx++) {
+    const tok = tokens[idx];
+    if (tok === 'curl') continue;
+    if (tok === '-X' || tok === '--request') { method = (tokens[++idx] || method).toUpperCase(); continue; }
+    if (tok === '-H' || tok === '--header') { const h = tokens[++idx]; if (h) headerLines.push(h); continue; }
+    if (tok === '-d' || tok === '--data' || tok === '--data-raw' || tok === '--data-binary' || tok === '--data-urlencode') {
+      body = tokens[++idx] || body;
+      continue;
+    }
+    if (tok.indexOf('-') === 0) continue;
+    if (!url && (tok.indexOf('http://') === 0 || tok.indexOf('https://') === 0)) { url = tok; continue; }
+  }
+  if (body && method === 'GET') method = 'POST';
+  return { method, url, headers: headerLines.join(NL), body };
+}
+
 async function curlAddNew() {
   const agentName = document.getElementById('curl-new-agent').value;
   const name = document.getElementById('curl-new-name').value.trim();
-  const url = document.getElementById('curl-new-url').value.trim();
   if (!agentName) { alert('Pilih agent dulu'); return; }
-  if (!name || !url) { alert('Nama dan URL wajib diisi'); return; }
+  if (!name) { alert('Nama target wajib diisi'); return; }
   if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+
+  let url, method, headers, bodyData;
+  if (window.__curlMode === 'paste') {
+    const raw = document.getElementById('curl-new-rawcmd').value.trim();
+    if (!raw) { alert('Tempel command curl dulu'); return; }
+    const parsed = parseCurlCommand(raw);
+    if (!parsed.url) { alert('URL tidak terbaca dari command curl, cek lagi formatnya'); return; }
+    url = parsed.url; method = parsed.method; headers = parsed.headers || null; bodyData = parsed.body || null;
+  } else {
+    url = document.getElementById('curl-new-url').value.trim();
+    if (!url) { alert('URL wajib diisi'); return; }
+    method = document.getElementById('curl-new-method').value;
+    headers = document.getElementById('curl-new-headers').value.trim() || null;
+    bodyData = document.getElementById('curl-new-body').value.trim() || null;
+  }
+
   const body = {
-    agent_name: agentName, name, url,
-    method: document.getElementById('curl-new-method').value,
-    headers: document.getElementById('curl-new-headers').value.trim() || null,
-    body: document.getElementById('curl-new-body').value.trim() || null,
+    agent_name: agentName, name, url, method, headers, body: bodyData,
     description: document.getElementById('curl-new-desc').value.trim() || null,
   };
   const msgEl = document.getElementById('curl-add-msg');
@@ -793,8 +871,9 @@ async function curlAddNew() {
     }
     msgEl.style.color = '#4ade80';
     msgEl.textContent = 'Target ditambahkan!';
-    ['name', 'url', 'headers', 'body', 'desc'].forEach(f => {
-      document.getElementById('curl-new-' + f).value = '';
+    ['name', 'url', 'headers', 'body', 'desc', 'rawcmd'].forEach(f => {
+      const el = document.getElementById('curl-new-' + f);
+      if (el) el.value = '';
     });
     document.getElementById('curl-new-agent').value = '';
     document.getElementById('curl-new-method').value = 'GET';
