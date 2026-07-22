@@ -260,9 +260,11 @@ function renderAgentTree(agents) {
         ${p.keys.length ? agKeyTable(p) : ''}
         ${children.map(c => `
           <div class="ag-child-box">
-            <div style="margin-bottom:6px">
+            <div style="margin-bottom:6px;display:flex;align-items:center;gap:6px">
               <b style="font-size:0.85rem">${c.agent_name}</b>
-              <span class="pill" style="background:#334155;color:#94a3b8;margin-left:6px">child</span>
+              <span class="pill" style="background:#334155;color:#94a3b8">child</span>
+              <button class="retry-btn" style="margin-left:auto;padding:4px 10px;font-size:0.7rem;background:#7f1d1d"
+                onclick="agRegDeleteAgent('${c.agent_name}', '${c.keys.map(k => k.id).join(',')}')">Hapus</button>
             </div>
             <div style="font-size:0.7rem;color:#94a3b8;margin-bottom:6px">${c.description || ''}</div>
             ${agKeyTable(c)}
@@ -301,6 +303,22 @@ async function agRegLoad() {
   } catch (e) {
     msgEl.style.color = '#f87171';
     msgEl.textContent = 'Gagal: ' + e.message;
+  }
+}
+
+async function agRegDeleteAgent(agentName, keyIdsCsv) {
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  if (!confirm(`Hapus agent "${agentName}" beserta semua key-nya? Tidak bisa dibatalkan.`)) return;
+  const ids = keyIdsCsv.split(',').filter(Boolean);
+  try {
+    for (const id of ids) {
+      await fetch(window.location.origin + '/api/v1/agent-registry/' + id, {
+        method: 'DELETE', headers: agAuthHeaders(),
+      });
+    }
+    agRegLoad();
+  } catch (e) {
+    alert('Gagal hapus: ' + e.message);
   }
 }
 
