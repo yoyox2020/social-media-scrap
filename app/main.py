@@ -374,6 +374,7 @@ function agKeyTable(a) {
               : (k.note || 'Lihat /api/v1/credentials')}
           </td>
         </tr>
+        ${k.last_error ? `<tr><td colspan="5" style="font-size:0.7rem;color:#c96f5c;padding-top:0">&#9888; Error terakhir (${new Date(k.last_error_at).toLocaleString('id-ID')}): ${k.last_error.slice(0, 200)}</td></tr>` : ''}
       `).join('')}
       </tbody>
     </table>`;

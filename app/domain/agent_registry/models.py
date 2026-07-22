@@ -34,5 +34,10 @@ class AgentRegistryEntry(Base, UUIDMixin):
     custom_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_custom: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Log error/habis TERAKHIR (2026-07-22, permintaan user) -- SAMA
+    # pola dgn third_party_apis, tapi cakupan LEBIH LUAS krn kebanyakan
+    # agent py key LANGSUNG di sini (bukan lewat katalog pihak ketiga).
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

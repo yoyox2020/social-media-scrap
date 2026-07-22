@@ -72,6 +72,8 @@ async def list_agents(db: AsyncSession) -> list[dict]:
                 "linked_credential_id": row.linked_credential_id,
                 "model": None, "account_email": row.account_email, "editable_here": False,
                 "note": "Diedit lewat /manage-api-keys (shared/pool) atau tab Pengaturan agent ini.",
+                "last_error": row.last_error,
+                "last_error_at": row.last_error_at.isoformat() if row.last_error_at else None,
             })
         else:
             bucket["keys"].append({
@@ -80,6 +82,8 @@ async def list_agents(db: AsyncSession) -> list[dict]:
                 "linked_credential_id": None,
                 "model": row.custom_model, "account_email": row.account_email, "editable_here": True,
                 "note": "Agent custom -- belum tentu py kode scraping asli, ini cuma pencatatan." if row.is_custom else None,
+                "last_error": row.last_error,
+                "last_error_at": row.last_error_at.isoformat() if row.last_error_at else None,
             })
     return list(agents.values())
 
@@ -132,6 +136,25 @@ async def update_custom_agent_key(
     await db.commit()
     await db.refresh(entry)
     return entry
+
+
+async def mark_agent_error(db: AsyncSession, agent_name: str, error_message: str) -> None:
+    """Catat error TERAKHIR (2026-07-22, permintaan user) -- tampil di
+    kartu "Kelola Agent". Cakupan LEBIH LUAS drpd third_party_apis krn
+    kebanyakan agent py key LANGSUNG di sini. Tandai baris PERTAMA yg
+    enabled=True (baris yg sama dipakai get_key_for_agent)."""
+    entry = await db.scalar(
+        select(AgentRegistryEntry).where(
+            AgentRegistryEntry.agent_name == agent_name.strip(),
+            AgentRegistryEntry.enabled.is_(True),
+        )
+    )
+    if not entry:
+        return
+    entry.last_error = error_message[:2000]
+    entry.last_error_at = datetime.now(timezone.utc)
+    entry.updated_at = datetime.now(timezone.utc)
+    await db.commit()
 
 
 async def get_key_for_agent(db: AsyncSession, agent_name: str) -> dict | None:
