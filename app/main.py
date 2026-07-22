@@ -283,7 +283,8 @@ function agKeyTable(a) {
           <td style="font-size:0.72rem;color:#64748b">
             ${k.editable_here
               ? `<input type="password" id="agreg-edit-${k.id}" placeholder="Key baru..." style="width:110px;display:inline-block;padding:4px 6px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.7rem">
-                 <button class="retry-btn" style="padding:4px 8px;font-size:0.7rem" onclick="agRegEditCustom('${k.id}')">Ganti</button>`
+                 <button class="retry-btn" style="padding:4px 8px;font-size:0.7rem" onclick="agRegEditCustom('${k.id}')">Ganti</button>
+                 ${k.is_set ? `<button class="retry-btn" style="padding:4px 8px;font-size:0.7rem;background:#7f1d1d" onclick="agRegClearCustom('${k.id}')">Hapus Key</button>` : ''}`
               : (k.note || 'Lihat /api/v1/credentials')}
           </td>
         </tr>
@@ -406,6 +407,21 @@ async function agRegEditCustom(id) {
   }
 }
 
+async function agRegClearCustom(id) {
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  if (!confirm('Hapus key agent ini? Agent akan tercatat tanpa key sampai diisi ulang.')) return;
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/agent-registry/' + id, {
+      method: 'PATCH', headers: agAuthHeaders(), body: JSON.stringify({ api_key: '' }),
+    });
+    const j = await r.json();
+    if (!r.ok) { alert('Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown')); return; }
+    agRegLoad();
+  } catch (e) {
+    alert('Gagal: ' + e.message);
+  }
+}
+
 async function agRegAddNew() {
   const name = document.getElementById('agreg-new-name').value.trim();
   if (!name) { alert('Nama agent wajib diisi'); return; }
@@ -457,6 +473,12 @@ async function tpaLoad() {
       return;
     }
     const apis = j.data.apis;
+    if (apis.length === 0) {
+      document.getElementById('tpa-list').innerHTML = '<div style="color:#475569;font-style:italic;font-size:0.82rem">Belum ada API pihak ketiga terdaftar. Tambah lewat form di atas.</div>';
+      msgEl.style.color = '#64748b';
+      msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID') + ' (0 API)';
+      return;
+    }
     const agentOptions = (window.__allAgentNames || []).map(n => `<option value="${n}">${n}</option>`).join('');
     document.getElementById('tpa-list').innerHTML = apis.map(a => `
       <div style="background:#1e293b;border-radius:8px;padding:12px 16px;margin-bottom:10px">
