@@ -1,8 +1,9 @@
-"""agent_youtube01 -- child "API": ambil data video/channel/comments via
-YouTube Data API v3 LANGSUNG (2026-07-22). Key SELALU diambil ulang dari
-agent_registry saat dipanggil (lihat get_key_for_agent), tidak pernah
-hardcode -- kalau user ganti key lewat dashboard, run berikutnya otomatis
-pakai yg baru.
+"""Child "API" YouTube Data API v3 (2026-07-22) -- BISA dipanggil oleh
+child mana pun (agent_youtube01, atau child lain yg dibagi kerjanya via
+distribusi keyword), bukan cuma agent_youtube01 hardcode. Key SELALU
+diambil ulang dari agent_registry/third_party_apis saat dipanggil
+(lihat get_key_for_agent), tidak pernah hardcode -- kalau user ganti
+key lewat dashboard, run berikutnya otomatis pakai yg baru.
 
 MVP (versi sederhana, sesuai permintaan user "yang penting bisa jalan
 dulu"): video+channel+statistics+comments. Caption/transcript/live/
@@ -16,20 +17,30 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.agent_registry.service import get_key_for_agent
 
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
-AGENT_NAME = "agent_youtube01"
+
+
+def looks_like_youtube_key(api_key: str | None) -> bool:
+    """Heuristik: key YouTube Data API asli SELALU mulai 'AIza' (format
+    Google API key) -- beda dari key OpenRouter ('sk-or-v1-...'). Dipakai
+    utk saring child mana yg BENERAN punya key YouTube (bukan cuma key
+    LLM yg kebetulan tersimpan di kolom yg sama)."""
+    return bool(api_key) and api_key.startswith("AIza")
 
 
 async def fetch_videos_by_keyword(
-    db: AsyncSession, keyword: str, max_results: int = 15, region_code: str = "ID",
+    db: AsyncSession, keyword: str, agent_name: str, max_results: int = 15, region_code: str = "ID",
 ) -> dict:
     """Cari video by keyword (search.list) -> ambil detail lengkap
     (videos.list part=snippet,statistics,contentDetails) -> ambil channel
     (channels.list) -> ambil sebagian comment (commentThreads.list, best
     effort -- video yg comment-nya dimatikan/private akan gagal, itu
-    normal, tidak menggagalkan keseluruhan)."""
-    key_info = await get_key_for_agent(db, AGENT_NAME)
+    normal, tidak menggagalkan keseluruhan). `agent_name` menentukan key
+    SIAPA yg dipakai -- BUKAN selalu agent_youtube01."""
+    key_info = await get_key_for_agent(db, agent_name)
     if not key_info or not key_info.get("api_key"):
-        return {"success": False, "error": f"Agent '{AGENT_NAME}' belum punya key aktif di agent_registry", "videos": [], "channels": {}}
+        return {"success": False, "error": f"Agent '{agent_name}' belum punya key aktif", "videos": [], "channels": {}}
+    if not looks_like_youtube_key(key_info["api_key"]):
+        return {"success": False, "error": f"Agent '{agent_name}' key-nya bukan format YouTube Data API (AIza...)", "videos": [], "channels": {}}
 
     api_key = key_info["api_key"]
 

@@ -156,7 +156,32 @@ async def get_key_for_agent(db: AsyncSession, agent_name: str) -> dict | None:
                     return {"api_key": value, "model": entry.custom_model, "account_email": entry.account_email}
         elif entry.custom_api_key:
             return {"api_key": entry.custom_api_key, "model": entry.custom_model, "account_email": entry.account_email}
+
+    # Fallback: cek katalog "API Pihak Ketiga" (third_party_apis) -- agent
+    # bisa juga dapat key dari sana (link 1:1), BUKAN cuma dari baris
+    # agent_registry-nya sendiri. Ditambah 2026-07-22 krn user simpan
+    # sebagian key lewat katalog itu, bukan langsung di sini.
+    from app.domain.third_party_apis.models import ThirdPartyApi, ThirdPartyApiAgentLink
+    link = await db.scalar(
+        select(ThirdPartyApiAgentLink).where(ThirdPartyApiAgentLink.agent_name == agent_name.strip())
+    )
+    if link:
+        api = await db.get(ThirdPartyApi, link.third_party_api_id)
+        if api and api.enabled and api.api_key:
+            return {"api_key": api.api_key, "model": None, "account_email": api.account_email}
     return None
+
+
+async def get_enabled_children(db: AsyncSession, parent_agent_name: str) -> list[str]:
+    """Nama semua child agent yg AKTIF (enabled=True) milik 1 parent --
+    dipakai utk membagi kerja (mis. keyword pencarian) antar child."""
+    rows = (await db.scalars(
+        select(AgentRegistryEntry.agent_name).where(
+            AgentRegistryEntry.parent_agent_name == parent_agent_name.strip(),
+            AgentRegistryEntry.enabled.is_(True),
+        ).distinct()
+    )).all()
+    return list(rows)
 
 
 async def delete_agent_entry(db: AsyncSession, entry_id: uuid.UUID) -> bool:
