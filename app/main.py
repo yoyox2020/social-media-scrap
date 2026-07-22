@@ -207,14 +207,6 @@ async def kelola_agent_page():
 </div>
 
 <div id="tabpanel-apis" style="display:none">
-<div style="margin-bottom:10px">
-  <button class="retry-btn" onclick="tpaLoad()">Muat / Refresh API Pihak Ketiga</button>
-  <span id="tpa-msg" style="margin-left:10px;font-size:0.82rem;color:#64748b"></span>
-</div>
-<div id="tpa-list" style="margin-bottom:20px">
-  <div style="color:#475569;font-style:italic;font-size:0.82rem">Klik "Muat / Refresh API Pihak Ketiga" utk mulai.</div>
-</div>
-
 <div style="max-width:560px;background:#1e293b;border-radius:8px;padding:16px">
   <div style="font-size:0.85rem;font-weight:600;margin-bottom:10px">+ Tambah API Pihak Ketiga</div>
   <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:10px">
@@ -243,6 +235,14 @@ async def kelola_agent_page():
   </select>
   <button class="retry-btn" onclick="tpaAddNew()">Tambah API</button>
   <span id="tpa-add-msg" style="margin-left:10px;font-size:0.82rem"></span>
+</div>
+
+<div style="margin-top:20px;margin-bottom:10px">
+  <button class="retry-btn" onclick="tpaLoad()">Muat / Refresh API Pihak Ketiga</button>
+  <span id="tpa-msg" style="margin-left:10px;font-size:0.82rem;color:#64748b"></span>
+</div>
+<div id="tpa-list" style="margin-bottom:20px">
+  <div style="color:#475569;font-style:italic;font-size:0.82rem">Klik "Muat / Refresh API Pihak Ketiga" utk mulai.</div>
 </div>
 </div>
 
