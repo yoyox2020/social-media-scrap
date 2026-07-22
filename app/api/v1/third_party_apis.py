@@ -25,6 +25,7 @@ class AddApiRequest(BaseModel):
     base_url: str | None = Field(default=None, max_length=500)
     account_email: str | None = Field(default=None, max_length=255)
     description: str | None = Field(default=None, max_length=2000)
+    agent_name: str | None = Field(default=None, max_length=255)
 
 
 class UpdateApiRequest(BaseModel):
@@ -55,6 +56,7 @@ async def add_api(
 ):
     entry = await service.add_api(
         db, body.name, body.provider, body.api_key, body.base_url, body.account_email, body.description,
+        agent_name=body.agent_name,
     )
     return build_success_response({"id": str(entry.id), "name": entry.name})
 

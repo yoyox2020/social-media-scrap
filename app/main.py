@@ -218,7 +218,7 @@ async def kelola_agent_page():
 <div style="max-width:560px;background:#1e293b;border-radius:8px;padding:16px">
   <div style="font-size:0.85rem;font-weight:600;margin-bottom:10px">+ Tambah API Pihak Ketiga</div>
   <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:10px">
-    Katalog bebas (Apify, OpenRouter, EnsembleData, Firecrawl, dll) -- bisa dihubungkan ke agent mana saja setelah ditambah.
+    Katalog bebas (Apify, OpenRouter, EnsembleData, Firecrawl, dll). Satu API cuma boleh dipakai satu agent -- pilih agent tujuannya sekalian di sini (opsional, bisa dihubungkan belakangan).
   </div>
   <input type="text" id="tpa-new-name" placeholder="Nama (mis. Apify Akun 1)">
   <input type="text" id="tpa-new-provider" placeholder="Provider (mis. Apify, OpenRouter, EnsembleData)">
@@ -226,6 +226,9 @@ async def kelola_agent_page():
   <input type="text" id="tpa-new-baseurl" placeholder="Base URL (opsional)">
   <input type="text" id="tpa-new-account" placeholder="Akun/email (opsional)">
   <input type="text" id="tpa-new-desc" placeholder="Deskripsi singkat (opsional)">
+  <select id="tpa-new-agent">
+    <option value="">(Belum dihubungkan ke agent manapun)</option>
+  </select>
   <button class="retry-btn" onclick="tpaAddNew()">Tambah API</button>
   <span id="tpa-add-msg" style="margin-left:10px;font-size:0.82rem"></span>
 </div>
@@ -335,13 +338,20 @@ async function agRegLoad() {
     const j = await r.json();
     if (!r.ok) {
       msgEl.style.color = '#f87171';
-      msgEl.textContent = 'Gagal: ' + (j.detail || j.message || 'isi token login dulu');
+      msgEl.textContent = 'Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'isi token login dulu');
       return;
     }
     const agents = j.data.agents;
     renderAgentTree(agents);
     populateParentDropdown(agents);
     window.__allAgentNames = agents.map(a => a.agent_name).sort();
+    const tpaSel = document.getElementById('tpa-new-agent');
+    if (tpaSel) {
+      const cur = tpaSel.value;
+      tpaSel.innerHTML = '<option value="">(Belum dihubungkan ke agent manapun)</option>' +
+        window.__allAgentNames.map(n => `<option value="${n}">${n}</option>`).join('');
+      tpaSel.value = cur;
+    }
     msgEl.style.color = '#64748b';
     msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID') + ` (${agents.length} agent)`;
   } catch (e) {
@@ -376,7 +386,7 @@ async function agRegEditCustom(id) {
       method: 'PATCH', headers: agAuthHeaders(), body: JSON.stringify({ api_key: value }),
     });
     const j = await r.json();
-    if (!r.ok) { alert('Gagal: ' + (j.detail || j.message || 'unknown')); return; }
+    if (!r.ok) { alert('Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown')); return; }
     input.value = '';
     agRegLoad();
   } catch (e) {
@@ -406,7 +416,7 @@ async function agRegAddNew() {
     const j = await r.json();
     if (!r.ok) {
       msgEl.style.color = '#f87171';
-      msgEl.textContent = 'Gagal: ' + (j.detail || j.message || 'unknown');
+      msgEl.textContent = 'Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown');
       return;
     }
     msgEl.style.color = '#4ade80';
@@ -431,7 +441,7 @@ async function tpaLoad() {
     const j = await r.json();
     if (!r.ok) {
       msgEl.style.color = '#f87171';
-      msgEl.textContent = 'Gagal: ' + (j.detail || j.message || 'isi token login dulu');
+      msgEl.textContent = 'Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'isi token login dulu');
       return;
     }
     const apis = j.data.apis;
@@ -451,17 +461,18 @@ async function tpaLoad() {
           ${a.account_email ? ' &middot; Akun: ' + a.account_email : ''}
         </div>
         <div style="font-size:0.72rem;color:#64748b;margin-bottom:6px">Dipakai agent:
-          ${a.linked_agents.length
-            ? a.linked_agents.map(ag => `<span class="pill" style="background:#334155;color:#e2e8f0;margin-right:4px">${ag} <a href="#" onclick="tpaUnlink('${a.id}','${ag}');return false" style="color:#f87171;text-decoration:none;margin-left:4px">&times;</a></span>`).join('')
+          ${a.linked_agent
+            ? `<span class="pill" style="background:#334155;color:#e2e8f0">${a.linked_agent} <a href="#" onclick="tpaUnlink('${a.id}','${a.linked_agent}');return false" style="color:#f87171;text-decoration:none;margin-left:4px">&times;</a></span>`
             : '<i>belum ada</i>'}
         </div>
+        ${!a.linked_agent ? `
         <div style="display:flex;gap:6px">
           <select id="tpa-linksel-${a.id}" style="width:auto;flex:1;margin-bottom:0">
             <option value="">-- pilih agent utk dihubungkan --</option>
             ${agentOptions}
           </select>
           <button class="retry-btn" style="padding:6px 12px;font-size:0.75rem" onclick="tpaLink('${a.id}')">Hubungkan</button>
-        </div>
+        </div>` : ''}
       </div>
     `).join('');
     msgEl.style.color = '#64748b';
@@ -483,6 +494,7 @@ async function tpaAddNew() {
     base_url: document.getElementById('tpa-new-baseurl').value.trim() || null,
     account_email: document.getElementById('tpa-new-account').value.trim() || null,
     description: document.getElementById('tpa-new-desc').value.trim() || null,
+    agent_name: document.getElementById('tpa-new-agent').value || null,
   };
   const msgEl = document.getElementById('tpa-add-msg');
   try {
@@ -492,7 +504,7 @@ async function tpaAddNew() {
     const j = await r.json();
     if (!r.ok) {
       msgEl.style.color = '#f87171';
-      msgEl.textContent = 'Gagal: ' + (j.detail || j.message || 'unknown');
+      msgEl.textContent = 'Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown');
       return;
     }
     msgEl.style.color = '#4ade80';
@@ -500,6 +512,7 @@ async function tpaAddNew() {
     ['name', 'provider', 'apikey', 'baseurl', 'account', 'desc'].forEach(f => {
       document.getElementById('tpa-new-' + f).value = '';
     });
+    document.getElementById('tpa-new-agent').value = '';
     tpaLoad();
   } catch (e) {
     msgEl.style.color = '#f87171';
@@ -517,7 +530,7 @@ async function tpaLink(apiId) {
       method: 'POST', headers: agAuthHeaders(), body: JSON.stringify({ agent_name: agentName }),
     });
     const j = await r.json();
-    if (!r.ok) { alert('Gagal: ' + (j.detail || j.message || 'unknown')); return; }
+    if (!r.ok) { alert('Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown')); return; }
     tpaLoad();
   } catch (e) {
     alert('Gagal: ' + e.message);
@@ -531,7 +544,7 @@ async function tpaUnlink(apiId, agentName) {
       method: 'POST', headers: agAuthHeaders(), body: JSON.stringify({ agent_name: agentName }),
     });
     const j = await r.json();
-    if (!r.ok) { alert('Gagal: ' + (j.detail || j.message || 'unknown')); return; }
+    if (!r.ok) { alert('Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown')); return; }
     tpaLoad();
   } catch (e) {
     alert('Gagal: ' + e.message);
@@ -546,7 +559,7 @@ async function tpaDelete(apiId) {
       method: 'DELETE', headers: agAuthHeaders(),
     });
     const j = await r.json();
-    if (!r.ok) { alert('Gagal: ' + (j.detail || j.message || 'unknown')); return; }
+    if (!r.ok) { alert('Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown')); return; }
     tpaLoad();
   } catch (e) {
     alert('Gagal: ' + e.message);
