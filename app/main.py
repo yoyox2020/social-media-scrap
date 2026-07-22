@@ -506,9 +506,10 @@ async function tpaLoad() {
     document.getElementById('tpa-list').innerHTML = apis.map(a => `
       <div style="background:#1e293b;border-radius:8px;padding:12px 16px;margin-bottom:10px">
         <div style="margin-bottom:6px;display:flex;align-items:center;gap:6px">
-          <b>${a.name}</b>
+          <input type="text" id="tpa-editname-${a.id}" value="${a.name}" style="width:180px;padding:4px 6px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.8rem;font-weight:600;margin-bottom:0">
           <span class="pill" style="background:#1e3a5f;color:#60a5fa">${a.provider}</span>
           ${!a.enabled ? '<span class="pill" style="background:#450a0a;color:#f87171">nonaktif</span>' : ''}
+          <button class="retry-btn" style="padding:4px 8px;font-size:0.7rem" onclick="tpaRename('${a.id}')">Simpan Nama</button>
           <button class="retry-btn" style="margin-left:auto;padding:4px 10px;font-size:0.7rem;background:#7f1d1d" onclick="tpaDelete('${a.id}')">Hapus</button>
         </div>
         <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:4px">${a.description || ''}</div>
@@ -573,6 +574,23 @@ async function tpaAddNew() {
   } catch (e) {
     msgEl.style.color = '#f87171';
     msgEl.textContent = 'Gagal: ' + e.message;
+  }
+}
+
+async function tpaRename(apiId) {
+  const input = document.getElementById('tpa-editname-' + apiId);
+  const value = input.value.trim();
+  if (!value) { alert('Nama tidak boleh kosong'); return; }
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/third-party-apis/' + apiId, {
+      method: 'PATCH', headers: agAuthHeaders(), body: JSON.stringify({ name: value }),
+    });
+    const j = await r.json();
+    if (!r.ok) { alert('Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown')); return; }
+    tpaLoad();
+  } catch (e) {
+    alert('Gagal: ' + e.message);
   }
 }
 
