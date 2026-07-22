@@ -216,14 +216,25 @@ async def process_and_save(
             existing = await db.scalar(
                 select(Post).where(Post.external_id == item["external_id"], Post.platform == "youtube")
             )
+            old_meta = (existing.metadata_ or {}) if existing else {}
+            # JANGAN timpa ai_summary/ai_tags dgn None kalau run SEBELUMNYA
+            # sudah berhasil bikin ringkasan tapi run INI tidak
+            # mencakup video ini di top-10-nya sendiri -- pertahankan yg lama.
+            ai_summary = item["ai_summary"] or old_meta.get("ai_summary")
+            ai_tags = item["ai_tags"] or old_meta.get("ai_tags") or []
+            # source_topic jadi daftar SEMUA topik yg pernah nemuin video ini,
+            # bukan cuma topik run TERAKHIR (biar histori pencarian tidak hilang).
+            prev_topics = old_meta.get("source_topics") or ([old_meta["source_topic"]] if old_meta.get("source_topic") else [])
+            source_topics = list(dict.fromkeys([*prev_topics, topic]))
             metadata = {
                 "trend_score": item["scores"]["trend_score"],
                 "engagement_score": item["scores"]["engagement_score"],
                 "freshness_score": item["scores"]["freshness_score"],
                 "authority_score": item["scores"]["authority_score"],
-                "ai_summary": item["ai_summary"],
-                "ai_tags": item["ai_tags"],
-                "source_topic": topic,
+                "ai_summary": ai_summary,
+                "ai_tags": ai_tags,
+                "source_topic": topic,  # topik run TERAKHIR (backward-compat)
+                "source_topics": source_topics,  # SEMUA topik yg pernah nemuin video ini
                 "channel_id": item.get("channel_id"),
             }
             if existing:
