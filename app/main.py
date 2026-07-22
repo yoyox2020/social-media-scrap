@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.api.v1 import agent_registry, auth, credentials, users
+from app.api.v1 import agent_registry, auth, credentials, third_party_apis, users
 # Import domain models agar SQLAlchemy mapper bisa resolve relationship.
 # SEMUA tabel lama TETAP di-import (data tidak dihapus), walau endpoint
 # API utk masing2 platform sudah tidak ada -- lihat catatan modul.
@@ -38,6 +38,7 @@ import app.domain.trend_recommendations.models  # noqa: F401
 import app.domain.trend_recommendations.platform_usage_models  # noqa: F401
 import app.domain.agent_registry.models  # noqa: F401
 import app.domain.agent_registry.pool_models  # noqa: F401
+import app.domain.third_party_apis.models  # noqa: F401
 import app.domain.youtube_discovery.models  # noqa: F401
 import app.domain.youtube_video_metadata.models  # noqa: F401
 import app.domain.threads.models  # noqa: F401
@@ -164,13 +165,19 @@ async def kelola_agent_page():
 <body>
 
 <h1>Kelola Agent</h1>
-<div class="subtitle">Katalog semua agent AI + key/model. API v2 -- direstrukturisasi 2026-07-22.</div>
+<div class="subtitle">Katalog semua agent AI + key/model + API pihak ketiga. API v2 -- direstrukturisasi 2026-07-22.</div>
 
 <div style="max-width:420px;margin-bottom:20px;padding:12px 16px;background:#1e293b;border-radius:8px">
   <label style="font-size:0.8rem;color:#94a3b8">Token login (Bearer) admin -- tempel sekali, tersimpan di browser ini saja.</label>
   <input type="password" id="ag-token" placeholder="Bearer token admin..." onchange="agSaveToken()">
 </div>
 
+<div class="da-tabbar" style="display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid #1e293b">
+  <button class="da-tab-btn active" id="tabbtn-agents" onclick="switchMainTab('agents')" style="background:none;border:none;color:#60a5fa;border-bottom:2px solid #60a5fa;padding:8px 16px;font-size:0.85rem;font-weight:600;cursor:pointer">Kelola Agent</button>
+  <button class="da-tab-btn" id="tabbtn-apis" onclick="switchMainTab('apis')" style="background:none;border:none;color:#64748b;border-bottom:2px solid transparent;padding:8px 16px;font-size:0.85rem;font-weight:600;cursor:pointer">API Pihak Ketiga</button>
+</div>
+
+<div id="tabpanel-agents">
 <div style="margin-bottom:10px">
   <button class="retry-btn" onclick="agRegLoad()">Muat / Refresh Daftar Agent</button>
   <span id="agreg-msg" style="margin-left:10px;font-size:0.82rem;color:#64748b"></span>
@@ -197,8 +204,44 @@ async def kelola_agent_page():
   <button class="retry-btn" onclick="agRegAddNew()">Tambah Agent</button>
   <span id="agreg-add-msg" style="margin-left:10px;font-size:0.82rem"></span>
 </div>
+</div>
+
+<div id="tabpanel-apis" style="display:none">
+<div style="margin-bottom:10px">
+  <button class="retry-btn" onclick="tpaLoad()">Muat / Refresh API Pihak Ketiga</button>
+  <span id="tpa-msg" style="margin-left:10px;font-size:0.82rem;color:#64748b"></span>
+</div>
+<div id="tpa-list" style="margin-bottom:20px">
+  <div style="color:#475569;font-style:italic;font-size:0.82rem">Klik "Muat / Refresh API Pihak Ketiga" utk mulai.</div>
+</div>
+
+<div style="max-width:560px;background:#1e293b;border-radius:8px;padding:16px">
+  <div style="font-size:0.85rem;font-weight:600;margin-bottom:10px">+ Tambah API Pihak Ketiga</div>
+  <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:10px">
+    Katalog bebas (Apify, OpenRouter, EnsembleData, Firecrawl, dll) -- bisa dihubungkan ke agent mana saja setelah ditambah.
+  </div>
+  <input type="text" id="tpa-new-name" placeholder="Nama (mis. Apify Akun 1)">
+  <input type="text" id="tpa-new-provider" placeholder="Provider (mis. Apify, OpenRouter, EnsembleData)">
+  <input type="password" id="tpa-new-apikey" placeholder="API key (opsional)">
+  <input type="text" id="tpa-new-baseurl" placeholder="Base URL (opsional)">
+  <input type="text" id="tpa-new-account" placeholder="Akun/email (opsional)">
+  <input type="text" id="tpa-new-desc" placeholder="Deskripsi singkat (opsional)">
+  <button class="retry-btn" onclick="tpaAddNew()">Tambah API</button>
+  <span id="tpa-add-msg" style="margin-left:10px;font-size:0.82rem"></span>
+</div>
+</div>
 
 <script>
+function switchMainTab(name) {
+  document.getElementById('tabpanel-agents').style.display = name === 'agents' ? '' : 'none';
+  document.getElementById('tabpanel-apis').style.display = name === 'apis' ? '' : 'none';
+  ['agents', 'apis'].forEach(n => {
+    const btn = document.getElementById('tabbtn-' + n);
+    if (n === name) { btn.style.color = '#60a5fa'; btn.style.borderBottomColor = '#60a5fa'; }
+    else { btn.style.color = '#64748b'; btn.style.borderBottomColor = 'transparent'; }
+  });
+  if (name === 'apis' && agToken()) tpaLoad();
+}
 function agToken() {
   return document.getElementById('ag-token').value || localStorage.getItem('ag_token') || '';
 }
@@ -298,6 +341,7 @@ async function agRegLoad() {
     const agents = j.data.agents;
     renderAgentTree(agents);
     populateParentDropdown(agents);
+    window.__allAgentNames = agents.map(a => a.agent_name).sort();
     msgEl.style.color = '#64748b';
     msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID') + ` (${agents.length} agent)`;
   } catch (e) {
@@ -377,6 +421,138 @@ async function agRegAddNew() {
   }
 }
 
+// ── Tab API Pihak Ketiga (2026-07-22) ──
+async function tpaLoad() {
+  const msgEl = document.getElementById('tpa-msg');
+  msgEl.style.color = '#60a5fa';
+  msgEl.textContent = 'Memuat...';
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/third-party-apis', { headers: agAuthHeaders() });
+    const j = await r.json();
+    if (!r.ok) {
+      msgEl.style.color = '#f87171';
+      msgEl.textContent = 'Gagal: ' + (j.detail || j.message || 'isi token login dulu');
+      return;
+    }
+    const apis = j.data.apis;
+    const agentOptions = (window.__allAgentNames || []).map(n => `<option value="${n}">${n}</option>`).join('');
+    document.getElementById('tpa-list').innerHTML = apis.map(a => `
+      <div style="background:#1e293b;border-radius:8px;padding:12px 16px;margin-bottom:10px">
+        <div style="margin-bottom:6px;display:flex;align-items:center;gap:6px">
+          <b>${a.name}</b>
+          <span class="pill" style="background:#1e3a5f;color:#60a5fa">${a.provider}</span>
+          ${!a.enabled ? '<span class="pill" style="background:#450a0a;color:#f87171">nonaktif</span>' : ''}
+          <button class="retry-btn" style="margin-left:auto;padding:4px 10px;font-size:0.7rem;background:#7f1d1d" onclick="tpaDelete('${a.id}')">Hapus</button>
+        </div>
+        <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:4px">${a.description || ''}</div>
+        <div style="font-size:0.75rem;color:#94a3b8;margin-bottom:8px">
+          Key: <span style="font-family:monospace">${a.masked_key || '-'}</span>
+          ${a.base_url ? ' &middot; URL: ' + a.base_url : ''}
+          ${a.account_email ? ' &middot; Akun: ' + a.account_email : ''}
+        </div>
+        <div style="font-size:0.72rem;color:#64748b;margin-bottom:6px">Dipakai agent:
+          ${a.linked_agents.length
+            ? a.linked_agents.map(ag => `<span class="pill" style="background:#334155;color:#e2e8f0;margin-right:4px">${ag} <a href="#" onclick="tpaUnlink('${a.id}','${ag}');return false" style="color:#f87171;text-decoration:none;margin-left:4px">&times;</a></span>`).join('')
+            : '<i>belum ada</i>'}
+        </div>
+        <div style="display:flex;gap:6px">
+          <select id="tpa-linksel-${a.id}" style="width:auto;flex:1;margin-bottom:0">
+            <option value="">-- pilih agent utk dihubungkan --</option>
+            ${agentOptions}
+          </select>
+          <button class="retry-btn" style="padding:6px 12px;font-size:0.75rem" onclick="tpaLink('${a.id}')">Hubungkan</button>
+        </div>
+      </div>
+    `).join('');
+    msgEl.style.color = '#64748b';
+    msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID') + ` (${apis.length} API)`;
+  } catch (e) {
+    msgEl.style.color = '#f87171';
+    msgEl.textContent = 'Gagal: ' + e.message;
+  }
+}
+
+async function tpaAddNew() {
+  const name = document.getElementById('tpa-new-name').value.trim();
+  const provider = document.getElementById('tpa-new-provider').value.trim();
+  if (!name || !provider) { alert('Nama dan provider wajib diisi'); return; }
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  const body = {
+    name, provider,
+    api_key: document.getElementById('tpa-new-apikey').value.trim() || null,
+    base_url: document.getElementById('tpa-new-baseurl').value.trim() || null,
+    account_email: document.getElementById('tpa-new-account').value.trim() || null,
+    description: document.getElementById('tpa-new-desc').value.trim() || null,
+  };
+  const msgEl = document.getElementById('tpa-add-msg');
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/third-party-apis', {
+      method: 'POST', headers: agAuthHeaders(), body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok) {
+      msgEl.style.color = '#f87171';
+      msgEl.textContent = 'Gagal: ' + (j.detail || j.message || 'unknown');
+      return;
+    }
+    msgEl.style.color = '#4ade80';
+    msgEl.textContent = 'API ditambahkan!';
+    ['name', 'provider', 'apikey', 'baseurl', 'account', 'desc'].forEach(f => {
+      document.getElementById('tpa-new-' + f).value = '';
+    });
+    tpaLoad();
+  } catch (e) {
+    msgEl.style.color = '#f87171';
+    msgEl.textContent = 'Gagal: ' + e.message;
+  }
+}
+
+async function tpaLink(apiId) {
+  const sel = document.getElementById('tpa-linksel-' + apiId);
+  const agentName = sel.value;
+  if (!agentName) { alert('Pilih agent dulu'); return; }
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/third-party-apis/' + apiId + '/link', {
+      method: 'POST', headers: agAuthHeaders(), body: JSON.stringify({ agent_name: agentName }),
+    });
+    const j = await r.json();
+    if (!r.ok) { alert('Gagal: ' + (j.detail || j.message || 'unknown')); return; }
+    tpaLoad();
+  } catch (e) {
+    alert('Gagal: ' + e.message);
+  }
+}
+
+async function tpaUnlink(apiId, agentName) {
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/third-party-apis/' + apiId + '/unlink', {
+      method: 'POST', headers: agAuthHeaders(), body: JSON.stringify({ agent_name: agentName }),
+    });
+    const j = await r.json();
+    if (!r.ok) { alert('Gagal: ' + (j.detail || j.message || 'unknown')); return; }
+    tpaLoad();
+  } catch (e) {
+    alert('Gagal: ' + e.message);
+  }
+}
+
+async function tpaDelete(apiId) {
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  if (!confirm('Hapus API pihak ketiga ini beserta semua hubungannya ke agent? Tidak bisa dibatalkan.')) return;
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/third-party-apis/' + apiId, {
+      method: 'DELETE', headers: agAuthHeaders(),
+    });
+    const j = await r.json();
+    if (!r.ok) { alert('Gagal: ' + (j.detail || j.message || 'unknown')); return; }
+    tpaLoad();
+  } catch (e) {
+    alert('Gagal: ' + e.message);
+  }
+}
+
 const savedToken = localStorage.getItem('ag_token');
 if (savedToken) { document.getElementById('ag-token').value = savedToken; agRegLoad(); }
 </script>
@@ -393,3 +569,4 @@ app.include_router(auth.router, prefix=API_PREFIX)
 app.include_router(users.router, prefix=API_PREFIX)
 app.include_router(credentials.router, prefix=API_PREFIX)
 app.include_router(agent_registry.router, prefix=API_PREFIX)
+app.include_router(third_party_apis.router, prefix=API_PREFIX)
