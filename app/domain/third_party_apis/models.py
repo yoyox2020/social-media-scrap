@@ -24,6 +24,11 @@ class ThirdPartyApi(Base, UUIDMixin):
     account_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Log error/habis TERAKHIR (2026-07-22, permintaan user) -- SIMPLE,
+    # tampil langsung di kartu list, BUKAN sistem status/reload
+    # terpisah spt rotation_key_bank.
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

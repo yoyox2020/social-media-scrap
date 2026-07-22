@@ -610,6 +610,7 @@ async function tpaLoad() {
             ? `<span class="pill" style="background:#334155;color:#e2e8f0">${a.linked_agent} <a href="#" onclick="tpaUnlink('${a.id}','${a.linked_agent}');return false" style="color:#f87171;text-decoration:none;margin-left:4px">&times;</a></span>`
             : '<i>belum ada</i>'}
         </div>
+        ${a.last_error ? `<div style="font-size:0.7rem;color:#c96f5c;margin-bottom:6px">&#9888; Error terakhir (${new Date(a.last_error_at).toLocaleString('id-ID')}): ${a.last_error.slice(0, 200)}</div>` : ''}
         <div style="display:flex;gap:6px">
           <select id="tpa-linksel-${a.id}" style="width:auto;flex:1;margin-bottom:0">
             <option value="">-- tidak ada agent --</option>

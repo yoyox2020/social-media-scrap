@@ -134,6 +134,14 @@ async def report_key_failure(db: AsyncSession, agent_name: str, error_message: s
     if not current or not current.get("api_key"):
         return None  # agent kosong -- bukan cakupan rotasi ini
 
+    # Catat error di kartu "API Pihak Ketiga" kalau key agent ini
+    # sumbernya dari katalog itu (2026-07-22, permintaan user -- log
+    # per kotak, bukan cuma di bank rotasi).
+    from app.services.third_party_apis.service import find_api_id_by_agent, mark_api_error
+    linked_api_id = await find_api_id_by_agent(db, agent_name)
+    if linked_api_id:
+        await mark_api_error(db, linked_api_id, error_message)
+
     old_assigned = await db.scalar(
         select(RotationKeyBank).where(
             RotationKeyBank.assigned_to_agent == agent_name,

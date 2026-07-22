@@ -154,6 +154,28 @@ async def list_apis(db: AsyncSession) -> list[dict]:
             "base_url": a.base_url, "account_email": a.account_email,
             "description": a.description, "enabled": a.enabled,
             "linked_agent": agent_by_api.get(a.id),
+            "last_error": a.last_error,
+            "last_error_at": a.last_error_at.isoformat() if a.last_error_at else None,
         }
         for a in apis
     ]
+
+
+async def mark_api_error(db: AsyncSession, api_id: uuid.UUID, error_message: str) -> None:
+    """Catat error TERAKHIR (2026-07-22, permintaan user) -- tampil di
+    kartu list, TIDAK ubah `enabled` (bukan sistem status/reload
+    terpisah, cuma info log per kotak)."""
+    entry = await db.get(ThirdPartyApi, api_id)
+    if not entry:
+        return
+    entry.last_error = error_message[:2000]
+    entry.last_error_at = datetime.now(timezone.utc)
+    entry.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+
+
+async def find_api_id_by_agent(db: AsyncSession, agent_name: str) -> uuid.UUID | None:
+    link = await db.scalar(
+        select(ThirdPartyApiAgentLink).where(ThirdPartyApiAgentLink.agent_name == agent_name.strip())
+    )
+    return link.third_party_api_id if link else None
