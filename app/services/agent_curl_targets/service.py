@@ -104,13 +104,25 @@ async def get_targets_for_agent(db: AsyncSession, agent_name: str) -> list[Agent
     )).all())
 
 
-def resolve_placeholders(text: str | None) -> str | None:
+def resolve_placeholders(text: str | None, keyword: str | None = None) -> str | None:
     """Ganti {{NOW}}/{{NOW-<n>h}}/{{NOW-<n>d}}/{{NOW-<n>m}} jadi timestamp
     RFC3339 SUNGGUHAN, dihitung dari waktu saat fungsi ini dipanggil --
     versi Python dari resolveCurlPlaceholders() di app/main.py (JS).
-    HARUS disinkronkan manual kalau salah satu diubah."""
+    HARUS disinkronkan manual kalau salah satu diubah.
+
+    {{KEYWORD}} (BARU, 2026-07-22) -- diganti keyword yg SEDANG dibagi
+    ke agent ini oleh coordinator (lihat app/agents/youtube/coordinator.py)
+    -- di-url-encode dulu krn biasanya dipakai di query string (?q=...).
+    Kalau dipanggil TANPA keyword (mis. tombol "Jalankan (Test)" manual
+    di dashboard, tidak ada konteks pipeline), placeholder ini dibiarkan
+    APA ADANYA (tidak diganti) -- INI YG MEMUNGKINKAN 1 curl target yg
+    sama dipakai baik utk test manual (placeholder terlihat) MAUPUN
+    dijalankan otomatis oleh pipeline dgn keyword asli."""
     if not text:
         return text
+    if keyword:
+        from urllib.parse import quote
+        text = text.replace("{{KEYWORD}}", quote(keyword))
     now = datetime.now(timezone.utc)
     now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     result = text.replace("{{NOW}}", now_str)
@@ -166,18 +178,20 @@ def _parse_headers(headers_text: str | None) -> dict[str, str]:
     return result
 
 
-async def execute_target(db: AsyncSession, target_id: uuid.UUID) -> dict | None:
-    """Jalankan target curl ini SUNGGUHAN (test manual dari dashboard) --
-    resolve placeholder dulu, baru kirim request beneran, balikin hasil
-    asli (status code + preview response) supaya user tahu langsung
-    apakah curl-nya jalan tanpa error atau datanya benar2 muncul."""
+async def execute_target(db: AsyncSession, target_id: uuid.UUID, keyword: str | None = None) -> dict | None:
+    """Jalankan target curl ini SUNGGUHAN -- dipanggil baik dari tombol
+    "Jalankan (Test)" dashboard (keyword=None) MAUPUN dari pipeline
+    agent (keyword=milik agent ini utk run tsb). Resolve placeholder
+    dulu ({{NOW}}/{{KEYWORD}}/dst), baru kirim request beneran, balikin
+    hasil asli (status code + response) supaya jelas apakah curl-nya
+    jalan tanpa error atau datanya benar2 muncul."""
     target = await db.get(AgentCurlTarget, target_id)
     if not target:
         return None
 
-    url = resolve_placeholders(target.url)
-    headers_resolved = resolve_placeholders(target.headers)
-    body_resolved = resolve_placeholders(target.body)
+    url = resolve_placeholders(target.url, keyword=keyword)
+    headers_resolved = resolve_placeholders(target.headers, keyword=keyword)
+    body_resolved = resolve_placeholders(target.body, keyword=keyword)
     headers_dict = _parse_headers(headers_resolved)
 
     try:

@@ -1,17 +1,31 @@
-"""agent_youtube02 -- child "Crawler": jalankan SEMUA target curl yg
-terdaftar utk agent ini (agent_curl_targets, 2026-07-22), parse hasilnya
-jadi bentuk video yg seragam. Curl target BEBAS diubah kapan saja lewat
-dashboard tab "Target Curl" -- kode ini SELALU baca ulang daftar
-terbaru tiap dipanggil, tidak pernah hardcode URL."""
+"""Child "Crawler" generik (2026-07-22) -- jalankan SEMUA target curl
+terdaftar utk 1 agent (agent_curl_targets), parse hasilnya jadi bentuk
+video yg seragam. BUKAN hardcode ke agent_youtube02 lagi -- terima
+`agent_name` apa pun, supaya agent BARU (platform lain atau child baru)
+otomatis bisa dipakai cuma dgn DAFTAR curl target lewat dashboard,
+TANPA kode Python baru.
+
+Kalau curl target-nya pakai placeholder {{KEYWORD}} di url/header/body,
+target itu dijalankan SEKALI PER keyword yg dibagi coordinator ke agent
+ini (lihat resolve_placeholders di app/services/agent_curl_targets/
+service.py). Target yg TIDAK pakai {{KEYWORD}} tetap jalan seperti
+biasa (1x, keyword diabaikan) -- backward-compat penuh dgn target lama
+spt "curl youtube news trending"."""
 from __future__ import annotations
 
 import json
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.domain.agent_curl_targets.models import AgentCurlTarget
 from app.services.agent_curl_targets.service import execute_target, get_targets_for_agent
 
-AGENT_NAME = "agent_youtube02"
+
+def _uses_keyword_placeholder(target: AgentCurlTarget) -> bool:
+    for field in (target.url, target.headers, target.body):
+        if field and "{{KEYWORD}}" in field:
+            return True
+    return False
 
 
 def _extract_video_items(response_json: dict) -> list[dict]:
@@ -33,36 +47,48 @@ def _extract_video_items(response_json: dict) -> list[dict]:
     return normalized
 
 
-async def fetch_via_curl_targets(db: AsyncSession) -> dict:
-    """Jalankan semua curl target milik agent_youtube02, kumpulkan
-    semua video yg berhasil di-parse. Target yg gagal (network error,
-    JSON tidak sesuai format) DICATAT tapi tidak menggagalkan target
-    lain -- best effort, konsisten dgn semangat "yang penting bisa
-    jalan dulu"."""
-    targets = await get_targets_for_agent(db, AGENT_NAME)
+async def _run_one(db: AsyncSession, target: AgentCurlTarget, keyword: str | None) -> tuple[list[dict], str | None]:
+    result = await execute_target(db, target.id, keyword=keyword)
+    if not result or not result.get("success"):
+        return [], (result or {}).get("error", "unknown")
+    try:
+        parsed = json.loads(result["response_text"])
+    except (ValueError, KeyError):
+        return [], "response bukan JSON valid"
+    return _extract_video_items(parsed), None
+
+
+async def fetch_via_curl_targets(db: AsyncSession, agent_name: str, keywords: list[str] | None = None) -> dict:
+    """Jalankan semua curl target milik `agent_name`, kumpulkan semua
+    video yg berhasil di-parse. Target yg gagal (network error, JSON
+    tidak sesuai format) DICATAT tapi tidak menggagalkan target lain --
+    best effort. Kalau `keywords` diisi DAN target pakai {{KEYWORD}},
+    target itu dijalankan 1x PER keyword (bukan cuma sekali)."""
+    targets = await get_targets_for_agent(db, agent_name)
     if not targets:
         return {"success": True, "videos": [], "targets_run": 0, "targets_failed": 0, "errors": []}
 
     all_videos: list[dict] = []
     errors: list[dict] = []
+    runs_attempted = 0
     failed_count = 0
 
     for target in targets:
-        result = await execute_target(db, target.id)
-        if not result or not result.get("success"):
-            failed_count += 1
-            errors.append({"target_name": target.name, "error": (result or {}).get("error", "unknown")})
-            continue
-        try:
-            parsed = json.loads(result["response_text"])
-        except (ValueError, KeyError):
-            failed_count += 1
-            errors.append({"target_name": target.name, "error": "response bukan JSON valid"})
-            continue
-        videos = _extract_video_items(parsed)
-        all_videos.extend(videos)
+        if keywords and _uses_keyword_placeholder(target):
+            kw_list = keywords
+        else:
+            kw_list = [None]  # jalankan sekali, tanpa substitusi keyword
+
+        for kw in kw_list:
+            runs_attempted += 1
+            videos, error = await _run_one(db, target, kw)
+            if error:
+                failed_count += 1
+                errors.append({"target_name": target.name, "keyword": kw, "error": error})
+            else:
+                all_videos.extend(videos)
 
     return {
         "success": True, "videos": all_videos,
-        "targets_run": len(targets), "targets_failed": failed_count, "errors": errors,
+        "targets_run": runs_attempted, "targets_failed": failed_count, "errors": errors,
     }
