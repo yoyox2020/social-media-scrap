@@ -29,7 +29,7 @@ celery_app = Celery(
     backend=settings.celery_result_backend,
     include=[
         "app.workers.youtube_auto_crawl_worker", "app.workers.tiktok_auto_crawl_worker",
-        "app.workers.youtube_refresh_worker",
+        "app.workers.youtube_refresh_worker", "app.workers.tiktok_reply_enrichment_worker",
     ],
 )
 
@@ -50,6 +50,10 @@ celery_app.conf.update(
         },
         "youtube-refresh-stale-hourly": {
             "task": "youtube.refresh_stale_posts",
+            "schedule": 3600.0,
+        },
+        "tiktok-enrich-viral-replies-hourly": {
+            "task": "tiktok.enrich_viral_replies",
             "schedule": 3600.0,
         },
     },
