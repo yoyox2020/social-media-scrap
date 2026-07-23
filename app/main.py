@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.api.v1 import agent_curl_targets, agent_registry, auth, credentials, rotation_key_bank, third_party_apis, tiktok_metadata, tiktok_pipeline, trend_recommendations, users, youtube_metadata, youtube_pipeline
+from app.api.v1 import agent_curl_targets, agent_registry, auth, credentials, rotation_key_bank, scrape_monitoring, third_party_apis, tiktok_metadata, tiktok_pipeline, trend_recommendations, users, youtube_metadata, youtube_pipeline
 # Import SEMUA domain model agar SQLAlchemy mapper bisa resolve
 # relationship (tabel lama TETAP ada, walau endpoint API-nya sudah
 # tidak ada) -- daftar lengkapnya di register_all_models.py, dipakai
@@ -157,6 +157,7 @@ async def kelola_agent_page():
   <button class="da-tab-btn" id="tabbtn-apis" onclick="switchMainTab('apis')" style="background:none;border:none;color:#64748b;border-bottom:2px solid transparent;padding:8px 16px;font-size:0.85rem;font-weight:600;cursor:pointer">API Pihak Ketiga</button>
   <button class="da-tab-btn" id="tabbtn-curl" onclick="switchMainTab('curl')" style="background:none;border:none;color:#64748b;border-bottom:2px solid transparent;padding:8px 16px;font-size:0.85rem;font-weight:600;cursor:pointer">Target Curl</button>
   <button class="da-tab-btn" id="tabbtn-rotasi" onclick="switchMainTab('rotasi')" style="background:none;border:none;color:#64748b;border-bottom:2px solid transparent;padding:8px 16px;font-size:0.85rem;font-weight:600;cursor:pointer">Rotasi API Key</button>
+  <button class="da-tab-btn" id="tabbtn-monitoring" onclick="switchMainTab('monitoring')" style="background:none;border:none;color:#64748b;border-bottom:2px solid transparent;padding:8px 16px;font-size:0.85rem;font-weight:600;cursor:pointer">Monitoring</button>
 </div>
 
 <div id="tabpanel-agents">
@@ -299,13 +300,27 @@ async def kelola_agent_page():
 </div>
 </div>
 
+<div id="tabpanel-monitoring" style="display:none">
+<div style="font-size:0.72rem;color:#94a3b8;margin-bottom:10px;max-width:640px">
+  Status scraping tiap platform -- run terakhir, statistik 24 jam, dan run yg macet (status "running" &gt;15 menit tanpa selesai). Platform baru otomatis muncul di sini begitu ada run pertamanya.
+</div>
+<div style="margin-bottom:10px">
+  <button class="retry-btn" onclick="monLoad()">Muat / Refresh Monitoring</button>
+  <span id="mon-msg" style="margin-left:10px;font-size:0.82rem;color:#64748b"></span>
+</div>
+<div id="mon-list" style="margin-bottom:20px">
+  <div style="color:#475569;font-style:italic;font-size:0.82rem">Klik "Muat / Refresh Monitoring" utk mulai.</div>
+</div>
+</div>
+
 <script>
 function switchMainTab(name) {
   document.getElementById('tabpanel-agents').style.display = name === 'agents' ? '' : 'none';
   document.getElementById('tabpanel-apis').style.display = name === 'apis' ? '' : 'none';
   document.getElementById('tabpanel-curl').style.display = name === 'curl' ? '' : 'none';
   document.getElementById('tabpanel-rotasi').style.display = name === 'rotasi' ? '' : 'none';
-  ['agents', 'apis', 'curl', 'rotasi'].forEach(n => {
+  document.getElementById('tabpanel-monitoring').style.display = name === 'monitoring' ? '' : 'none';
+  ['agents', 'apis', 'curl', 'rotasi', 'monitoring'].forEach(n => {
     const btn = document.getElementById('tabbtn-' + n);
     if (n === name) { btn.style.color = '#60a5fa'; btn.style.borderBottomColor = '#60a5fa'; }
     else { btn.style.color = '#64748b'; btn.style.borderBottomColor = 'transparent'; }
@@ -313,6 +328,61 @@ function switchMainTab(name) {
   if (name === 'rotasi' && agToken()) rotasiLoad();
   if (name === 'apis' && agToken()) tpaLoad();
   if (name === 'curl' && agToken()) curlLoad();
+  if (name === 'monitoring' && agToken()) monLoad();
+}
+
+async function monLoad() {
+  const msgEl = document.getElementById('mon-msg');
+  msgEl.style.color = '#60a5fa';
+  msgEl.textContent = 'Memuat...';
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/monitoring/status', { headers: agAuthHeaders() });
+    const j = await r.json();
+    if (!r.ok) {
+      msgEl.style.color = '#f87171';
+      msgEl.textContent = 'Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'isi token login dulu');
+      return;
+    }
+    const platforms = j.data.platforms;
+    if (platforms.length === 0) {
+      document.getElementById('mon-list').innerHTML = '<div style="color:#475569;font-style:italic;font-size:0.82rem">Belum ada riwayat scraping sama sekali.</div>';
+      msgEl.style.color = '#64748b';
+      msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID');
+      return;
+    }
+    document.getElementById('mon-list').innerHTML = platforms.map(p => {
+      const lr = p.last_run;
+      const statusColor = !lr ? '#64748b' : lr.status === 'success' ? '#4ade80' : lr.status === 'running' ? '#facc15' : '#f87171';
+      return `
+      <div style="background:#1e293b;border-radius:8px;padding:12px 16px;margin-bottom:10px;max-width:640px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+          <span style="font-size:0.9rem;font-weight:700;text-transform:capitalize">${p.platform}</span>
+          ${p.stuck_runs > 0 ? `<span class="pill" style="background:#450a0a;color:#f87171">&#9888; ${p.stuck_runs} run macet</span>` : ''}
+        </div>
+        ${lr ? `
+        <div style="font-size:0.78rem;color:#94a3b8;margin-bottom:6px">
+          Run terakhir: <span style="color:${statusColor};font-weight:600">${lr.status}</span>
+          &middot; topik "${lr.keyword_text || '-'}" &middot; ${lr.triggered_by || '-'}
+          &middot; ${lr.started_at ? new Date(lr.started_at).toLocaleString('id-ID') : '-'}
+          ${lr.videos_new !== null && lr.videos_new !== undefined ? ` &middot; ${lr.videos_new} video baru` : ''}
+        </div>
+        ${lr.error_message ? `<div style="font-size:0.72rem;color:#c96f5c;margin-bottom:6px">&#9888; ${lr.error_message.slice(0, 250)}</div>` : ''}
+        ` : '<div style="font-size:0.78rem;color:#64748b;margin-bottom:6px">Belum pernah ada run.</div>'}
+        <div style="font-size:0.75rem;color:#94a3b8">
+          24 jam terakhir: <span style="color:#4ade80">${p.last_24h.success} sukses</span>
+          &middot; <span style="color:#f87171">${p.last_24h.failed} gagal</span>
+          ${p.last_24h.running > 0 ? ` &middot; <span style="color:#facc15">${p.last_24h.running} lagi jalan</span>` : ''}
+          &middot; ${p.last_24h.videos_new} video baru total
+        </div>
+      </div>
+    `;
+    }).join('');
+    msgEl.style.color = '#64748b';
+    msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID') + ` (${platforms.length} platform)`;
+  } catch (e) {
+    msgEl.style.color = '#f87171';
+    msgEl.textContent = 'Gagal: ' + e.message;
+  }
 }
 function agToken() {
   return document.getElementById('ag-token').value || localStorage.getItem('ag_token') || '';
@@ -1130,3 +1200,4 @@ app.include_router(rotation_key_bank.router, prefix=API_PREFIX)
 app.include_router(trend_recommendations.router, prefix=API_PREFIX)
 app.include_router(tiktok_pipeline.router, prefix=API_PREFIX)
 app.include_router(tiktok_metadata.router, prefix=API_PREFIX)
+app.include_router(scrape_monitoring.router, prefix=API_PREFIX)
