@@ -100,7 +100,14 @@ async def refresh_stale_youtube_posts(db: AsyncSession, limit: int = REFRESH_BAT
         )
 
         post.metrics = metrics
-        meta = post.metadata_ or {}
+        # dict(...) BUKAN cuma `post.metadata_ or {}` -- kalau metadata_
+        # sudah truthy, `or {}` balikin OBJEK YANG SAMA (referensi, bukan
+        # salinan). Mutasi in-place lalu "assign balik" ke atribut yg
+        # SAMA persis tidak selalu ke-detect SQLAlchemy sbg perubahan
+        # utk kolom JSON polos -- trend_score dkk DIAM-DIAM GAGAL
+        # tersimpan (ditemukan 2026-07-24, verified live: metrics ter-
+        # update tapi trend_score tidak). dict() paksa jadi objek BARU.
+        meta = dict(post.metadata_ or {})
         meta.update({
             "trend_score": scores["trend_score"], "engagement_score": scores["engagement_score"],
             "freshness_score": scores["freshness_score"], "authority_score": scores["authority_score"],
