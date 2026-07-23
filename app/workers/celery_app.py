@@ -30,6 +30,7 @@ celery_app = Celery(
     include=[
         "app.workers.youtube_auto_crawl_worker", "app.workers.tiktok_auto_crawl_worker",
         "app.workers.youtube_refresh_worker", "app.workers.tiktok_reply_enrichment_worker",
+        "app.workers.youtube_completeness_worker",
     ],
 )
 
@@ -55,6 +56,10 @@ celery_app.conf.update(
         "tiktok-enrich-viral-replies-hourly": {
             "task": "tiktok.enrich_viral_replies",
             "schedule": 3600.0,
+        },
+        "youtube-audit-completeness-daily": {
+            "task": "youtube.audit_completeness",
+            "schedule": 86400.0,
         },
     },
 )
