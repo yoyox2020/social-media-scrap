@@ -60,9 +60,20 @@ def _safe_int(value) -> int:
         return 0
 
 
+MIN_TARGET_ITEMS = 100  # permintaan user "ambang batas di atas 100"
+MAX_PAGES = 8  # batas aman -- EnsembleData ~20/halaman, 8x20=160 (>100 tanpa panggilan tak terbatas)
+
+
 def _uses_keyword_placeholder(target: AgentCurlTarget) -> bool:
     for field in (target.url, target.headers, target.body):
         if field and "{{KEYWORD}}" in field:
+            return True
+    return False
+
+
+def _uses_cursor_placeholder(target: AgentCurlTarget) -> bool:
+    for field in (target.url, target.headers, target.body):
+        if field and "{{CURSOR}}" in field:
             return True
     return False
 
@@ -144,31 +155,61 @@ async def _fetch_comments_dataset(client: httpx.AsyncClient, dataset_url: str) -
 
 
 async def _run_one(db: AsyncSession, target: AgentCurlTarget, keyword: str | None) -> tuple[list[dict], str | None]:
-    result = await execute_target(db, target.id, keyword=keyword)
-    if not result or not result.get("success"):
-        return [], (result or {}).get("error", "unknown")
-    try:
-        parsed = json.loads(result["response_text"])
-    except (ValueError, KeyError):
-        return [], "response bukan JSON valid"
-    items = _extract_items(parsed)
+    """Target Apify (resultsPerPage=120 di body, verified live bisa
+    >100 dlm 1 panggilan) cukup 1x. Target EnsembleData (fixed ~20
+    hasil/panggilan, verified live TIDAK ada param utk perbesar) pakai
+    {{CURSOR}} -- diulang otomatis sampai terkumpul >=100 item atau
+    halaman habis (nextCursor null) atau MAX_PAGES tercapai (2026-07-23,
+    permintaan user "ambang di atas 100")."""
+    paginate = _uses_cursor_placeholder(target)
+    all_items: list[dict] = []
+    cursor = "0"
+    pages_fetched = 0
+    last_error: str | None = None
+
+    while True:
+        result = await execute_target(db, target.id, keyword=keyword, cursor=cursor if paginate else None)
+        if not result or not result.get("success"):
+            last_error = (result or {}).get("error", "unknown")
+            break
+        try:
+            parsed = json.loads(result["response_text"])
+        except (ValueError, KeyError):
+            last_error = "response bukan JSON valid"
+            break
+
+        all_items.extend(_extract_items(parsed))
+        pages_fetched += 1
+
+        if not paginate:
+            break
+
+        next_cursor = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("data"), dict):
+            next_cursor = parsed["data"].get("nextCursor")
+        if next_cursor is None or len(all_items) >= MIN_TARGET_ITEMS or pages_fetched >= MAX_PAGES:
+            break
+        cursor = str(next_cursor)
+
+    if not all_items and last_error:
+        return [], last_error
 
     # commentsDatasetUrl (kalau ada, krn commentsPerPost>0 di body target)
     # dibagi 1x utk semua item run ini, lalu dicocokkan balik ke tiap
     # item via webVideoUrl -- validasi ketat spt YouTube, BUKAN asumsi
     # comment pertama otomatis milik video pertama.
-    dataset_url = next((it.get("commentsDatasetUrl") for it in items if it.get("commentsDatasetUrl")), None)
+    dataset_url = next((it.get("commentsDatasetUrl") for it in all_items if it.get("commentsDatasetUrl")), None)
     if dataset_url:
         async with httpx.AsyncClient(timeout=30.0) as client:
             all_comments = await _fetch_comments_dataset(client, dataset_url)
-        for it in items:
+        for it in all_items:
             web_url = it.get("webVideoUrl")
             it["_comments"] = [c for c in all_comments if c.get("videoWebUrl") == web_url] if web_url else []
     else:
-        for it in items:
+        for it in all_items:
             it["_comments"] = []
 
-    return items, None
+    return all_items, None
 
 
 async def fetch_via_curl_targets(db: AsyncSession, agent_name: str, keywords: list[str] | None = None) -> dict:

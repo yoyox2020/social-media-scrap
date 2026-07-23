@@ -26,6 +26,12 @@ from app.domain.agent_curl_targets.models import AgentCurlTarget
 # dipakai jg utk auto-rotasi {{ROTATE:<Provider>}} (2026-07-23).
 ROTATION_FAILURE_STATUS_CODES = {401, 402, 403, 429}
 _ROTATE_RE = re.compile(r"\{\{ROTATE:([A-Za-z0-9_ -]+)\}\}")
+# Batas percobaan ganti-token dlm 1x execute_target (2026-07-23,
+# permintaan user "kalau satu habis lakukan scrap dgn akun yg lain,
+# jika terpakai semua berarti harus menunggu yang kosong") -- jangan
+# infinite loop kalau SEMUA token provider itu benar2 habis, tapi
+# cukup besar utk cover pool token yg wajar (skrg 4-5 per provider).
+MAX_ROTATION_ATTEMPTS = 8
 
 
 async def add_target(
@@ -111,25 +117,31 @@ async def get_targets_for_agent(db: AsyncSession, agent_name: str) -> list[Agent
     )).all())
 
 
-def resolve_placeholders(text: str | None, keyword: str | None = None) -> str | None:
+def resolve_placeholders(text: str | None, keyword: str | None = None, cursor: str | None = None) -> str | None:
     """Ganti {{NOW}}/{{NOW-<n>h}}/{{NOW-<n>d}}/{{NOW-<n>m}} jadi timestamp
     RFC3339 SUNGGUHAN, dihitung dari waktu saat fungsi ini dipanggil --
     versi Python dari resolveCurlPlaceholders() di app/main.py (JS).
     HARUS disinkronkan manual kalau salah satu diubah.
 
-    {{KEYWORD}} (BARU, 2026-07-22) -- diganti keyword yg SEDANG dibagi
-    ke agent ini oleh coordinator (lihat app/agents/youtube/coordinator.py)
-    -- di-url-encode dulu krn biasanya dipakai di query string (?q=...).
-    Kalau dipanggil TANPA keyword (mis. tombol "Jalankan (Test)" manual
-    di dashboard, tidak ada konteks pipeline), placeholder ini dibiarkan
-    APA ADANYA (tidak diganti) -- INI YG MEMUNGKINKAN 1 curl target yg
-    sama dipakai baik utk test manual (placeholder terlihat) MAUPUN
-    dijalankan otomatis oleh pipeline dgn keyword asli."""
+    {{KEYWORD}} (2026-07-22) -- diganti keyword yg SEDANG dibagi ke
+    agent ini oleh coordinator -- di-url-encode dulu krn biasanya
+    dipakai di query string (?q=...). Kalau dipanggil TANPA keyword
+    (mis. tombol "Jalankan (Test)" manual), placeholder dibiarkan apa
+    adanya.
+
+    {{CURSOR}} (BARU, 2026-07-23, permintaan user "ambang di atas 100"
+    utk EnsembleData yg cuma ~20 hasil/panggilan) -- diganti nilai
+    cursor pagination SAAT INI, dipakai crawler_client.py utk memanggil
+    ulang target yg sama dgn cursor berikutnya sampai terkumpul cukup
+    hasil atau halaman habis. Sama spt {{KEYWORD}}, dibiarkan apa
+    adanya kalau tidak diberi (test manual)."""
     if not text:
         return text
     if keyword:
         from urllib.parse import quote
         text = text.replace("{{KEYWORD}}", quote(keyword))
+    if cursor is not None:
+        text = text.replace("{{CURSOR}}", str(cursor))
     now = datetime.now(timezone.utc)
     now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     result = text.replace("{{NOW}}", now_str)
@@ -216,63 +228,90 @@ def _apply_substitutions(text: str | None, substitutions: dict[str, str]) -> str
     return text
 
 
-async def execute_target(db: AsyncSession, target_id: uuid.UUID, keyword: str | None = None) -> dict | None:
+async def execute_target(
+    db: AsyncSession, target_id: uuid.UUID, keyword: str | None = None, cursor: str | None = None,
+) -> dict | None:
     """Jalankan target curl ini SUNGGUHAN -- dipanggil baik dari tombol
     "Jalankan (Test)" dashboard (keyword=None) MAUPUN dari pipeline
     agent (keyword=milik agent ini utk run tsb). Resolve placeholder
-    dulu ({{NOW}}/{{KEYWORD}}/{{ROTATE:<Provider>}}/dst), baru kirim
-    request beneran, balikin hasil asli (status code + response)
-    supaya jelas apakah curl-nya jalan tanpa error atau datanya benar2
-    muncul.
+    dulu ({{NOW}}/{{KEYWORD}}/{{CURSOR}}/{{ROTATE:<Provider>}}/dst),
+    baru kirim request beneran, balikin hasil asli (status code +
+    response) supaya jelas apakah curl-nya jalan tanpa error atau
+    datanya benar2 muncul.
 
-    {{ROTATE:<Provider>}} (2026-07-23, permintaan user "auto rotasi
-    berapapun API key yang saya daftarkan") -- diganti 1 key yg SEDANG
-    paling layak dari katalog `third_party_apis` provider itu. Kalau
+    {{ROTATE:<Provider>}} + ANTRIAN GANTI-TOKEN (2026-07-23, permintaan
+    user "kalau satu habis lakukan scrap dgn akun yg lain, jika
+    terpakai semua berarti harus menunggu yang kosong") -- kalau
     request GAGAL dgn status yg nunjuk key bermasalah (401/402/403/429),
-    key itu OTOMATIS dicatat error-nya (mark_api_error) -- panggilan
-    BERIKUTNYA (via get_next_available_key) otomatis lompat ke key lain
-    yg belum/paling lama error, TANPA campur tangan manual."""
+    key itu dicatat error-nya (mark_api_error) DAN request diulang
+    SEKALI LAGI dgn key BERIKUTNYA (get_next_available_key otomatis
+    lompati yg baru dicatat error) -- diulang sampai BERHASIL atau
+    sampai get_next_available_key balikin None (semua token provider
+    itu SUDAH dicoba & gagal dlm request ini -- 'menunggu yang kosong'
+    brarti gagal utk SEKARANG, dicoba lagi otomatis di jadwal
+    berikutnya, BUKAN blocking-wait krn saldo baru biasanya reset
+    bulanan bukan dlm hitungan detik)."""
     target = await db.get(AgentCurlTarget, target_id)
     if not target:
         return None
 
-    rotate_substitutions, used_key_ids = await _resolve_rotating_keys(db, target.url, target.headers, target.body)
+    from app.services.third_party_apis.service import mark_api_error
 
-    url = _apply_substitutions(resolve_placeholders(target.url, keyword=keyword), rotate_substitutions)
-    headers_resolved = _apply_substitutions(resolve_placeholders(target.headers, keyword=keyword), rotate_substitutions)
-    body_resolved = _apply_substitutions(resolve_placeholders(target.body, keyword=keyword), rotate_substitutions)
-    headers_dict = _parse_headers(headers_resolved)
+    last_result: dict = {"success": False, "status_code": None, "resolved_url": target.url, "error": "unknown"}
+    tried_key_ids: set[uuid.UUID] = set()
 
-    async def _mark_rotating_keys_failed(error_message: str) -> None:
-        from app.services.third_party_apis.service import mark_api_error
-        for key_id in used_key_ids.values():
-            await mark_api_error(db, key_id, error_message)
+    for attempt in range(MAX_ROTATION_ATTEMPTS):
+        rotate_substitutions, used_key_ids = await _resolve_rotating_keys(db, target.url, target.headers, target.body)
+        # Kalau target ini pakai {{ROTATE:...}} TAPI semua key provider
+        # itu sudah dicoba & gagal di percobaan sebelumnya (get_next_available_key
+        # akhirnya muter balik ke key yg SAMA krn tidak ada lagi yg baru) --
+        # berhenti, jangan infinite-retry ke key yg sudah pasti gagal.
+        if used_key_ids and all(kid in tried_key_ids for kid in used_key_ids.values()):
+            last_result["error"] = "Semua token provider ini sudah dicoba & gagal -- menunggu jadwal berikutnya"
+            break
 
-    try:
-        # 90s (bukan 15s) -- Apify run-sync-get-dataset-items (dipakai TikTok,
-        # 2026-07-23) genuinely butuh puluhan detik-2 menit utk 1 actor run
-        # sungguhan, 15s selalu timeout sblm actor selesai.
-        async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
-            resp = await client.request(
-                target.method, url, headers=headers_dict,
-                content=body_resolved.encode() if body_resolved else None,
-            )
-        if used_key_ids and resp.status_code in ROTATION_FAILURE_STATUS_CODES:
-            await _mark_rotating_keys_failed(f"HTTP {resp.status_code}: {resp.text[:500]}")
-        return {
-            "success": True,
-            "status_code": resp.status_code,
-            "resolved_url": url,
-            "response_text": resp.text,
-            "response_preview": resp.text[:2000],
-            "response_length": len(resp.text),
-        }
-    except Exception as exc:
-        if used_key_ids:
-            await _mark_rotating_keys_failed(str(exc)[:500])
-        return {
-            "success": False,
-            "status_code": None,
-            "resolved_url": url,
-            "error": str(exc),
-        }
+        url = _apply_substitutions(resolve_placeholders(target.url, keyword=keyword, cursor=cursor), rotate_substitutions)
+        headers_resolved = _apply_substitutions(resolve_placeholders(target.headers, keyword=keyword, cursor=cursor), rotate_substitutions)
+        body_resolved = _apply_substitutions(resolve_placeholders(target.body, keyword=keyword, cursor=cursor), rotate_substitutions)
+        headers_dict = _parse_headers(headers_resolved)
+
+        try:
+            # 90s (bukan 15s) -- Apify run-sync-get-dataset-items (dipakai TikTok,
+            # 2026-07-23) genuinely butuh puluhan detik-2 menit utk 1 actor run
+            # sungguhan, 15s selalu timeout sblm actor selesai.
+            async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
+                resp = await client.request(
+                    target.method, url, headers=headers_dict,
+                    content=body_resolved.encode() if body_resolved else None,
+                )
+            if used_key_ids and resp.status_code in ROTATION_FAILURE_STATUS_CODES:
+                for key_id in used_key_ids.values():
+                    await mark_api_error(db, key_id, f"HTTP {resp.status_code}: {resp.text[:500]}")
+                    tried_key_ids.add(key_id)
+                last_result = {
+                    "success": True, "status_code": resp.status_code, "resolved_url": url,
+                    "response_text": resp.text, "response_preview": resp.text[:2000], "response_length": len(resp.text),
+                }
+                if not used_key_ids:  # target ini tidak pakai rotasi sama sekali -- tidak ada gunanya diulang
+                    return last_result
+                continue  # coba lagi dgn key berikutnya
+
+            return {
+                "success": True,
+                "status_code": resp.status_code,
+                "resolved_url": url,
+                "response_text": resp.text,
+                "response_preview": resp.text[:2000],
+                "response_length": len(resp.text),
+            }
+        except Exception as exc:
+            if used_key_ids:
+                for key_id in used_key_ids.values():
+                    await mark_api_error(db, key_id, str(exc)[:500])
+                    tried_key_ids.add(key_id)
+            last_result = {"success": False, "status_code": None, "resolved_url": url, "error": str(exc)}
+            if not used_key_ids:
+                return last_result
+            continue
+
+    return last_result

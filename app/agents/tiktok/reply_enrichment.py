@@ -33,7 +33,7 @@ from app.domain.posts.models import Post
 from app.services.third_party_apis.service import get_next_available_key, mark_api_error
 
 BATCH_SIZE = 10
-MAX_COMMENTS_PER_VIDEO = 100  # permintaan user "max comment harusnya 100 saja"
+MAX_COMMENTS_PER_VIDEO = 150  # permintaan user "batasan harus diatas 100"
 MAX_REPLIES_PER_COMMENT = 20
 ACTOR_URL_TEMPLATE = "https://api.apify.com/v2/acts/automation-lab~tiktok-comments-scraper/run-sync-get-dataset-items?token={token}"
 
