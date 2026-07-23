@@ -26,6 +26,7 @@ import app.domain.scrape_runs.models  # noqa: F401
 import app.domain.instagram_trending.models  # noqa: F401
 import app.domain.trend_recommendations.models  # noqa: F401
 import app.domain.trend_recommendations.platform_usage_models  # noqa: F401
+import app.domain.trend_recommendations.keyword_models  # noqa: F401
 import app.domain.agent_registry.models  # noqa: F401
 import app.domain.agent_registry.pool_models  # noqa: F401
 import app.domain.third_party_apis.models  # noqa: F401
