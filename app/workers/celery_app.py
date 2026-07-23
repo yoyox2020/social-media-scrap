@@ -31,7 +31,7 @@ celery_app = Celery(
         "app.workers.youtube_auto_crawl_worker", "app.workers.tiktok_auto_crawl_worker",
         "app.workers.youtube_refresh_worker", "app.workers.tiktok_reply_enrichment_worker",
         "app.workers.youtube_completeness_worker", "app.workers.youtube_comment_backfill_worker",
-        "app.workers.tiktok_follower_backfill_worker",
+        "app.workers.tiktok_follower_backfill_worker", "app.workers.facebook_auto_crawl_worker",
     ],
 )
 
@@ -69,6 +69,10 @@ celery_app.conf.update(
         "tiktok-backfill-author-followers-weekly": {
             "task": "tiktok.backfill_author_followers",
             "schedule": 604800.0,
+        },
+        "facebook-auto-crawl-hourly": {
+            "task": "facebook.auto_crawl_top_topics",
+            "schedule": 3600.0,
         },
     },
 )

@@ -11,6 +11,7 @@ mem-port ulang logika yg SAMA (unit h/d/m) ke Python, dipakai baik oleh
 mana pun nanti yg mau benar2 menjalankan curl ini terjadwal."""
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,19 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.agent_curl_targets.models import AgentCurlTarget
+
+# execute_target() dipanggil KONKUREN lintas child (coordinator.py tiap
+# platform pakai asyncio.gather dgn 1 AsyncSession yg SAMA dibagi ke
+# semua child) -- AsyncSession SQLAlchemy TIDAK aman dipakai konkuren
+# oleh >1 coroutine (didokumentasikan resmi), db.get/commit yg tabrakan
+# bisa lempar IllegalStateChangeError. Ditemukan NYATA 2026-07-24 (smoke
+# test pipeline Facebook, 5 child gagal BERSAMAAN krn semua token Apify
+# exhausted -> mark_api_error() konkuren -> crash). Lock ini SENGAJA
+# HANYA membungkus bagian yg sentuh `db` (get/resolve-key/mark_api_error),
+# BUKAN seluruh fungsi -- panggilan HTTP aktual (httpx, paling lama)
+# tetap jalan konkuren tanpa lock, jadi throughput lintas child TIDAK
+# banyak berkurang.
+_DB_LOCK = asyncio.Lock()
 
 # Status code yg berarti "key ini kena limit/expired/ditolak" -- SAMA
 # persis dgn AI_KEY_FAILURE_STATUS_CODES di agent_struktur_data.py,
@@ -251,7 +265,8 @@ async def execute_target(
     brarti gagal utk SEKARANG, dicoba lagi otomatis di jadwal
     berikutnya, BUKAN blocking-wait krn saldo baru biasanya reset
     bulanan bukan dlm hitungan detik)."""
-    target = await db.get(AgentCurlTarget, target_id)
+    async with _DB_LOCK:
+        target = await db.get(AgentCurlTarget, target_id)
     if not target:
         return None
 
@@ -261,7 +276,8 @@ async def execute_target(
     tried_key_ids: set[uuid.UUID] = set()
 
     for attempt in range(MAX_ROTATION_ATTEMPTS):
-        rotate_substitutions, used_key_ids = await _resolve_rotating_keys(db, target.url, target.headers, target.body)
+        async with _DB_LOCK:
+            rotate_substitutions, used_key_ids = await _resolve_rotating_keys(db, target.url, target.headers, target.body)
         # Kalau target ini pakai {{ROTATE:...}} TAPI semua key provider
         # itu sudah dicoba & gagal di percobaan sebelumnya (get_next_available_key
         # akhirnya muter balik ke key yg SAMA krn tidak ada lagi yg baru) --
@@ -285,9 +301,10 @@ async def execute_target(
                     content=body_resolved.encode() if body_resolved else None,
                 )
             if used_key_ids and resp.status_code in ROTATION_FAILURE_STATUS_CODES:
-                for key_id in used_key_ids.values():
-                    await mark_api_error(db, key_id, f"HTTP {resp.status_code}: {resp.text[:500]}")
-                    tried_key_ids.add(key_id)
+                async with _DB_LOCK:
+                    for key_id in used_key_ids.values():
+                        await mark_api_error(db, key_id, f"HTTP {resp.status_code}: {resp.text[:500]}")
+                        tried_key_ids.add(key_id)
                 last_result = {
                     "success": True, "status_code": resp.status_code, "resolved_url": url,
                     "response_text": resp.text, "response_preview": resp.text[:2000], "response_length": len(resp.text),
@@ -306,9 +323,10 @@ async def execute_target(
             }
         except Exception as exc:
             if used_key_ids:
-                for key_id in used_key_ids.values():
-                    await mark_api_error(db, key_id, str(exc)[:500])
-                    tried_key_ids.add(key_id)
+                async with _DB_LOCK:
+                    for key_id in used_key_ids.values():
+                        await mark_api_error(db, key_id, str(exc)[:500])
+                        tried_key_ids.add(key_id)
             last_result = {"success": False, "status_code": None, "resolved_url": url, "error": str(exc)}
             if not used_key_ids:
                 return last_result
