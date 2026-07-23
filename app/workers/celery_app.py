@@ -31,6 +31,7 @@ celery_app = Celery(
         "app.workers.youtube_auto_crawl_worker", "app.workers.tiktok_auto_crawl_worker",
         "app.workers.youtube_refresh_worker", "app.workers.tiktok_reply_enrichment_worker",
         "app.workers.youtube_completeness_worker", "app.workers.youtube_comment_backfill_worker",
+        "app.workers.tiktok_follower_backfill_worker",
     ],
 )
 
@@ -64,6 +65,10 @@ celery_app.conf.update(
         "youtube-backfill-missing-comments-hourly": {
             "task": "youtube.backfill_missing_comments",
             "schedule": 3600.0,
+        },
+        "tiktok-backfill-author-followers-weekly": {
+            "task": "tiktok.backfill_author_followers",
+            "schedule": 604800.0,
         },
     },
 )
