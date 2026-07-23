@@ -39,6 +39,23 @@ async def add_bank_key(
     return entry
 
 
+async def update_bank_key(db: AsyncSession, key_id: uuid.UUID, model: str | None = None) -> RotationKeyBank | None:
+    """Ganti model 1 key bank -- dipakai kalau model gratis default
+    ketahuan bermasalah/deprecated (kejadian nyata: OpenRouter deprecate
+    model gratis tanpa notif, DAN model gratis lain kena rate-limit
+    GLOBAL upstream 2026-07-24, bukan soal key habis) spy key yg SUDAH
+    ada tidak perlu dihapus+ditambah ulang."""
+    entry = await db.get(RotationKeyBank, key_id)
+    if not entry:
+        return None
+    if model is not None:
+        entry.model = model.strip() or None
+    entry.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(entry)
+    return entry
+
+
 def _mask(value: str | None) -> str | None:
     if not value:
         return None
