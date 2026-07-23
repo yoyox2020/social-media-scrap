@@ -1,17 +1,41 @@
-"""Child "Crawler" TikTok (2026-07-23) -- SATU-SATUNYA jalur ambil data
-TikTok, via curl target Apify (`clockworks/tiktok-scraper`,
-`searchQueries` mode, verified live sebelum ditulis -- lihat riset
-curl sebelumnya). TIDAK ada "API resmi" TikTok spt YouTube Data API,
-jadi TIDAK ada api_client.py terpisah -- semua anak (agent_tiktok01..05)
-kerjanya sama, cuma via curl target masing2 (pola generik yg SAMA dgn
-crawler_client.py YouTube, TANPA hardcode ke 1 agent tertentu).
+"""Child "Crawler" TikTok (2026-07-23) -- SEKARANG 2 provider (Apify +
+EnsembleData, permintaan user "tambah lebih banyak akun apify dan
+ensemble"), curl target manapun terdaftar utk agent ini otomatis
+dipakai. TIDAK ada "API resmi" TikTok spt YouTube Data API, jadi TIDAK
+ada api_client.py terpisah -- semua anak (agent_tiktok01..05) kerjanya
+sama, cuma via curl target masing2.
 
-Bentuk respons Apify BEDA dari YouTube: array JSON langsung (bukan
-{"items":[...]}), field `id` numerik string (bukan 11-char), thumbnail
-di `videoMeta.coverUrl`, views di `playCount` (bukan `viewCount`)."""
+DUA bentuk respons BEDA TOTAL, keduanya DIKONVERSI ke SATU bentuk
+internal (bentuk Apify) di _extract_items() supaya struktur_data.py
+TIDAK PERLU tahu bedanya:
+- Apify: array JSON langsung, field `id` (digit), `playCount`/
+  `diggCount`/`commentCount`/`shareCount`, `authorMeta.name`/`fans`,
+  `videoMeta.coverUrl`, `webVideoUrl`, `createTimeISO`.
+- EnsembleData: {"data": {"data": [...aweme items...]}} -- item aweme
+  asli TikTok (field `aweme_id`, `desc`, `create_time`,
+  `statistics.{digg_count,comment_count,play_count,share_count}`,
+  `author.{unique_id,nickname,follower_count}`,
+  `video.cover.url_list`), SEMUA diverifikasi LIVE 2026-07-23 lewat
+  endpoint `/tt/hashtag/posts` (BUKAN tebakan).
+
+  PENTING -- `/tt/keyword/posts` (endpoint keyword-search yg dulu
+  dipakai project ini, lihat riwayat git
+  app/integrations/tiktok/connector.py commit a26487c) SEKARANG 404,
+  sudah tidak ada di API EnsembleData (dicek live, bukan asumsi).
+  Diganti pakai `/tt/hashtag/posts?name=<keyword>` yg TERBUKTI jalan --
+  konsekuensinya: keyword FRASA (mis. "rupiah lemah", ada spasi) HASIL-
+  NYA BISA KOSONG krn hashtag TikTok tidak ada spasi, beda dari
+  pencarian keyword bebas. Ini keterbatasan NYATA dari sisi API-nya,
+  bukan bug di kode ini.
+
+  TIDAK ada commentsDatasetUrl -- EnsembleData butuh panggilan TERPISAH
+  per post (/tt/post/comments) yg BELUM diimplementasi (dicatat sbg
+  keterbatasan, video EnsembleData _comments=[] apa adanya, bukan
+  disembunyikan sbg "berhasil")."""
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,8 +48,16 @@ def is_valid_tiktok_id(value) -> bool:
     """ID video TikTok SELALU digit semua, biasanya 18-19 karakter --
     SATU sumber kebenaran spy item yg id-nya bukan video asli (mis.
     hasil parsing keliru) tidak ikut kesimpan, pola sama dgn
-    is_valid_video_id() YouTube (app/agents/youtube/api_client.py)."""
+    is_valid_video_id() YouTube (app/agents/youtube/api_client.py).
+    Dipakai utk KEDUA bentuk (Apify `id`, EnsembleData `aweme_id`)."""
     return isinstance(value, str) and value.isdigit() and 5 <= len(value) <= 25
+
+
+def _safe_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _uses_keyword_placeholder(target: AgentCurlTarget) -> bool:
@@ -35,14 +67,66 @@ def _uses_keyword_placeholder(target: AgentCurlTarget) -> bool:
     return False
 
 
+def _convert_ensembledata_item(item: dict) -> dict | None:
+    """aweme item (EnsembleData) -> bentuk internal SAMA dgn item Apify.
+    Field mapping diverifikasi dari kode historis project ini yg PERNAH
+    beneran dipakai (bukan tebakan) -- lihat docstring modul."""
+    aweme_id = str(item.get("aweme_id") or "")
+    if not is_valid_tiktok_id(aweme_id):
+        return None
+    author = item.get("author") or {}
+    stats = item.get("statistics") or {}
+    username = author.get("unique_id") or author.get("uniqueId") or ""
+    create_time = item.get("create_time")
+    create_time_iso = None
+    if create_time:
+        try:
+            create_time_iso = datetime.fromtimestamp(int(create_time), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            create_time_iso = None
+    cover_list = ((item.get("video") or {}).get("cover") or {}).get("url_list") or []
+
+    return {
+        "id": aweme_id,
+        "text": item.get("desc") or "",
+        "authorMeta": {
+            "name": username, "nickName": author.get("nickname", ""),
+            # follower_count TIDAK terverifikasi ada di respons EnsembleData
+            # (kode historis project ini tidak pernah memakainya) -- kalau
+            # kosong, authority_score fallback ke default 40.0 di
+            # struktur_data.py (SAMA persis pola YouTube), bukan error.
+            "fans": _safe_int(author.get("follower_count")),
+        },
+        "webVideoUrl": f"https://www.tiktok.com/@{username}/video/{aweme_id}" if username else "",
+        "createTimeISO": create_time_iso,
+        "diggCount": _safe_int(stats.get("digg_count")),
+        "playCount": _safe_int(stats.get("play_count")),
+        "commentCount": _safe_int(stats.get("comment_count")),
+        "shareCount": _safe_int(stats.get("share_count")),
+        "videoMeta": {"coverUrl": cover_list[0] if cover_list else None},
+        "commentsDatasetUrl": None,
+    }
+
+
 def _extract_items(response_json) -> list[dict]:
-    items = response_json if isinstance(response_json, list) else response_json.get("items", [])
-    normalized = []
-    for item in items:
-        if not isinstance(item, dict) or not is_valid_tiktok_id(item.get("id")):
-            continue
-        normalized.append(item)
-    return normalized
+    if isinstance(response_json, list):
+        # Bentuk Apify: array langsung.
+        return [item for item in response_json if isinstance(item, dict) and is_valid_tiktok_id(item.get("id"))]
+
+    if isinstance(response_json, dict):
+        # EnsembleData /tt/hashtag/posts: {"data": {"data": [...aweme...]}}
+        # (verified live 2026-07-23, BUKAN {"data":{"aweme_list":[...]}}
+        # spt asumsi awal dari kode historis -- API-nya sudah berubah).
+        outer = response_json.get("data")
+        aweme_list = outer.get("data") if isinstance(outer, dict) else None
+        if isinstance(aweme_list, list):
+            converted = [_convert_ensembledata_item(it) for it in aweme_list if isinstance(it, dict)]
+            return [c for c in converted if c is not None]
+
+        items = response_json.get("items", [])
+        return [item for item in items if isinstance(item, dict) and is_valid_tiktok_id(item.get("id"))]
+
+    return []
 
 
 async def _fetch_comments_dataset(client: httpx.AsyncClient, dataset_url: str) -> list[dict]:
