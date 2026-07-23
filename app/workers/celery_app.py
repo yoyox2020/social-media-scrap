@@ -27,7 +27,7 @@ celery_app = Celery(
     "social_intelligence",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["app.workers.youtube_auto_crawl_worker"],
+    include=["app.workers.youtube_auto_crawl_worker", "app.workers.tiktok_auto_crawl_worker"],
 )
 
 celery_app.conf.update(
@@ -39,6 +39,10 @@ celery_app.conf.update(
     beat_schedule={
         "youtube-auto-crawl-hourly": {
             "task": "youtube.auto_crawl_top_topics",
+            "schedule": 3600.0,
+        },
+        "tiktok-auto-crawl-hourly": {
+            "task": "tiktok.auto_crawl_top_topics",
             "schedule": 3600.0,
         },
     },
