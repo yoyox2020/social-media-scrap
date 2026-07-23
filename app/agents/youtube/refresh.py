@@ -11,8 +11,15 @@ genuinely "paling basi duluan".
 
 Kenapa ini AMAN dari sisi kuota (beda dari search.list yg 100 unit):
 `videos.list`/`channels.list` cuma 1 unit/panggilan DAN bisa batch 50
-ID sekaligus -- refresh 100 post cuma makan ~4 unit total, hampir
-tidak bersaing dgn kuota search.list yg dipakai auto-crawl discovery."""
+ID sekaligus -- refresh 1000 post cuma makan puluhan unit total, hampir
+tidak bersaing dgn kuota search.list yg dipakai auto-crawl discovery.
+
+BATCH_SIZE dinaikkan 100->1000 (2026-07-24, ditemukan nyata: dari
+12.601 post YouTube, 6.663/53% belum disentuh >7 hari krn 100/jam jauh
+lebih kecil drpd total backlog -- sama pola dgn masalah batch TikTok
+sebelumnya). 1000 post = ~20 panggilan videos.list (batch 50 ID),
+selesai dlm hitungan detik (BUKAN spt aktor komentar TikTok yg lambat),
+jadi aman dinaikkan jauh lebih tinggi drpd sebelumnya."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -26,7 +33,7 @@ from app.agents.youtube.api_client import YOUTUBE_API_BASE, looks_like_youtube_k
 from app.domain.posts.models import Post
 from app.services.agent_registry.service import get_key_for_agent
 
-REFRESH_BATCH_SIZE = 100
+REFRESH_BATCH_SIZE = 1000
 YOUTUBE_LIST_MAX_IDS = 50
 
 

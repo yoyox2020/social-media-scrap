@@ -6,14 +6,17 @@ py balasan dari 1 video, ~17 detik/panggilan jauh lebih cepat dari
 komentar top-level) + `reply_id` (= `cid` milik induknya) dipetakan ke
 `Comment.parent_comment_id` yg SUDAH ADA di schema.
 
-Pemilihan post (2026-07-24, permintaan user "hubungkan ke post yang
-paling sedikit komentar dan ambil semuanya" + "cek semua postingan
-viral yang harus diambil semua komentarnya"): urut `metrics.comments`
-(jumlah komentar ASLI di TikTok) TERKECIL dulu -- post "murah" (sedikit
-komentar) selesai FULL duluan dan cepat, tapi krn BATCH_SIZE sekarang
-besar ("unlimited", permintaan user) & 1 panggilan cuma ~17 detik,
-post viral (komentar banyak) tetap kebagian giliran dlm 1 jam yg sama,
-bukan ditunda selamanya.
+Pemilihan post (2026-07-24, DIBALIK dari versi awal atas permintaan
+user "bukan yang paling sedikit tapi maksimalkan semua pengambilan
+komentar dimulai dari yang terviral terbanyak views dan semua harus
+terupdate"): urut `metrics.views` TERBESAR dulu -- post PALING VIRAL
+diproses PALING AWAL tiap batch (bukan post "murah" komentar-sedikit
+spt versi awal), krn prioritas user adalah komentar dari konten paling
+berdampak duluan. BATCH_SIZE tetap besar ("unlimited") & 1 panggilan
+cuma ~17-55 detik, jadi post non-viral (views kecil, di urutan bawah)
+tetap kebagian giliran dlm batch yg sama selama masih di bawah
+BATCH_SIZE -- semua post TikTok yg belum pernah diambil replies-nya
+tercakup, bukan cuma yg viral.
 
 DIPISAH jadi task terjadwal SENDIRI (bukan ditempel ke pipeline
 discovery) -- meski aktor baru ini jauh lebih cepat, tetap best-practice
@@ -52,11 +55,11 @@ def _parse_dt(value) -> datetime | None:
         return None
 
 
-async def _select_low_comment_unenriched_posts(db: AsyncSession, limit: int = BATCH_SIZE) -> list[Post]:
+async def _select_most_viral_unenriched_posts(db: AsyncSession, limit: int = BATCH_SIZE) -> list[Post]:
     result = await db.execute(select(Post).where(Post.platform == "tiktok"))
     posts = result.scalars().all()
     candidates = [p for p in posts if not (p.metadata_ or {}).get("replies_fetched_at")]
-    candidates.sort(key=lambda p: (p.metrics or {}).get("comments", 0))
+    candidates.sort(key=lambda p: (p.metrics or {}).get("views", 0), reverse=True)
     return candidates[:limit]
 
 
@@ -87,7 +90,7 @@ async def _fetch_comments_with_replies(db: AsyncSession, video_id: str) -> tuple
 
 
 async def enrich_viral_posts_with_replies(db: AsyncSession, limit: int = BATCH_SIZE) -> dict:
-    posts = await _select_low_comment_unenriched_posts(db, limit)
+    posts = await _select_most_viral_unenriched_posts(db, limit)
     if not posts:
         return {"processed": 0, "comments_saved": 0, "replies_saved": 0}
 
