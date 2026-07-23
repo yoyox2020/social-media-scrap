@@ -18,9 +18,20 @@ lain):
    spesifik), LALU reset seluruh tanda 'used' platform ini -- jam
    berikutnya otomatis balik ke mode "topic" dari awal lagi (topik yg
    sama diproses ULANG, sekaligus me-refresh statistiknya -- bukan
-   cuma discovery, jg semacam "update")."""
+   cuma discovery, jg semacam "update").
+
+BATAS WAKTU PER-TOPIK (2026-07-23, ditemukan bug NYATA): 1 topik TikTok
+("korupsi") pernah macet 2 JAM di tengah proses (proses worker mati
+tanpa sempat update status) -- krn loop di sini SEKUENSIAL (nunggu 1
+topik selesai baru lanjut topik berikutnya), topik yg macet itu
+BERHASIL MENGUNCI SELURUH 19 topik lain di belakangnya, tidak ada satu
+pun yg sempat dicoba. `asyncio.wait_for` dipasang supaya 1 topik yg
+macet DIPOTONG paksa (dicatat gagal, TIDAK ditandai used spy dicoba
+lagi nanti) dan loop lanjut ke topik berikutnya -- bukan berhenti
+total."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Awaitable, Callable
 
@@ -38,6 +49,7 @@ logger = logging.getLogger(__name__)
 TOP_N_TOPICS = 20
 TRIGGERED_BY = "celery_beat"
 GLOBAL_VIRAL_TOPICS = ["viral", "fyp", "trending"]
+PER_TOPIC_TIMEOUT_SECONDS = 600.0  # 10 menit -- cukup longgar utk proses normal, tapi tetap membatasi
 
 PipelineFn = Callable[[AsyncSession, str, str], Awaitable[dict]]
 
@@ -69,7 +81,9 @@ async def run_auto_crawl_for_platform(platform_label: str, pipeline_fn: Pipeline
         for reco_id, topic in work_items:
             async with session_factory() as db:
                 try:
-                    result = await pipeline_fn(db, topic, TRIGGERED_BY)
+                    result = await asyncio.wait_for(
+                        pipeline_fn(db, topic, TRIGGERED_BY), timeout=PER_TOPIC_TIMEOUT_SECONDS,
+                    )
                     summary["topics_processed"].append({
                         "topic": topic, "status": result["status"],
                         "saved_to_database": result.get("saved_to_database", 0),
@@ -80,6 +94,14 @@ async def run_auto_crawl_for_platform(platform_label: str, pipeline_fn: Pipeline
                             await mark_topics_used(db, platform_label, [reco_id])
                     else:
                         summary["failed"] += 1
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "[auto_crawl_%s] topik '%s' DIPOTONG PAKSA -- macet >%ss, lanjut ke topik berikutnya "
+                        "(TIDAK ditandai used, akan dicoba lagi jadwal berikutnya)",
+                        platform_label, topic, PER_TOPIC_TIMEOUT_SECONDS,
+                    )
+                    summary["topics_processed"].append({"topic": topic, "status": "timeout"})
+                    summary["failed"] += 1
                 except Exception as exc:
                     logger.exception("[auto_crawl_%s] topik '%s' gagal: %s", platform_label, topic, exc)
                     summary["topics_processed"].append({"topic": topic, "status": "error", "error": str(exc)})
