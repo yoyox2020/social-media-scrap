@@ -60,12 +60,19 @@ async def list_sentiment(
     date_from: datetime | None = Query(default=None),
     date_to: datetime | None = Query(default=None),
     page: int = Query(default=1, ge=1),
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=20, ge=1, le=200),
+    post_id: uuid.UUID | None = Query(default=None, description="Filter SATU post spesifik by UUID internal (post_id di response)"),
+    post_external_id: str | None = Query(default=None, description="Filter SATU post spesifik by ID asli platform (mis. video ID YouTube, lebih praktis drpd UUID)"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Daftar hasil sentiment, siap dipakai dashboard/analytics langsung."""
+    """Daftar hasil sentiment, siap dipakai dashboard/analytics langsung.
+    Pakai `post_external_id` (mis. ID video YouTube) utk lihat SEMUA
+    komentar 1 post spesifik -- bukan cuma sample tercampur lintas post."""
     repo = SentimentRepository(db)
-    rows, total = await repo.list_results(platform, sentiment, date_from, date_to, page, limit)
+    rows, total = await repo.list_results(
+        platform, sentiment, date_from, date_to, page, limit,
+        post_id=post_id, post_external_id=post_external_id,
+    )
     return build_success_response({
         "items": [_row_to_dict(la, c, p) for la, c, p in rows],
         "page": page, "limit": limit, "total": total,

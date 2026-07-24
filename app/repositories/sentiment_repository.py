@@ -35,7 +35,8 @@ class SentimentRepository:
         )
 
     def _apply_filters(self, stmt, platform: str | None, sentiment: str | None,
-                        date_from: datetime | None, date_to: datetime | None):
+                        date_from: datetime | None, date_to: datetime | None,
+                        post_id: uuid.UUID | None = None, post_external_id: str | None = None):
         if platform:
             stmt = stmt.where(Post.platform == platform)
         if sentiment:
@@ -44,6 +45,10 @@ class SentimentRepository:
             stmt = stmt.where(LexiconAnalysis.created_at >= date_from)
         if date_to:
             stmt = stmt.where(LexiconAnalysis.created_at <= date_to)
+        if post_id:
+            stmt = stmt.where(Post.id == post_id)
+        if post_external_id:
+            stmt = stmt.where(Post.external_id == post_external_id)
         return stmt
 
     async def get_by_comment_id(self, comment_id: uuid.UUID) -> tuple[LexiconAnalysis, Comment, Post] | None:
@@ -56,8 +61,12 @@ class SentimentRepository:
         self, platform: str | None = None, sentiment: str | None = None,
         date_from: datetime | None = None, date_to: datetime | None = None,
         page: int = 1, limit: int = 20,
+        post_id: uuid.UUID | None = None, post_external_id: str | None = None,
     ) -> tuple[list[tuple[LexiconAnalysis, Comment, Post]], int]:
-        base = self._apply_filters(self._base_query(), platform, sentiment, date_from, date_to)
+        base = self._apply_filters(
+            self._base_query(), platform, sentiment, date_from, date_to,
+            post_id=post_id, post_external_id=post_external_id,
+        )
 
         total = await self.db.scalar(select(func.count()).select_from(base.subquery()))
 
