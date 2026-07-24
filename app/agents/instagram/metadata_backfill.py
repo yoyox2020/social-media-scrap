@@ -10,11 +10,17 @@ struktur-data, Instagram di branch ini belum py pipeline apapun).
 komentar SUDAH tersimpan) -- TIDAK ada gap komentar utk dibackfill
 sekarang, jadi file ini CUMA follower+skor (bukan komentar).
 
-Follower via SocialCrawl (SAMA API+key dgn TikTok, `/v1/instagram/profile`,
-verified live 2026-07-24: data nyata @cristiano 677.873.612 followers)
--- KREDIT DIBAGI dgn TikTok follower backfill (1 akun SocialCrawl,
-budget bersama), makanya limit per-run KECIL+jadwal jarang, sama pola
-dgn app/agents/tiktok/socialcrawl_follower_backfill.py.
+Follower via SocialCrawl (`/v1/instagram/profile`, verified live
+2026-07-24: data nyata @cristiano 677.873.612 followers). Agent
+penanggung jawab: `agent_instagram02` (ditugaskan 2026-07-24, permintaan
+user "satu agen lagi utk update metadata instagram") -- key-nya SALINAN
+persis dari agent_youtube05/TikTok follower backfill (SocialCrawl cuma
+1 akun asli, third_party_apis SENGAJA 1 API = 1 agent eksklusif jadi
+tidak bisa di-link ke 2 agent sekaligus -- disimpan sbg custom_api_key
+langsung di agent_instagram02 sbg gantinya). KREDIT TETAP DIBAGI dgn
+TikTok (budget SocialCrawl sama, bukan 2 kuota terpisah) -- limit
+per-run KECIL+jadwal jarang, sama pola dgn
+app/agents/tiktok/socialcrawl_follower_backfill.py.
 
 Skor dihitung TANPA views (Instagram scraper ini tidak expose views
 publik utk post foto) -- formula log-interaksi SAMA PERSIS dgn
@@ -75,9 +81,9 @@ async def _get_authors_missing_followers(db: AsyncSession, limit: int) -> list[s
 
 async def backfill_instagram_metadata(db: AsyncSession, api_key: str | None = None, author_limit: int = DEFAULT_AUTHOR_LIMIT) -> dict:
     if not api_key:
-        key_info = await get_key_for_agent(db, "agent_youtube05")
+        key_info = await get_key_for_agent(db, "agent_instagram02")
         if not key_info or not key_info.get("api_key"):
-            return {"error": "agent_youtube05 belum punya key SocialCrawl", "authors_checked": 0}
+            return {"error": "agent_instagram02 belum punya key SocialCrawl", "authors_checked": 0}
         api_key = key_info["api_key"]
 
     authors_to_fetch = await _get_authors_missing_followers(db, author_limit)
