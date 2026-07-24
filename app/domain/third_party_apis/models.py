@@ -19,6 +19,11 @@ class ThirdPartyApi(Base, UUIDMixin):
 
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     provider: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    # platform_group (2026-07-24) -- tag BEBAS (youtube/tiktok/facebook/
+    # instagram/dll), dipakai get_next_available_key() rotasi TERISOLASI
+    # per-platform. NULL = pool bersama/lama (fallback kalau grup
+    # platform ybs kosong), BUKAN error/tidak lengkap.
+    platform_group: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     api_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     base_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     account_email: Mapped[str | None] = mapped_column(String(255), nullable=True)

@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.posts.models import Post
 from app.services.agent_registry.service import get_key_for_agent
+from app.services.third_party_apis.service import get_next_available_key
 
 SOCIALCRAWL_BASE_URL = "https://www.socialcrawl.dev/v1"
 MIN_CREDIT_BUFFER = 5
@@ -73,10 +74,17 @@ async def _get_authors_missing_followers(db: AsyncSession, limit: int) -> list[s
 
 async def backfill_facebook_metadata(db: AsyncSession, api_key: str | None = None, author_limit: int = DEFAULT_AUTHOR_LIMIT) -> dict:
     if not api_key:
-        key_info = await get_key_for_agent(db, "agent_facebook05")
-        if not key_info or not key_info.get("api_key"):
-            return {"error": "agent_facebook05 belum punya key SocialCrawl", "authors_checked": 0}
-        api_key = key_info["api_key"]
+        # Rotasi grup platform DULU (2026-07-24) -- akun SocialCrawl BARU
+        # yg ditag platform_group="facebook" otomatis kepakai di sini.
+        # Fallback ke key lama di agent_facebook05 kalau grup kosong.
+        key_entry = await get_next_available_key(db, "SocialCrawl", platform_group="facebook")
+        if key_entry and key_entry.api_key:
+            api_key = key_entry.api_key
+        else:
+            key_info = await get_key_for_agent(db, "agent_facebook05")
+            if not key_info or not key_info.get("api_key"):
+                return {"error": "Tidak ada key SocialCrawl tersedia (grup 'facebook' kosong & agent_facebook05 jg belum punya)", "authors_checked": 0}
+            api_key = key_info["api_key"]
 
     authors_to_fetch = await _get_authors_missing_followers(db, author_limit)
     followers_by_author: dict[str, int] = {}

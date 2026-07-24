@@ -26,6 +26,10 @@ class AddApiRequest(BaseModel):
     account_email: str | None = Field(default=None, max_length=255)
     description: str | None = Field(default=None, max_length=2000)
     agent_name: str | None = Field(default=None, max_length=255)
+    platform_group: str | None = Field(
+        default=None, max_length=100,
+        description="Tag platform (youtube/tiktok/facebook/instagram/dll) -- key ini CUMA dipakai rotasi utk platform ini, tidak berebut kuota dgn platform lain.",
+    )
 
 
 class UpdateApiRequest(BaseModel):
@@ -36,6 +40,7 @@ class UpdateApiRequest(BaseModel):
     account_email: str | None = Field(default=None, max_length=255)
     description: str | None = Field(default=None, max_length=2000)
     enabled: bool | None = Field(default=None)
+    platform_group: str | None = Field(default=None, max_length=100)
 
 
 class LinkAgentRequest(BaseModel):
@@ -56,7 +61,7 @@ async def add_api(
 ):
     entry = await service.add_api(
         db, body.name, body.provider, body.api_key, body.base_url, body.account_email, body.description,
-        agent_name=body.agent_name,
+        agent_name=body.agent_name, platform_group=body.platform_group,
     )
     return build_success_response({"id": str(entry.id), "name": entry.name})
 
@@ -70,7 +75,7 @@ async def update_api(
 ):
     entry = await service.update_api(
         db, api_id, body.name, body.provider, body.api_key, body.base_url,
-        body.account_email, body.description, body.enabled,
+        body.account_email, body.description, body.enabled, body.platform_group,
     )
     if not entry:
         raise NotFoundError(f"Third-party API {api_id} tidak ditemukan")

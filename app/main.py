@@ -193,7 +193,7 @@ async def kelola_agent_page():
 <div style="max-width:560px;background:#1e293b;border-radius:8px;padding:16px">
   <div style="font-size:0.85rem;font-weight:600;margin-bottom:10px">+ Tambah API Pihak Ketiga</div>
   <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:10px">
-    Katalog bebas (Apify, OpenRouter, EnsembleData, Firecrawl, dll). Satu API cuma boleh dipakai satu agent -- pilih agent tujuannya sekalian di sini (opsional, bisa dihubungkan belakangan).
+    Katalog bebas (Apify, OpenRouter, EnsembleData, SocialCrawl, dll). Pilih "Platform" -- key ini OTOMATIS cuma dipakai rotasi utk platform itu (tidak berebut kuota dgn platform lain), tanpa perlu pilih agent spesifik lagi.
   </div>
   <input type="text" id="tpa-new-name" placeholder="Nama (mis. Apify Akun 1)">
   <input type="text" id="tpa-new-provider" list="tpa-provider-list" placeholder="Provider (pilih dari daftar atau ketik sendiri)">
@@ -206,9 +206,18 @@ async def kelola_agent_page():
     <option value="Firecrawl">
     <option value="Tavily">
     <option value="YouTube Data API v3">
+    <option value="SocialCrawl">
+    <option value="ScrapeBadger">
     <option value="Facebook / Meta Graph API">
     <option value="Instagram (cookie)">
   </datalist>
+  <select id="tpa-new-platform-group">
+    <option value="">Platform (kosongkan = pool bersama/lama)</option>
+    <option value="youtube">YouTube</option>
+    <option value="tiktok">TikTok</option>
+    <option value="facebook">Facebook</option>
+    <option value="instagram">Instagram</option>
+  </select>
   <input type="password" id="tpa-new-apikey" placeholder="API key (opsional)">
   <input type="text" id="tpa-new-baseurl" placeholder="Base URL (opsional)">
   <input type="text" id="tpa-new-account" placeholder="Akun/email (opsional)">
@@ -669,6 +678,7 @@ async function tpaLoad() {
         <div style="margin-bottom:6px;display:flex;align-items:center;gap:6px">
           <input type="text" id="tpa-editname-${a.id}" value="${a.name}" style="width:180px;padding:4px 6px;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:0.8rem;font-weight:600;margin-bottom:0">
           <span class="pill" style="background:#1e3a5f;color:#60a5fa">${a.provider}</span>
+          ${a.platform_group ? `<span class="pill" style="background:#064e3b;color:#4ade80;text-transform:capitalize">${a.platform_group}</span>` : '<span class="pill" style="background:#334155;color:#94a3b8">pool bersama</span>'}
           ${!a.enabled ? '<span class="pill" style="background:#450a0a;color:#f87171">nonaktif</span>' : ''}
           <button class="retry-btn" style="padding:4px 8px;font-size:0.7rem" onclick="tpaRename('${a.id}')">Simpan Nama</button>
           <button class="retry-btn" style="margin-left:auto;padding:4px 10px;font-size:0.7rem;background:#7f1d1d" onclick="tpaDelete('${a.id}')">Hapus</button>
@@ -685,6 +695,16 @@ async function tpaLoad() {
             : '<i>belum ada</i>'}
         </div>
         ${a.last_error ? `<div style="font-size:0.7rem;color:#c96f5c;margin-bottom:6px">&#9888; Error terakhir (${new Date(a.last_error_at).toLocaleString('id-ID')}): ${a.last_error.slice(0, 200)}</div>` : ''}
+        <div style="display:flex;gap:6px;margin-bottom:6px">
+          <select id="tpa-platformsel-${a.id}" style="width:auto;flex:1;margin-bottom:0">
+            <option value="" ${!a.platform_group ? 'selected' : ''}>Platform: pool bersama/lama</option>
+            <option value="youtube" ${a.platform_group === 'youtube' ? 'selected' : ''}>YouTube</option>
+            <option value="tiktok" ${a.platform_group === 'tiktok' ? 'selected' : ''}>TikTok</option>
+            <option value="facebook" ${a.platform_group === 'facebook' ? 'selected' : ''}>Facebook</option>
+            <option value="instagram" ${a.platform_group === 'instagram' ? 'selected' : ''}>Instagram</option>
+          </select>
+          <button class="retry-btn" style="padding:6px 12px;font-size:0.75rem" onclick="tpaSetPlatformGroup('${a.id}')">Simpan Platform</button>
+        </div>
         <div style="display:flex;gap:6px">
           <select id="tpa-linksel-${a.id}" style="width:auto;flex:1;margin-bottom:0">
             <option value="">-- tidak ada agent --</option>
@@ -714,6 +734,7 @@ async function tpaAddNew() {
     account_email: document.getElementById('tpa-new-account').value.trim() || null,
     description: document.getElementById('tpa-new-desc').value.trim() || null,
     agent_name: document.getElementById('tpa-new-agent').value || null,
+    platform_group: document.getElementById('tpa-new-platform-group').value || null,
   };
   const msgEl = document.getElementById('tpa-add-msg');
   try {
@@ -747,6 +768,22 @@ async function tpaRename(apiId) {
   try {
     const r = await fetch(window.location.origin + '/api/v1/third-party-apis/' + apiId, {
       method: 'PATCH', headers: agAuthHeaders(), body: JSON.stringify({ name: value }),
+    });
+    const j = await r.json();
+    if (!r.ok) { alert('Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown')); return; }
+    tpaLoad();
+  } catch (e) {
+    alert('Gagal: ' + e.message);
+  }
+}
+
+async function tpaSetPlatformGroup(apiId) {
+  const sel = document.getElementById('tpa-platformsel-' + apiId);
+  const value = sel.value || null;
+  if (!agToken()) { alert('Isi token login (Bearer) dulu'); return; }
+  try {
+    const r = await fetch(window.location.origin + '/api/v1/third-party-apis/' + apiId, {
+      method: 'PATCH', headers: agAuthHeaders(), body: JSON.stringify({ platform_group: value || '' }),
     });
     const j = await r.json();
     if (!r.ok) { alert('Gagal: ' + ((j.error && j.error.message) || j.detail || j.message || 'unknown')); return; }

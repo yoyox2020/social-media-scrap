@@ -33,10 +33,9 @@ from sqlalchemy import BigInteger, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.agent_struktur_data import _parse_dt
-from app.agents.youtube.api_client import fetch_comments_for_video, looks_like_youtube_key
+from app.agents.youtube.api_client import fetch_comments_for_video, get_youtube_api_key
 from app.domain.comments.models import Comment
 from app.domain.posts.models import Post
-from app.services.agent_registry.service import get_key_for_agent
 
 # ~300 post/run x rata-rata 1-2 panggilan (kebanyakan video BUKAN
 # super-viral, jarang butuh full 5 panggilan paginasi) -- estimasi
@@ -47,10 +46,9 @@ BATCH_SIZE = 300
 
 async def backfill_missing_youtube_comments(db: AsyncSession, api_key: str | None = None, limit: int = BATCH_SIZE) -> dict:
     if not api_key:
-        key_info = await get_key_for_agent(db, "agent_youtube01")
-        if not key_info or not looks_like_youtube_key(key_info.get("api_key")):
-            return {"error": "agent_youtube01 tidak punya key YouTube asli", "checked": 0}
-        api_key = key_info["api_key"]
+        api_key = await get_youtube_api_key(db)
+        if not api_key:
+            return {"error": "Tidak ada key YouTube Data API tersedia (grup 'youtube' kosong & agent_youtube01 jg belum punya)", "checked": 0}
 
     # Post YouTube yg metrics.comments > 0 (YouTube bilang ADA komentar)
     # TAPI belum py baris comments SAMA SEKALI -- prioritas komentar

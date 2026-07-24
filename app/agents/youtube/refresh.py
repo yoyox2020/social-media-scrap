@@ -29,19 +29,17 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.agent_struktur_data import _compute_scores, _safe_int
-from app.agents.youtube.api_client import YOUTUBE_API_BASE, looks_like_youtube_key
+from app.agents.youtube.api_client import YOUTUBE_API_BASE, get_youtube_api_key
 from app.domain.posts.models import Post
-from app.services.agent_registry.service import get_key_for_agent
 
 REFRESH_BATCH_SIZE = 1000
 YOUTUBE_LIST_MAX_IDS = 50
 
 
 async def refresh_stale_youtube_posts(db: AsyncSession, limit: int = REFRESH_BATCH_SIZE) -> dict:
-    key_info = await get_key_for_agent(db, "agent_youtube01")
-    if not key_info or not looks_like_youtube_key(key_info.get("api_key")):
-        return {"refreshed": 0, "not_found": 0, "total_checked": 0, "error": "agent_youtube01 tidak punya key YouTube asli"}
-    api_key = key_info["api_key"]
+    api_key = await get_youtube_api_key(db)
+    if not api_key:
+        return {"refreshed": 0, "not_found": 0, "total_checked": 0, "error": "Tidak ada key YouTube Data API tersedia (grup 'youtube' kosong & agent_youtube01 jg belum punya)"}
 
     result = await db.execute(
         select(Post).where(Post.platform == "youtube").order_by(Post.collected_at.asc()).limit(limit)

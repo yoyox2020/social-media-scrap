@@ -17,7 +17,7 @@ from app.shared.exceptions import ConflictError
 async def add_api(
     db: AsyncSession, name: str, provider: str, api_key: str | None = None,
     base_url: str | None = None, account_email: str | None = None, description: str | None = None,
-    agent_name: str | None = None,
+    agent_name: str | None = None, platform_group: str | None = None,
 ) -> ThirdPartyApi:
     agent_name = agent_name.strip() if agent_name else None
     if agent_name:
@@ -32,6 +32,7 @@ async def add_api(
         base_url=(base_url or "").strip() or None,
         account_email=(account_email or "").strip() or None,
         description=(description or "").strip() or None,
+        platform_group=(platform_group or "").strip().lower() or None,
         enabled=True, created_at=now, updated_at=now,
     )
     db.add(entry)
@@ -45,7 +46,7 @@ async def add_api(
 async def update_api(
     db: AsyncSession, api_id: uuid.UUID, name: str | None = None, provider: str | None = None,
     api_key: str | None = None, base_url: str | None = None, account_email: str | None = None,
-    description: str | None = None, enabled: bool | None = None,
+    description: str | None = None, enabled: bool | None = None, platform_group: str | None = None,
 ) -> ThirdPartyApi | None:
     entry = await db.get(ThirdPartyApi, api_id)
     if not entry:
@@ -64,6 +65,8 @@ async def update_api(
         entry.description = description.strip() or None
     if enabled is not None:
         entry.enabled = enabled
+    if platform_group is not None:
+        entry.platform_group = platform_group.strip().lower() or None
     entry.updated_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(entry)
@@ -150,6 +153,7 @@ async def list_apis(db: AsyncSession) -> list[dict]:
     return [
         {
             "id": str(a.id), "name": a.name, "provider": a.provider,
+            "platform_group": a.platform_group,
             "masked_key": _mask(a.api_key), "is_set": bool(a.api_key),
             "base_url": a.base_url, "account_email": a.account_email,
             "description": a.description, "enabled": a.enabled,
@@ -181,7 +185,7 @@ async def find_api_id_by_agent(db: AsyncSession, agent_name: str) -> uuid.UUID |
     return link.third_party_api_id if link else None
 
 
-async def get_next_available_key(db: AsyncSession, provider: str) -> ThirdPartyApi | None:
+async def get_next_available_key(db: AsyncSession, provider: str, platform_group: str | None = None) -> ThirdPartyApi | None:
     """Rotasi GENERIK lintas SEMUA entry `provider` ini yg enabled=True
     (2026-07-23, permintaan user "auto rotasi berapapun API key yang
     saya daftarkan") -- utamakan yg BELUM PERNAH error, lalu yg PALING
@@ -191,10 +195,38 @@ async def get_next_available_key(db: AsyncSession, provider: str) -> ThirdPartyA
     via placeholder {{ROTATE:<Provider>}} -- generik lintas provider
     APA PUN yg terdaftar di katalog ini, BUKAN Apify-only, supaya
     provider baru tinggal didaftarkan lewat /manage-api-keys, TANPA
-    kode Python baru."""
+    kode Python baru.
+
+    ISOLASI PER-PLATFORM (2026-07-24, permintaan user "setiap platform
+    memiliki 1 group... jadi setiap agent pun hanya bisa mengambil dari
+    group tersebut") -- kalau `platform_group` diberikan, PRIORITASKAN
+    key yg tag-nya PERSIS cocok (grup platform itu sendiri, tidak
+    berebut sama platform lain). Kalau grup itu kosong/semua sedang
+    exhausted (tidak ada baris platform_group cocok yg tersedia), FALLBACK
+    ke pool BERSAMA (platform_group IS NULL / belum di-tag) -- supaya
+    kapasitas LAMA yg sudah ada (SEBELUM fitur grup ini dibuat) tidak
+    hilang begitu saja, cuma jadi cadangan kalau grup platform ybs habis."""
+    base_filters = [ThirdPartyApi.provider == provider, ThirdPartyApi.enabled.is_(True), ThirdPartyApi.api_key.isnot(None)]
+
+    if platform_group:
+        grouped = await db.execute(
+            select(ThirdPartyApi)
+            .where(*base_filters, ThirdPartyApi.platform_group == platform_group.strip().lower())
+            .order_by(ThirdPartyApi.last_error_at.asc().nulls_first())
+        )
+        entry = grouped.scalars().first()
+        if entry:
+            return entry
+        # Grup platform ini kosong/exhausted -- fallback ke pool bersama
+        # (BUKAN grup platform LAIN, cuma yg belum di-tag sama sekali).
+        shared = await db.execute(
+            select(ThirdPartyApi)
+            .where(*base_filters, ThirdPartyApi.platform_group.is_(None))
+            .order_by(ThirdPartyApi.last_error_at.asc().nulls_first())
+        )
+        return shared.scalars().first()
+
     result = await db.execute(
-        select(ThirdPartyApi)
-        .where(ThirdPartyApi.provider == provider, ThirdPartyApi.enabled.is_(True), ThirdPartyApi.api_key.isnot(None))
-        .order_by(ThirdPartyApi.last_error_at.asc().nulls_first())
+        select(ThirdPartyApi).where(*base_filters).order_by(ThirdPartyApi.last_error_at.asc().nulls_first())
     )
     return result.scalars().first()

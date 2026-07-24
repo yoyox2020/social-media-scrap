@@ -51,6 +51,29 @@ def looks_like_youtube_key(api_key: str | None) -> bool:
     return bool(api_key) and api_key.startswith("AIza")
 
 
+async def get_youtube_api_key(db: AsyncSession) -> str | None:
+    """SATU titik pengambilan key YouTube Data API utk refresh/completeness/
+    comment_backfill (2026-07-24) -- SEBELUMNYA ketiganya hardcode
+    `get_key_for_agent(db, "agent_youtube01")` doang, TIDAK PERNAH pakai
+    2 key YouTube Data API LAIN yg SUDAH terdaftar di katalog
+    third_party_apis (agent_youtube02/03) -- kapasitas kuota nganggur
+    ditemukan saat audit "setiap platform py 1 group rotasi" 2026-07-24.
+    Sekarang: rotasi grup platform_group="youtube" DULU (otomatis pakai
+    key manapun yg available, termasuk yg BARU ditambah user nanti),
+    fallback ke agent_youtube01 kalau grup kosong (kompatibel dgn setup
+    lama)."""
+    from app.services.third_party_apis.service import get_next_available_key
+
+    key_entry = await get_next_available_key(db, "YouTube Data API v3", platform_group="youtube")
+    if key_entry and looks_like_youtube_key(key_entry.api_key):
+        return key_entry.api_key
+
+    key_info = await get_key_for_agent(db, "agent_youtube01")
+    if key_info and looks_like_youtube_key(key_info.get("api_key")):
+        return key_info["api_key"]
+    return None
+
+
 async def fetch_comments_for_video(
     client: httpx.AsyncClient, api_key: str, video_id: str, max_comments: int = MAX_COMMENTS_PER_VIDEO,
 ) -> list[dict]:

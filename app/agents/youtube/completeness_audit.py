@@ -36,9 +36,8 @@ from sqlalchemy import case, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.agent_struktur_data import _compute_scores, _safe_int
-from app.agents.youtube.api_client import YOUTUBE_API_BASE, looks_like_youtube_key
+from app.agents.youtube.api_client import YOUTUBE_API_BASE, get_youtube_api_key
 from app.domain.posts.models import Post
-from app.services.agent_registry.service import get_key_for_agent
 
 YOUTUBE_LIST_MAX_IDS = 50
 # Commit tiap N batch video (bukan 1x di akhir) -- supaya progress AMAN
@@ -79,10 +78,9 @@ async def _fetch_channel_batch(client: httpx.AsyncClient, ids: list[str], api_ke
 
 async def audit_and_backfill_all_youtube_posts(db: AsyncSession, api_key: str | None = None) -> dict:
     if not api_key:
-        key_info = await get_key_for_agent(db, "agent_youtube01")
-        if not key_info or not looks_like_youtube_key(key_info.get("api_key")):
-            return {"error": "agent_youtube01 tidak punya key YouTube asli", "checked": 0}
-        api_key = key_info["api_key"]
+        api_key = await get_youtube_api_key(db)
+        if not api_key:
+            return {"error": "Tidak ada key YouTube Data API tersedia (grup 'youtube' kosong & agent_youtube01 jg belum punya)", "checked": 0}
 
     result = await db.execute(
         select(Post).where(Post.platform == "youtube").order_by(_priority_order(), Post.collected_at.asc())

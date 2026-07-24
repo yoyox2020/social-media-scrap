@@ -45,6 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.tiktok.struktur_data import _compute_scores
 from app.domain.posts.models import Post
 from app.services.agent_registry.service import get_key_for_agent
+from app.services.third_party_apis.service import get_next_available_key
 
 SOCIALCRAWL_BASE_URL = "https://www.socialcrawl.dev/v1"
 # Sengaja jauh di bawah limit riil (99 kredit tersisa saat ditulis) --
@@ -71,10 +72,17 @@ async def _get_authors_missing_followers(db: AsyncSession, limit: int) -> list[s
 
 async def backfill_tiktok_author_followers(db: AsyncSession, api_key: str | None = None, limit: int = DEFAULT_LIMIT) -> dict:
     if not api_key:
-        key_info = await get_key_for_agent(db, "agent_tiktok03")
-        if not key_info or not key_info.get("api_key"):
-            return {"error": "agent_tiktok03 belum punya key SocialCrawl", "checked": 0}
-        api_key = key_info["api_key"]
+        # Rotasi grup platform DULU (2026-07-24) -- akun SocialCrawl BARU
+        # yg ditag platform_group="tiktok" otomatis kepakai di sini.
+        # Fallback ke key lama di agent_tiktok03 kalau grup kosong.
+        key_entry = await get_next_available_key(db, "SocialCrawl", platform_group="tiktok")
+        if key_entry and key_entry.api_key:
+            api_key = key_entry.api_key
+        else:
+            key_info = await get_key_for_agent(db, "agent_tiktok03")
+            if not key_info or not key_info.get("api_key"):
+                return {"error": "Tidak ada key SocialCrawl tersedia (grup 'tiktok' kosong & agent_tiktok03 jg belum punya)", "checked": 0}
+            api_key = key_info["api_key"]
 
     authors = await _get_authors_missing_followers(db, limit)
     if not authors:

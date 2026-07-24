@@ -116,7 +116,7 @@ async def fetch_posts_for_topic(db: AsyncSession, topic: str, results_per_profil
     last_error: str | None = None
 
     for _attempt in range(MAX_ROTATION_ATTEMPTS):
-        key_entry = await get_next_available_key(db, "Apify")
+        key_entry = await get_next_available_key(db, "Apify", platform_group="instagram")
         if not key_entry or key_entry.id in tried_key_ids:
             last_error = "Semua token Apify sudah dicoba & gagal -- menunggu jadwal berikutnya"
             break

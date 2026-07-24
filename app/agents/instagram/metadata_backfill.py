@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.posts.models import Post
 from app.services.agent_registry.service import get_key_for_agent
+from app.services.third_party_apis.service import get_next_available_key
 
 SOCIALCRAWL_BASE_URL = "https://www.socialcrawl.dev/v1"
 MIN_CREDIT_BUFFER = 5
@@ -81,10 +82,20 @@ async def _get_authors_missing_followers(db: AsyncSession, limit: int) -> list[s
 
 async def backfill_instagram_metadata(db: AsyncSession, api_key: str | None = None, author_limit: int = DEFAULT_AUTHOR_LIMIT) -> dict:
     if not api_key:
-        key_info = await get_key_for_agent(db, "agent_instagram02")
-        if not key_info or not key_info.get("api_key"):
-            return {"error": "agent_instagram02 belum punya key SocialCrawl", "authors_checked": 0}
-        api_key = key_info["api_key"]
+        # Rotasi grup platform DULU (2026-07-24, "setiap platform py 1
+        # group... rotasi otomatis") -- kalau user nambah akun SocialCrawl
+        # BARU yg di-tag platform_group="instagram", otomatis kepakai di
+        # sini tanpa kode baru. Fallback ke key lama di agent_instagram02
+        # (custom_api_key, BUKAN di katalog rotasi) kalau grup kosong --
+        # jaga kompatibilitas dgn setup SEBELUM fitur grup ini ada.
+        key_entry = await get_next_available_key(db, "SocialCrawl", platform_group="instagram")
+        if key_entry and key_entry.api_key:
+            api_key = key_entry.api_key
+        else:
+            key_info = await get_key_for_agent(db, "agent_instagram02")
+            if not key_info or not key_info.get("api_key"):
+                return {"error": "Tidak ada key SocialCrawl tersedia (grup 'instagram' kosong & agent_instagram02 jg belum punya)", "authors_checked": 0}
+            api_key = key_info["api_key"]
 
     authors_to_fetch = await _get_authors_missing_followers(db, author_limit)
     followers_by_author: dict[str, int] = {}

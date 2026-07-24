@@ -211,12 +211,31 @@ def _parse_headers(headers_text: str | None) -> dict[str, str]:
     return result
 
 
-async def _resolve_rotating_keys(db: AsyncSession, *texts: str | None) -> tuple[dict[str, str], dict[str, uuid.UUID]]:
+_AGENT_NAME_PLATFORM_RE = re.compile(r"^agent_([a-z]+)\d*$")
+
+
+def derive_platform_group(agent_name: str | None) -> str | None:
+    """"agent_facebook01" -> "facebook", "agent_tiktok03" -> "tiktok",
+    dst (2026-07-24, permintaan user "ketika saya input key sudah jelas
+    utk platform yang mana, jadi saya tidak memilih2 lagi utk agent yang
+    mana") -- platform_group DIDERIVE OTOMATIS dari nama agent pemilik
+    curl target, TIDAK perlu placeholder/syntax baru di URL/body target."""
+    if not agent_name:
+        return None
+    m = _AGENT_NAME_PLATFORM_RE.match(agent_name.strip())
+    return m.group(1) if m else None
+
+
+async def _resolve_rotating_keys(
+    db: AsyncSession, *texts: str | None, platform_group: str | None = None,
+) -> tuple[dict[str, str], dict[str, uuid.UUID]]:
     """Cari SEMUA {{ROTATE:<Provider>}} di url/headers/body, ambil 1 key
     yg SEDANG paling layak pakai utk tiap provider yg disebut (lihat
     get_next_available_key -- generik, BUKAN Apify-only). Balikin
     substitusi teks + id key yg dipakai (utk dilaporkan gagal nanti
-    kalau requestnya emang gagal)."""
+    kalau requestnya emang gagal). `platform_group` (2026-07-24) --
+    diteruskan ke get_next_available_key spy rotasi TERISOLASI per-
+    platform (fallback otomatis ke pool bersama kalau grup itu kosong)."""
     from app.services.third_party_apis.service import get_next_available_key
 
     providers: set[str] = set()
@@ -227,7 +246,7 @@ async def _resolve_rotating_keys(db: AsyncSession, *texts: str | None) -> tuple[
     substitutions: dict[str, str] = {}
     used_key_ids: dict[str, uuid.UUID] = {}
     for provider in providers:
-        entry = await get_next_available_key(db, provider)
+        entry = await get_next_available_key(db, provider, platform_group=platform_group)
         if entry:
             substitutions[f"{{{{ROTATE:{provider}}}}}"] = entry.api_key
             used_key_ids[provider] = entry.id
@@ -274,10 +293,13 @@ async def execute_target(
 
     last_result: dict = {"success": False, "status_code": None, "resolved_url": target.url, "error": "unknown"}
     tried_key_ids: set[uuid.UUID] = set()
+    platform_group = derive_platform_group(target.agent_name)
 
     for attempt in range(MAX_ROTATION_ATTEMPTS):
         async with _DB_LOCK:
-            rotate_substitutions, used_key_ids = await _resolve_rotating_keys(db, target.url, target.headers, target.body)
+            rotate_substitutions, used_key_ids = await _resolve_rotating_keys(
+                db, target.url, target.headers, target.body, platform_group=platform_group,
+            )
         # Kalau target ini pakai {{ROTATE:...}} TAPI semua key provider
         # itu sudah dicoba & gagal di percobaan sebelumnya (get_next_available_key
         # akhirnya muter balik ke key yg SAMA krn tidak ada lagi yg baru) --
