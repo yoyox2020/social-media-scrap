@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.agent_curl_targets.models import AgentCurlTarget
+from app.shared.db_concurrency import SHARED_SESSION_LOCK
 
 # execute_target() dipanggil KONKUREN lintas child (coordinator.py tiap
 # platform pakai asyncio.gather dgn 1 AsyncSession yg SAMA dibagi ke
@@ -28,12 +29,14 @@ from app.domain.agent_curl_targets.models import AgentCurlTarget
 # oleh >1 coroutine (didokumentasikan resmi), db.get/commit yg tabrakan
 # bisa lempar IllegalStateChangeError. Ditemukan NYATA 2026-07-24 (smoke
 # test pipeline Facebook, 5 child gagal BERSAMAAN krn semua token Apify
-# exhausted -> mark_api_error() konkuren -> crash). Lock ini SENGAJA
-# HANYA membungkus bagian yg sentuh `db` (get/resolve-key/mark_api_error),
-# BUKAN seluruh fungsi -- panggilan HTTP aktual (httpx, paling lama)
-# tetap jalan konkuren tanpa lock, jadi throughput lintas child TIDAK
-# banyak berkurang.
-_DB_LOCK = asyncio.Lock()
+# exhausted -> mark_api_error() konkuren -> crash). SEKARANG pakai
+# SHARED_SESSION_LOCK (2026-07-24, lihat app/shared/db_concurrency.py) --
+# BUKAN lock lokal terpisah lagi, krn ditemukan lock independen di 3
+# modul beda (sini, third_party_apis, activity_log) TETAP bisa saling
+# bentrok walau masing2 "aman" sendiri-sendiri (root cause crash Twitter
+# reply-fetching). Lock ini SENGAJA HANYA membungkus bagian yg sentuh
+# `db` (get/resolve-key/mark_api_error), BUKAN seluruh fungsi -- panggilan
+# HTTP aktual (httpx, paling lama) tetap jalan konkuren tanpa lock.
 
 # Status code yg berarti "key ini kena limit/expired/ditolak" -- SAMA
 # persis dgn AI_KEY_FAILURE_STATUS_CODES di agent_struktur_data.py,
@@ -284,7 +287,7 @@ async def execute_target(
     brarti gagal utk SEKARANG, dicoba lagi otomatis di jadwal
     berikutnya, BUKAN blocking-wait krn saldo baru biasanya reset
     bulanan bukan dlm hitungan detik)."""
-    async with _DB_LOCK:
+    async with SHARED_SESSION_LOCK:
         target = await db.get(AgentCurlTarget, target_id)
     if not target:
         return None
@@ -296,7 +299,7 @@ async def execute_target(
     platform_group = derive_platform_group(target.agent_name)
 
     for attempt in range(MAX_ROTATION_ATTEMPTS):
-        async with _DB_LOCK:
+        async with SHARED_SESSION_LOCK:
             rotate_substitutions, used_key_ids = await _resolve_rotating_keys(
                 db, target.url, target.headers, target.body, platform_group=platform_group,
             )
@@ -323,7 +326,7 @@ async def execute_target(
                     content=body_resolved.encode() if body_resolved else None,
                 )
             if used_key_ids and resp.status_code in ROTATION_FAILURE_STATUS_CODES:
-                async with _DB_LOCK:
+                async with SHARED_SESSION_LOCK:
                     for key_id in used_key_ids.values():
                         await mark_api_error(db, key_id, f"HTTP {resp.status_code}: {resp.text[:500]}")
                         tried_key_ids.add(key_id)
@@ -345,7 +348,7 @@ async def execute_target(
             }
         except Exception as exc:
             if used_key_ids:
-                async with _DB_LOCK:
+                async with SHARED_SESSION_LOCK:
                     for key_id in used_key_ids.values():
                         await mark_api_error(db, key_id, str(exc)[:500])
                         tried_key_ids.add(key_id)

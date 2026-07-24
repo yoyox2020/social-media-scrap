@@ -4,7 +4,6 @@ Lihat docstring app/domain/third_party_apis/models.py utk desain.
 """
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import datetime, timezone
 
@@ -12,17 +11,15 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.third_party_apis.models import ThirdPartyApi, ThirdPartyApiAgentLink
+from app.shared.db_concurrency import SHARED_SESSION_LOCK
 from app.shared.exceptions import ConflictError
 
 # get_next_available_key()/mark_api_error() dipanggil KONKUREN dari
 # BANYAK coordinator platform (asyncio.gather lintas child, 1 AsyncSession
-# dibagi) -- AsyncSession TIDAK aman dipakai konkuren (ditemukan+fixed
-# di execute_target()/curl-target 2026-07-24, TAPI caller LANGSUNG spt
-# instagram/threads/crawler_client.py tidak lewat situ, jadi BELUM
-# terlindungi kalau cuma fix di 1 tempat). Lock DIPASANG DI SINI (sumber
-# fungsi asli), bukan di tiap pemanggil, spy caller BARU otomatis aman
-# tanpa perlu inget bungkus lock manual sendiri-sendiri.
-_ROTATION_DB_LOCK = asyncio.Lock()
+# dibagi) -- AsyncSession TIDAK aman dipakai konkuren. SEKARANG pakai
+# SHARED_SESSION_LOCK (2026-07-24, lihat app/shared/db_concurrency.py) --
+# BUKAN lock lokal sendiri lagi, krn lock terpisah dari log_activity()
+# TETAP bisa bentrok satu sama lain walau masing2 "aman" sendiri-sendiri.
 
 
 async def add_api(
@@ -180,7 +177,7 @@ async def mark_api_error(db: AsyncSession, api_id: uuid.UUID, error_message: str
     """Catat error TERAKHIR (2026-07-22, permintaan user) -- tampil di
     kartu list, TIDAK ubah `enabled` (bukan sistem status/reload
     terpisah, cuma info log per kotak)."""
-    async with _ROTATION_DB_LOCK:
+    async with SHARED_SESSION_LOCK:
         entry = await db.get(ThirdPartyApi, api_id)
         if not entry:
             return
@@ -220,7 +217,7 @@ async def get_next_available_key(db: AsyncSession, provider: str, platform_group
     hilang begitu saja, cuma jadi cadangan kalau grup platform ybs habis."""
     base_filters = [ThirdPartyApi.provider == provider, ThirdPartyApi.enabled.is_(True), ThirdPartyApi.api_key.isnot(None)]
 
-    async with _ROTATION_DB_LOCK:
+    async with SHARED_SESSION_LOCK:
         if platform_group:
             grouped = await db.execute(
                 select(ThirdPartyApi)

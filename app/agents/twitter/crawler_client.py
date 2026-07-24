@@ -17,7 +17,17 @@ klasik "Tue Jul 07 10:15:23 +0000 2026", BUKAN ISO -- lihat
 _parse_twitter_date()), `favorites, retweets, replies, views` (STRING),
 `quotes`, `author.{rest_id,name,screen_name,followers_count,blue_verified}`.
 Cocok PERSIS dgn 124 post Twitter lama yg sudah ada di DB
-(metadata.likes/retweets/quotes/views/comments/followers)."""
+(metadata.likes/retweets/quotes/views/comments/followers).
+
+BALASAN/KOMENTAR (2026-07-24, ditambahkan -- gap ditemukan user "komentar
+harus diambil"): TIDAK inline di item tweet, perlu actor call TERPISAH
+per tweet (mode "responses", dipicu dgn `post_id`, BEDA dari mode search
+di atas) -- pola SAMA PERSIS dgn kode lama yg PERNAH live-tested (`main`
+commit 15da503). Biaya bertambah 1 actor call per tweet yg diambil
+balasannya (SAMA seperti dulu, BUKAN model biaya baru) -- dibatasi
+MAX_REPLIES_PER_TWEET spy tidak membengkak tanpa batas. Field balasan:
+`id, text, display_text, created_at, likes, retweets, replies, views,
+author.{screen_name,...}`."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -29,6 +39,7 @@ from app.services.third_party_apis.service import get_next_available_key, mark_a
 
 ACTOR_URL_TEMPLATE = "https://api.apify.com/v2/acts/danek~twitter-scraper/run-sync-get-dataset-items?token={token}"
 DEFAULT_MAX_POSTS = 15
+MAX_REPLIES_PER_TWEET = 10  # sama dgn default kode lama, jaga biaya per actor-call balasan
 ROTATION_FAILURE_STATUS_CODES = {401, 402, 403, 429}
 MAX_ROTATION_ATTEMPTS = 4
 
@@ -87,6 +98,66 @@ def _extract_items(response_json) -> list[dict]:
     return [n for n in normalized if n is not None]
 
 
+def _normalize_reply(item: dict) -> dict | None:
+    reply_id = item.get("id")
+    if not reply_id:
+        return None
+    text = item.get("text") or item.get("display_text") or ""
+    author = item.get("author") or {}
+    if not isinstance(author, dict):
+        author = {}
+    screen_name = author.get("screen_name") or ""
+    if not text and not screen_name:
+        return None
+
+    return {
+        "external_id": str(reply_id),
+        "content": text,
+        "author": screen_name,
+        "likes": _safe_int(item.get("likes")),
+        "published_at": _parse_twitter_date(item.get("created_at")),
+    }
+
+
+async def _fetch_replies(db: AsyncSession, tweet_id: str, max_comments: int) -> list[dict]:
+    if max_comments <= 0:
+        return []
+    tried_key_ids: set = set()
+    body = {"post_id": tweet_id, "max_posts": max_comments}
+
+    for _attempt in range(MAX_ROTATION_ATTEMPTS):
+        key_entry = await get_next_available_key(db, "Apify", platform_group="twitter")
+        if not key_entry or key_entry.id in tried_key_ids:
+            return []
+        tried_key_ids.add(key_entry.id)
+
+        url = ACTOR_URL_TEMPLATE.format(token=key_entry.api_key)
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(url, json=body)
+        except Exception as exc:
+            await mark_api_error(db, key_entry.id, str(exc)[:500])
+            continue
+
+        if resp.status_code in ROTATION_FAILURE_STATUS_CODES:
+            await mark_api_error(db, key_entry.id, f"HTTP {resp.status_code}: {resp.text[:500]}")
+            continue
+
+        if resp.status_code not in (200, 201):
+            return []
+
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+
+        items = data if isinstance(data, list) else []
+        normalized = [_normalize_reply(it) for it in items if isinstance(it, dict)]
+        return [n for n in normalized if n is not None]
+
+    return []
+
+
 async def _fetch_keyword(db: AsyncSession, keyword: str, max_posts: int) -> tuple[list[dict], str | None]:
     tried_key_ids: set = set()
     last_error: str | None = None
@@ -128,13 +199,18 @@ async def _fetch_keyword(db: AsyncSession, keyword: str, max_posts: int) -> tupl
     return [], last_error or "unknown"
 
 
-async def fetch_via_keywords(db: AsyncSession, keywords: list[str], max_posts: int = DEFAULT_MAX_POSTS) -> dict:
+async def fetch_via_keywords(
+    db: AsyncSession, keywords: list[str], max_posts: int = DEFAULT_MAX_POSTS,
+    max_replies_per_tweet: int = MAX_REPLIES_PER_TWEET,
+) -> dict:
     all_posts: list[dict] = []
     errors: list[dict] = []
     for kw in keywords:
         posts, error = await _fetch_keyword(db, kw, max_posts)
         if error:
             errors.append({"keyword": kw, "error": error})
-        else:
-            all_posts.extend(posts)
+            continue
+        for post in posts:
+            post["comments_raw"] = await _fetch_replies(db, post["external_id"], max_replies_per_tweet)
+        all_posts.extend(posts)
     return {"success": True, "posts": all_posts, "errors": errors}

@@ -5,7 +5,13 @@ Facebook/Instagram/Threads) krn Twitter, SEPERTI TikTok, genuinely
 expose view count publik per-tweet (field `views`, lihat crawler_client.py)
 -- konsisten dgn 124 post Twitter lama yg sudah py `metadata.views` terisi.
 MIN_VIEWS_FOR_ENGAGEMENT dipakai sama persis dgn TikTok/YouTube (BUKAN
-angka baru yg diputuskan sendiri di sini, reuse konvensi yg SUDAH ada)."""
+angka baru yg diputuskan sendiri di sini, reuse konvensi yg SUDAH ada).
+
+Balasan/komentar (2026-07-24, ditambahkan): `comments_raw` dari
+crawler_client.py (`_fetch_replies`/`_normalize_reply`) disimpan ke
+tabel `comments`, pola SAMA PERSIS dgn Instagram (dedupe by
+external_id, `published_at` sudah di-parse crawler_client.py pakai
+format Twitter asli, BUKAN None spt bug lama Instagram)."""
 from __future__ import annotations
 
 import math
@@ -16,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.activity_log import log_activity
+from app.domain.comments.models import Comment
 from app.domain.posts.models import Post
 
 AGENT_NAME = "agent-struktur-data"
@@ -107,6 +114,7 @@ async def process_and_save(db: AsyncSession, run_id: uuid.UUID, topic: str, post
                 existing.raw_data = item["raw_data"]
                 existing.collected_at = datetime.now(timezone.utc)
                 duplicate_in_db += 1
+                post_row = existing
             else:
                 post_row = Post(
                     external_id=item["external_id"], platform="twitter", title=None,
@@ -116,7 +124,25 @@ async def process_and_save(db: AsyncSession, run_id: uuid.UUID, topic: str, post
                     collected_at=datetime.now(timezone.utc), is_processed=False, is_near_duplicate=False,
                 )
                 db.add(post_row)
+                await db.flush()
                 saved_count += 1
+
+            for c in item.get("comments_raw", []):
+                external_comment_id = c.get("external_id")
+                if not external_comment_id:
+                    continue
+                existing_comment = await db.scalar(
+                    select(Comment).where(Comment.post_id == post_row.id, Comment.external_id == external_comment_id)
+                )
+                if existing_comment:
+                    continue
+                db.add(Comment(
+                    post_id=post_row.id, external_id=external_comment_id,
+                    content=c.get("content") or "",
+                    author=c.get("author") or "",
+                    metadata_={"like_count": c.get("likes")},
+                    published_at=c.get("published_at"),
+                ))
 
         await db.commit()
     except Exception as exc:

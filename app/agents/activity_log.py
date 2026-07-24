@@ -2,20 +2,15 @@
 dipanggil semua agent (agent_topic, agent_search, agent_youtube01/02,
 agent-struktur-data) supaya riwayat lengkap 1 run bisa ditelusuri.
 
-_LOG_ACTIVITY_LOCK (2026-07-24, ditemukan live saat test Twitter):
-coordinator platform manapun yg jalankan child PARALEL via
-`asyncio.gather()` (Facebook/TikTok/Threads/News/Twitter) manggil
-`log_activity(db, ...)` per child SELESAI -- kalau 2+ child selesai
-brengsamaan, `db.commit()` di sini bentrok krn semua child BERBAGI 1
-`AsyncSession` yg sama (`IllegalStateChangeError`, PERSIS pola bug yg
-sama dgn rotasi key third_party_apis, cuma titik pemanggilannya beda
--- lock lama di situ TIDAK melindungi log_activity(). Fix SAMA:
-kunci di titik PALING BAWAH (fungsi ini sendiri) supaya SEMUA pemanggil
-(lama+baru, platform apa pun) otomatis terlindung tanpa perlu ingat
-lock manual di tiap coordinator."""
+_LOG_ACTIVITY_LOCK (2026-07-24, ditemukan live saat test Twitter,
+DIPERBAIKI LAGI setelah reply-fetching ditambah -- lihat
+app/shared/db_concurrency.py utk kronologi lengkap): SEKARANG pakai
+`SHARED_SESSION_LOCK` yg SAMA dgn third_party_apis/service.py (BUKAN
+lock lokal terpisah lagi) -- 2 lock independen yg masing2 lindungi
+bagiannya sendiri TETAP bisa bentrok satu sama lain kalau melindungi
+SESSION yg sama tapi TIDAK saling mengunci."""
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import datetime, timezone
 
@@ -23,10 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.agent_activity_log.models import AgentActivityLog
 from app.infrastructure.logging.logger import get_logger
+from app.shared.db_concurrency import SHARED_SESSION_LOCK
 
 logger = get_logger(__name__)
-
-_LOG_ACTIVITY_LOCK = asyncio.Lock()
 
 
 async def log_activity(
@@ -37,7 +31,7 @@ async def log_activity(
         run_id=run_id, agent_name=agent_name, stage=stage, level=level,
         message=message, details=details, created_at=datetime.now(timezone.utc),
     )
-    async with _LOG_ACTIVITY_LOCK:
+    async with SHARED_SESSION_LOCK:
         db.add(entry)
         await db.commit()
     logger.info("agent_activity", run_id=str(run_id), agent_name=agent_name, stage=stage, message=message, level=level)
