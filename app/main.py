@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.api.v1 import agent_curl_targets, agent_registry, auth, credentials, facebook_metadata, facebook_pipeline, instagram_metadata, instagram_pipeline, rotation_key_bank, scrape_monitoring, third_party_apis, threads_metadata, threads_pipeline, tiktok_metadata, tiktok_pipeline, trend_recommendations, users, youtube_metadata, youtube_pipeline
+from app.api.v1 import agent_curl_targets, agent_registry, auth, credentials, facebook_metadata, facebook_pipeline, instagram_metadata, instagram_pipeline, news_metadata, news_pipeline, rotation_key_bank, scrape_monitoring, third_party_apis, threads_metadata, threads_pipeline, tiktok_metadata, tiktok_pipeline, trend_recommendations, twitter_metadata, twitter_pipeline, users, youtube_metadata, youtube_pipeline
 # Import SEMUA domain model agar SQLAlchemy mapper bisa resolve
 # relationship (tabel lama TETAP ada, walau endpoint API-nya sudah
 # tidak ada) -- daftar lengkapnya di register_all_models.py, dipakai
@@ -217,6 +217,9 @@ async def kelola_agent_page():
     <option value="tiktok">TikTok</option>
     <option value="facebook">Facebook</option>
     <option value="instagram">Instagram</option>
+    <option value="threads">Threads</option>
+    <option value="twitter">Twitter/X</option>
+    <option value="news">News</option>
   </select>
   <input type="password" id="tpa-new-apikey" placeholder="API key (opsional)">
   <input type="text" id="tpa-new-baseurl" placeholder="Base URL (opsional)">
@@ -702,6 +705,9 @@ async function tpaLoad() {
             <option value="tiktok" ${a.platform_group === 'tiktok' ? 'selected' : ''}>TikTok</option>
             <option value="facebook" ${a.platform_group === 'facebook' ? 'selected' : ''}>Facebook</option>
             <option value="instagram" ${a.platform_group === 'instagram' ? 'selected' : ''}>Instagram</option>
+            <option value="threads" ${a.platform_group === 'threads' ? 'selected' : ''}>Threads</option>
+            <option value="twitter" ${a.platform_group === 'twitter' ? 'selected' : ''}>Twitter/X</option>
+            <option value="news" ${a.platform_group === 'news' ? 'selected' : ''}>News</option>
           </select>
           <button class="retry-btn" style="padding:6px 12px;font-size:0.75rem" onclick="tpaSetPlatformGroup('${a.id}')">Simpan Platform</button>
         </div>
@@ -1269,4 +1275,8 @@ app.include_router(instagram_metadata.router, prefix=API_PREFIX)
 app.include_router(instagram_pipeline.router, prefix=API_PREFIX)
 app.include_router(threads_metadata.router, prefix=API_PREFIX)
 app.include_router(threads_pipeline.router, prefix=API_PREFIX)
+app.include_router(twitter_metadata.router, prefix=API_PREFIX)
+app.include_router(twitter_pipeline.router, prefix=API_PREFIX)
+app.include_router(news_metadata.router, prefix=API_PREFIX)
+app.include_router(news_pipeline.router, prefix=API_PREFIX)
 app.include_router(scrape_monitoring.router, prefix=API_PREFIX)

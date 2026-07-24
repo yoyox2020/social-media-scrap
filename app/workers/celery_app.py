@@ -34,6 +34,7 @@ celery_app = Celery(
         "app.workers.tiktok_follower_backfill_worker", "app.workers.facebook_auto_crawl_worker",
         "app.workers.instagram_metadata_backfill_worker", "app.workers.instagram_auto_crawl_worker",
         "app.workers.facebook_metadata_backfill_worker", "app.workers.threads_auto_crawl_worker",
+        "app.workers.twitter_auto_crawl_worker", "app.workers.news_auto_crawl_worker",
     ],
 )
 
@@ -90,6 +91,14 @@ celery_app.conf.update(
         },
         "threads-auto-crawl-hourly": {
             "task": "threads.auto_crawl_top_topics",
+            "schedule": 3600.0,
+        },
+        "twitter-auto-crawl-hourly": {
+            "task": "twitter.auto_crawl_top_topics",
+            "schedule": 3600.0,
+        },
+        "news-auto-crawl-hourly": {
+            "task": "news.auto_crawl_top_topics",
             "schedule": 3600.0,
         },
     },
