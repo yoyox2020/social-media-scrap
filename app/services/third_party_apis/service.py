@@ -4,6 +4,7 @@ Lihat docstring app/domain/third_party_apis/models.py utk desain.
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 
@@ -12,6 +13,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.third_party_apis.models import ThirdPartyApi, ThirdPartyApiAgentLink
 from app.shared.exceptions import ConflictError
+
+# get_next_available_key()/mark_api_error() dipanggil KONKUREN dari
+# BANYAK coordinator platform (asyncio.gather lintas child, 1 AsyncSession
+# dibagi) -- AsyncSession TIDAK aman dipakai konkuren (ditemukan+fixed
+# di execute_target()/curl-target 2026-07-24, TAPI caller LANGSUNG spt
+# instagram/threads/crawler_client.py tidak lewat situ, jadi BELUM
+# terlindungi kalau cuma fix di 1 tempat). Lock DIPASANG DI SINI (sumber
+# fungsi asli), bukan di tiap pemanggil, spy caller BARU otomatis aman
+# tanpa perlu inget bungkus lock manual sendiri-sendiri.
+_ROTATION_DB_LOCK = asyncio.Lock()
 
 
 async def add_api(
@@ -169,13 +180,14 @@ async def mark_api_error(db: AsyncSession, api_id: uuid.UUID, error_message: str
     """Catat error TERAKHIR (2026-07-22, permintaan user) -- tampil di
     kartu list, TIDAK ubah `enabled` (bukan sistem status/reload
     terpisah, cuma info log per kotak)."""
-    entry = await db.get(ThirdPartyApi, api_id)
-    if not entry:
-        return
-    entry.last_error = error_message[:2000]
-    entry.last_error_at = datetime.now(timezone.utc)
-    entry.updated_at = datetime.now(timezone.utc)
-    await db.commit()
+    async with _ROTATION_DB_LOCK:
+        entry = await db.get(ThirdPartyApi, api_id)
+        if not entry:
+            return
+        entry.last_error = error_message[:2000]
+        entry.last_error_at = datetime.now(timezone.utc)
+        entry.updated_at = datetime.now(timezone.utc)
+        await db.commit()
 
 
 async def find_api_id_by_agent(db: AsyncSession, agent_name: str) -> uuid.UUID | None:
@@ -208,25 +220,26 @@ async def get_next_available_key(db: AsyncSession, provider: str, platform_group
     hilang begitu saja, cuma jadi cadangan kalau grup platform ybs habis."""
     base_filters = [ThirdPartyApi.provider == provider, ThirdPartyApi.enabled.is_(True), ThirdPartyApi.api_key.isnot(None)]
 
-    if platform_group:
-        grouped = await db.execute(
-            select(ThirdPartyApi)
-            .where(*base_filters, ThirdPartyApi.platform_group == platform_group.strip().lower())
-            .order_by(ThirdPartyApi.last_error_at.asc().nulls_first())
-        )
-        entry = grouped.scalars().first()
-        if entry:
-            return entry
-        # Grup platform ini kosong/exhausted -- fallback ke pool bersama
-        # (BUKAN grup platform LAIN, cuma yg belum di-tag sama sekali).
-        shared = await db.execute(
-            select(ThirdPartyApi)
-            .where(*base_filters, ThirdPartyApi.platform_group.is_(None))
-            .order_by(ThirdPartyApi.last_error_at.asc().nulls_first())
-        )
-        return shared.scalars().first()
+    async with _ROTATION_DB_LOCK:
+        if platform_group:
+            grouped = await db.execute(
+                select(ThirdPartyApi)
+                .where(*base_filters, ThirdPartyApi.platform_group == platform_group.strip().lower())
+                .order_by(ThirdPartyApi.last_error_at.asc().nulls_first())
+            )
+            entry = grouped.scalars().first()
+            if entry:
+                return entry
+            # Grup platform ini kosong/exhausted -- fallback ke pool bersama
+            # (BUKAN grup platform LAIN, cuma yg belum di-tag sama sekali).
+            shared = await db.execute(
+                select(ThirdPartyApi)
+                .where(*base_filters, ThirdPartyApi.platform_group.is_(None))
+                .order_by(ThirdPartyApi.last_error_at.asc().nulls_first())
+            )
+            return shared.scalars().first()
 
-    result = await db.execute(
-        select(ThirdPartyApi).where(*base_filters).order_by(ThirdPartyApi.last_error_at.asc().nulls_first())
-    )
-    return result.scalars().first()
+        result = await db.execute(
+            select(ThirdPartyApi).where(*base_filters).order_by(ThirdPartyApi.last_error_at.asc().nulls_first())
+        )
+        return result.scalars().first()

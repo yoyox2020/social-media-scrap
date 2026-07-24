@@ -33,7 +33,7 @@ celery_app = Celery(
         "app.workers.youtube_completeness_worker", "app.workers.youtube_comment_backfill_worker",
         "app.workers.tiktok_follower_backfill_worker", "app.workers.facebook_auto_crawl_worker",
         "app.workers.instagram_metadata_backfill_worker", "app.workers.instagram_auto_crawl_worker",
-        "app.workers.facebook_metadata_backfill_worker",
+        "app.workers.facebook_metadata_backfill_worker", "app.workers.threads_auto_crawl_worker",
     ],
 )
 
@@ -87,6 +87,10 @@ celery_app.conf.update(
         "facebook-backfill-metadata-weekly": {
             "task": "facebook.backfill_metadata",
             "schedule": 604800.0,
+        },
+        "threads-auto-crawl-hourly": {
+            "task": "threads.auto_crawl_top_topics",
+            "schedule": 3600.0,
         },
     },
 )
