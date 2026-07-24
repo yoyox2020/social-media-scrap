@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import Integer, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.domain.comments.models import Comment
 from app.domain.posts.models import Post
 from app.domain.scrape_runs.models import ScrapeRun
 
@@ -96,6 +97,25 @@ async def get_completeness_summary(db: AsyncSession) -> list[dict]:
             ).where(Post.platform == platform)
         )).one()
         total = row.total or 0
+
+        # Komentar (2026-07-24, permintaan user "sediakan agent yg memantau
+        # komentar belum discrape") -- "seharusnya py komentar" =
+        # metrics.comments>0. "benar2 tersimpan" HARUS subset dari itu (BUKAN
+        # dihitung terpisah -- bug awal: post dgn metrics.comments=NULL/0 tapi
+        # SUDAH py komentar lama tersimpan bikin coverage >100%, krn 2 kondisi
+        # dihitung independen, tidak di-AND-kan jadi 1 kriteria yg sama).
+        posts_with_comments_subq = select(Comment.post_id).distinct().subquery()
+        should_have_expr = func.coalesce(cast(Post.metrics["comments"].astext, Integer), 0) > 0
+        has_saved_expr = Post.id.in_(select(posts_with_comments_subq.c.post_id))
+        comment_row = (await db.execute(
+            select(
+                func.count().filter(should_have_expr).label("should_have_comments"),
+                func.count().filter(should_have_expr, has_saved_expr).label("have_any_comment_saved"),
+            ).where(Post.platform == platform)
+        )).one()
+        should_have = comment_row.should_have_comments or 0
+        have_saved = comment_row.have_any_comment_saved or 0
+
         summary.append({
             "platform": platform,
             "total_posts": total,
@@ -103,5 +123,9 @@ async def get_completeness_summary(db: AsyncSession) -> list[dict]:
             "audience_size_coverage_pct": round((row.have_audience_size or 0) / total * 100, 1) if total else 0,
             "posts_missing_score": total - (row.have_score or 0),
             "posts_missing_audience_size": total - (row.have_audience_size or 0),
+            "posts_expected_to_have_comments": should_have,
+            "posts_with_comments_saved": have_saved,
+            "comment_coverage_pct": round(have_saved / should_have * 100, 1) if should_have else None,
+            "posts_missing_comments": max(should_have - have_saved, 0),
         })
     return summary

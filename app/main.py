@@ -407,9 +407,15 @@ async function monLoad() {
             Skor (trend_score dkk): <span style="color:${barColor(c.score_coverage_pct)};font-weight:600">${c.score_coverage_pct}%</span>
             ${c.posts_missing_score > 0 ? `<span style="color:#94a3b8"> (${c.posts_missing_score} post belum)</span>` : ''}
           </div>
-          <div style="font-size:0.78rem">
+          <div style="font-size:0.78rem;margin-bottom:4px">
             Audience size (follower/subscriber): <span style="color:${barColor(c.audience_size_coverage_pct)};font-weight:600">${c.audience_size_coverage_pct}%</span>
             ${c.posts_missing_audience_size > 0 ? `<span style="color:#94a3b8"> (${c.posts_missing_audience_size} post belum)</span>` : ''}
+          </div>
+          <div style="font-size:0.78rem">
+            Komentar (post yg seharusnya py komentar tapi belum ter-scrape): ${c.comment_coverage_pct === null
+              ? '<span style="color:#475569;font-style:italic">tidak ada post py komentar utk platform ini</span>'
+              : `<span style="color:${barColor(c.comment_coverage_pct)};font-weight:600">${c.comment_coverage_pct}%</span>`}
+            ${c.posts_missing_comments > 0 ? `<span style="color:#94a3b8"> (${c.posts_missing_comments} post belum di-scrape komentarnya)</span>` : ''}
           </div>
         </div>
       `;
