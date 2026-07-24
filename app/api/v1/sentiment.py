@@ -21,6 +21,7 @@ from app.repositories.sentiment_repository import SentimentRepository
 from app.services.auth.dependencies import require_admin
 from app.services.sentiment import config as sentiment_cfg
 from app.services.sentiment.agent import run_sentiment_agent
+from app.services.sentiment.backfill import backfill_lexicon_analysis
 from app.services.sentiment.lexicon import analyze as lexicon_analyze
 from app.shared.exceptions import NotFoundError
 from app.shared.utils import build_success_response
@@ -150,6 +151,19 @@ async def analyze_batch(
     if limit is not None:
         await sentiment_cfg.set_batch_size(limit if limit in sentiment_cfg.ALLOWED_BATCH_SIZE else sentiment_cfg.DEFAULT_BATCH_SIZE)
     result = await run_sentiment_agent(db)
+    return build_success_response(result)
+
+
+@router.post("/backfill/lexicon", response_model=dict)
+async def backfill_lexicon(
+    limit: int = Query(default=5000, ge=1, le=100000, description="Jumlah komentar lama diproses sekali panggil (lexicon lokal, gratis, aman batch besar)"),
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Analisis lexicon utk komentar LAMA yg belum pernah tersentuh
+    (sebelum wiring inline dibangun) -- panggil BERULANG (has_more=true)
+    sampai backlog habis, TIDAK ada batas biaya krn lexicon lokal."""
+    result = await backfill_lexicon_analysis(db, limit=limit)
     return build_success_response(result)
 
 

@@ -37,3 +37,4 @@ import app.domain.youtube_discovery.models  # noqa: F401
 import app.domain.youtube_video_metadata.models  # noqa: F401
 import app.domain.threads.models  # noqa: F401
 import app.domain.viral_tracking.models  # noqa: F401
+import app.domain.youtube_transcript.models  # noqa: F401

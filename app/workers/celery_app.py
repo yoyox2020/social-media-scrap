@@ -36,6 +36,7 @@ celery_app = Celery(
         "app.workers.facebook_metadata_backfill_worker", "app.workers.threads_auto_crawl_worker",
         "app.workers.twitter_auto_crawl_worker", "app.workers.news_auto_crawl_worker",
         "app.workers.instagram_comment_backfill_worker", "app.workers.sentiment_agent_worker",
+        "app.workers.sentiment_lexicon_backfill_worker", "app.workers.youtube_transcript_backfill_worker",
     ],
 )
 
@@ -109,6 +110,14 @@ celery_app.conf.update(
         "sentiment-agent-every-30min": {
             "task": "sentiment.run_agent",
             "schedule": 1800.0,
+        },
+        "sentiment-backfill-lexicon-hourly": {
+            "task": "sentiment.backfill_lexicon",
+            "schedule": 3600.0,
+        },
+        "youtube-backfill-transcripts-hourly": {
+            "task": "youtube.backfill_transcripts",
+            "schedule": 3600.0,
         },
     },
 )

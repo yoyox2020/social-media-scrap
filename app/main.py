@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.api.v1 import agent_curl_targets, agent_registry, auth, credentials, facebook_metadata, facebook_pipeline, instagram_metadata, instagram_pipeline, news_metadata, news_pipeline, rotation_key_bank, scrape_monitoring, sentiment, third_party_apis, threads_metadata, threads_pipeline, tiktok_metadata, tiktok_pipeline, trend_recommendations, twitter_metadata, twitter_pipeline, users, youtube_metadata, youtube_pipeline
+from app.api.v1 import agent_curl_targets, agent_registry, auth, credentials, facebook_metadata, facebook_pipeline, instagram_metadata, instagram_pipeline, news_metadata, news_pipeline, rotation_key_bank, scrape_monitoring, sentiment, third_party_apis, threads_metadata, threads_pipeline, tiktok_metadata, tiktok_pipeline, trend_recommendations, twitter_metadata, twitter_pipeline, users, youtube_metadata, youtube_pipeline, youtube_transcript
 # Import SEMUA domain model agar SQLAlchemy mapper bisa resolve
 # relationship (tabel lama TETAP ada, walau endpoint API-nya sudah
 # tidak ada) -- daftar lengkapnya di register_all_models.py, dipakai
@@ -1287,3 +1287,4 @@ app.include_router(news_metadata.router, prefix=API_PREFIX)
 app.include_router(news_pipeline.router, prefix=API_PREFIX)
 app.include_router(scrape_monitoring.router, prefix=API_PREFIX)
 app.include_router(sentiment.router, prefix=API_PREFIX)
+app.include_router(youtube_transcript.router, prefix=API_PREFIX)
