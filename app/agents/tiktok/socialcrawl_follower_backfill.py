@@ -25,13 +25,24 @@ BUG NYATA ditemukan di response mereka (self-reported via `_warnings`):
 `data.author.likes_count` bisa NEGATIF (overflow, mis. -599236476 utk
 akun 159 JUTA follower) -- field itu TIDAK dipakai sama sekali di sini
 (cuma `followers`), tapi validasi `>= 0` tetap dipasang sbg jaring
-pengaman kalau field lain kena bug serupa nanti."""
+pengaman kalau field lain kena bug serupa nanti.
+
+BUG KE-2 ditemukan+diperbaiki 2026-07-24 (audit "apakah semua sudah
+smooth"): follower yg baru didapat CUMA disimpan mentah, `trend_score`/
+`authority_score` yg SUDAH tersimpan dari waktu scrape awal (biasanya
+authority default 40.0 krn follower belum diketahui saat itu) TIDAK
+PERNAH dihitung ULANG -- skor jadi basi/salah walau data follower-nya
+sendiri sudah benar. Sekarang: SETIAP kali follower berhasil diterapkan
+ke 1 post, skornya langsung dihitung ulang pakai `_compute_scores()`
+yg SAMA PERSIS dgn app/agents/tiktok/struktur_data.py (di-import
+langsung, bukan disalin, supaya formula TIDAK PERNAH bisa beda)."""
 from __future__ import annotations
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.tiktok.struktur_data import _compute_scores
 from app.domain.posts.models import Post
 from app.services.agent_registry.service import get_key_for_agent
 
@@ -122,6 +133,17 @@ async def backfill_tiktok_author_followers(db: AsyncSession, api_key: str | None
                 meta["author_fans"] = followers
                 meta["audience_size"] = followers
                 meta["author_verified"] = bool(data.get("verified"))
+
+                # Hitung ULANG skor pakai follower yg BARU didapat -- kalau
+                # tidak, trend_score/authority_score tetap basi (biasanya
+                # authority default 40.0 dari scrape awal saat follower
+                # belum diketahui), walau data follower-nya sendiri sudah
+                # benar (bug nyata ditemukan 2026-07-24).
+                scores = _compute_scores({
+                    "metrics": post.metrics or {}, "published_at": post.published_at, "author_fans": followers,
+                })
+                meta.update(scores)
+
                 post.metadata_ = meta
                 posts_updated += 1
             authors_updated += 1

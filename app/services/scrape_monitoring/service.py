@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.domain.posts.models import Post
 from app.domain.scrape_runs.models import ScrapeRun
 
 
@@ -70,4 +71,37 @@ async def get_monitoring_summary(db: AsyncSession) -> list[dict]:
             "stuck_runs": stuck_count or 0,
         })
 
+    return summary
+
+
+async def get_completeness_summary(db: AsyncSession) -> list[dict]:
+    """Persentase kelengkapan metadata per-platform (2026-07-24, permintaan
+    user "pastikan ada agent yang selalu memonitor dan mengupdatenya") --
+    jawaban VISIBLE ke pertanyaan itu: dashboard ini yg jadi "mata"
+    memantau hasil kerja SEMUA agent backfill/completeness (youtube.
+    audit_completeness, youtube.backfill_missing_comments, tiktok.
+    backfill_author_followers, facebook.backfill_metadata, instagram.
+    backfill_metadata) -- baca LANGSUNG dari tabel `posts` (bukan
+    hardcode daftar platform), jadi platform baru otomatis ikut muncul."""
+    platforms_result = await db.execute(select(Post.platform).distinct())
+    platforms = sorted(row[0] for row in platforms_result.all())
+
+    summary: list[dict] = []
+    for platform in platforms:
+        row = (await db.execute(
+            select(
+                func.count().label("total"),
+                func.count().filter(Post.metadata_["trend_score"].astext.is_not(None)).label("have_score"),
+                func.count().filter(Post.metadata_["audience_size"].astext.is_not(None)).label("have_audience_size"),
+            ).where(Post.platform == platform)
+        )).one()
+        total = row.total or 0
+        summary.append({
+            "platform": platform,
+            "total_posts": total,
+            "score_coverage_pct": round((row.have_score or 0) / total * 100, 1) if total else 0,
+            "audience_size_coverage_pct": round((row.have_audience_size or 0) / total * 100, 1) if total else 0,
+            "posts_missing_score": total - (row.have_score or 0),
+            "posts_missing_audience_size": total - (row.have_audience_size or 0),
+        })
     return summary

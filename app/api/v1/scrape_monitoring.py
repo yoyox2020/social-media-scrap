@@ -20,6 +20,10 @@ async def get_monitoring_status(
 ):
     """Status scraping tiap platform -- run terakhir, statistik 24 jam,
     run yg macet (status 'running' >15 menit). Platform baru otomatis
-    muncul begitu ada run pertamanya, tanpa kode baru."""
+    muncul begitu ada run pertamanya, tanpa kode baru. Sekalian
+    `completeness` -- persentase post yg SUDAH py skor/audience_size,
+    bukti nyata agent backfill/completeness tiap platform genuinely
+    jalan (bukan cuma terdaftar di jadwal)."""
     summary = await service.get_monitoring_summary(db)
-    return build_success_response({"platforms": summary})
+    completeness = await service.get_completeness_summary(db)
+    return build_success_response({"platforms": summary, "completeness": completeness})

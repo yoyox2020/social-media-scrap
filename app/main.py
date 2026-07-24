@@ -311,6 +311,8 @@ async def kelola_agent_page():
 <div id="mon-list" style="margin-bottom:20px">
   <div style="color:#475569;font-style:italic;font-size:0.82rem">Klik "Muat / Refresh Monitoring" utk mulai.</div>
 </div>
+<div style="font-size:0.78rem;font-weight:700;color:#e2e8f0;margin-bottom:8px">Kelengkapan Metadata (bukti kerja agent backfill/completeness)</div>
+<div id="mon-completeness-list" style="margin-bottom:20px"></div>
 </div>
 
 <script>
@@ -377,6 +379,30 @@ async function monLoad() {
       </div>
     `;
     }).join('');
+
+    const completeness = j.data.completeness || [];
+    document.getElementById('mon-completeness-list').innerHTML = completeness.length === 0
+      ? '<div style="color:#475569;font-style:italic;font-size:0.82rem">Belum ada post sama sekali.</div>'
+      : completeness.map(c => {
+        const barColor = pct => pct >= 90 ? '#4ade80' : pct >= 50 ? '#facc15' : '#f87171';
+        return `
+        <div style="background:#1e293b;border-radius:8px;padding:12px 16px;margin-bottom:10px;max-width:640px">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+            <span style="font-size:0.9rem;font-weight:700;text-transform:capitalize">${c.platform}</span>
+            <span style="font-size:0.75rem;color:#64748b">${c.total_posts} post total</span>
+          </div>
+          <div style="font-size:0.78rem;margin-bottom:4px">
+            Skor (trend_score dkk): <span style="color:${barColor(c.score_coverage_pct)};font-weight:600">${c.score_coverage_pct}%</span>
+            ${c.posts_missing_score > 0 ? `<span style="color:#94a3b8"> (${c.posts_missing_score} post belum)</span>` : ''}
+          </div>
+          <div style="font-size:0.78rem">
+            Audience size (follower/subscriber): <span style="color:${barColor(c.audience_size_coverage_pct)};font-weight:600">${c.audience_size_coverage_pct}%</span>
+            ${c.posts_missing_audience_size > 0 ? `<span style="color:#94a3b8"> (${c.posts_missing_audience_size} post belum)</span>` : ''}
+          </div>
+        </div>
+      `;
+      }).join('');
+
     msgEl.style.color = '#64748b';
     msgEl.textContent = 'Terakhir dimuat: ' + new Date().toLocaleTimeString('id-ID') + ` (${platforms.length} platform)`;
   } catch (e) {
