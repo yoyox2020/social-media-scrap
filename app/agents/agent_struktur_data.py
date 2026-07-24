@@ -24,6 +24,7 @@ from app.agents.activity_log import log_activity
 from app.domain.comments.models import Comment
 from app.domain.posts.models import Post
 from app.services.rotation_key_bank.service import get_working_key_for_agent, report_key_failure
+from app.services.sentiment.save import analyze_and_queue_lexicon
 
 AGENT_NAME = "agent-struktur-data"
 AI_KEY_FAILURE_STATUS_CODES = {401, 402, 403, 429}
@@ -330,13 +331,15 @@ async def process_and_save(
                 )
                 if existing_comment:
                     continue
-                db.add(Comment(
-                    post_id=post_row.id, external_id=external_comment_id,
+                comment_row = Comment(
+                    id=uuid.uuid4(), post_id=post_row.id, external_id=external_comment_id,
                     content=top_comment.get("textDisplay") or "",
                     author=top_comment.get("authorDisplayName") or "",
                     metadata_={"like_count": top_comment.get("likeCount")},
                     published_at=_parse_dt(top_comment.get("publishedAt")),
-                ))
+                )
+                db.add(comment_row)
+                await analyze_and_queue_lexicon(db, comment_row.id, comment_row.content)
 
         await db.commit()
     except Exception as exc:

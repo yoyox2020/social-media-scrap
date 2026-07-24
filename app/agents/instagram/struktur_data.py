@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.activity_log import log_activity
 from app.domain.comments.models import Comment
 from app.domain.posts.models import Post
+from app.services.sentiment.save import analyze_and_queue_lexicon
 
 AGENT_NAME = "agent-struktur-data"
 
@@ -145,13 +146,15 @@ async def process_and_save(db: AsyncSession, run_id: uuid.UUID, topic: str, post
                 )
                 if existing_comment:
                     continue
-                db.add(Comment(
-                    post_id=post_row.id, external_id=external_comment_id,
+                comment_row = Comment(
+                    id=uuid.uuid4(), post_id=post_row.id, external_id=external_comment_id,
                     content=c.get("text") or "",
                     author=c.get("ownerUsername") or "",
                     metadata_={"like_count": c.get("likesCount")},
                     published_at=_parse_comment_dt(c.get("timestamp")),
-                ))
+                )
+                db.add(comment_row)
+                await analyze_and_queue_lexicon(db, comment_row.id, comment_row.content)
 
         await db.commit()
     except Exception as exc:

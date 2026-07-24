@@ -26,6 +26,7 @@ menghabiskan kuota harian sendirian -- backlog 3.114 post dicicil
 beberapa run (jadwal jam-an), BUKAN sekali jalan spt completeness_audit.py."""
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 
 import httpx
@@ -36,6 +37,7 @@ from app.agents.agent_struktur_data import _parse_dt
 from app.agents.youtube.api_client import fetch_comments_for_video, get_youtube_api_key
 from app.domain.comments.models import Comment
 from app.domain.posts.models import Post
+from app.services.sentiment.save import analyze_and_queue_lexicon
 
 # ~300 post/run x rata-rata 1-2 panggilan (kebanyakan video BUKAN
 # super-viral, jarang butuh full 5 panggilan paginasi) -- estimasi
@@ -92,13 +94,15 @@ async def backfill_missing_youtube_comments(db: AsyncSession, api_key: str | Non
                 )
                 if existing:
                     continue
-                db.add(Comment(
-                    post_id=post.id, external_id=external_comment_id,
+                comment_row = Comment(
+                    id=uuid.uuid4(), post_id=post.id, external_id=external_comment_id,
                     content=top_comment.get("textDisplay") or "",
                     author=top_comment.get("authorDisplayName") or "",
                     metadata_={"like_count": top_comment.get("likeCount")},
                     published_at=_parse_dt(top_comment.get("publishedAt")),
-                ))
+                )
+                db.add(comment_row)
+                await analyze_and_queue_lexicon(db, comment_row.id, comment_row.content)
                 saved_for_this_post += 1
 
             if saved_for_this_post:

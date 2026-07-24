@@ -23,6 +23,7 @@ discovery) -- meski aktor baru ini jauh lebih cepat, tetap best-practice
 biar tidak mencampur "cari topik baru" dgn "lengkapi komentar lama"."""
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 
 import httpx
@@ -32,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.tiktok.crawler_client import is_valid_tiktok_id
 from app.domain.comments.models import Comment
 from app.domain.posts.models import Post
+from app.services.sentiment.save import analyze_and_queue_lexicon
 from app.services.third_party_apis.service import get_next_available_key, mark_api_error
 
 BATCH_SIZE = 200  # "unlimited" praktis -- cover total post TikTok saat ini (111) + pertumbuhan wajar dlm 1 jam
@@ -141,6 +143,7 @@ async def enrich_viral_posts_with_replies(db: AsyncSession, limit: int = BATCH_S
                 db.add(c)
                 await db.flush()
                 parent_id = c.id
+                await analyze_and_queue_lexicon(db, c.id, c.content)
                 total_comments += 1
 
             for reply in (item.get("_replies") or []):
@@ -153,13 +156,15 @@ async def enrich_viral_posts_with_replies(db: AsyncSession, limit: int = BATCH_S
                 if r_existing:
                     continue
                 r_user = reply.get("user") or {}
-                db.add(Comment(
-                    post_id=post.id, parent_comment_id=parent_id, external_id=r_cid,
+                reply_row = Comment(
+                    id=uuid.uuid4(), post_id=post.id, parent_comment_id=parent_id, external_id=r_cid,
                     content=reply.get("text") or "",
                     author=r_user.get("unique_id") or r_user.get("nickname") or "",
                     metadata_={"like_count": reply.get("digg_count", 0), "author_id": r_user.get("uid")},
                     published_at=_parse_dt(reply.get("create_time")),
-                ))
+                )
+                db.add(reply_row)
+                await analyze_and_queue_lexicon(db, reply_row.id, reply_row.content)
                 total_replies += 1
 
         post.metadata_ = meta

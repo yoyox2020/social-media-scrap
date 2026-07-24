@@ -35,7 +35,7 @@ celery_app = Celery(
         "app.workers.instagram_metadata_backfill_worker", "app.workers.instagram_auto_crawl_worker",
         "app.workers.facebook_metadata_backfill_worker", "app.workers.threads_auto_crawl_worker",
         "app.workers.twitter_auto_crawl_worker", "app.workers.news_auto_crawl_worker",
-        "app.workers.instagram_comment_backfill_worker",
+        "app.workers.instagram_comment_backfill_worker", "app.workers.sentiment_agent_worker",
     ],
 )
 
@@ -105,6 +105,10 @@ celery_app.conf.update(
         "instagram-backfill-comments-weekly": {
             "task": "instagram.backfill_comments",
             "schedule": 604800.0,
+        },
+        "sentiment-agent-every-30min": {
+            "task": "sentiment.run_agent",
+            "schedule": 1800.0,
         },
     },
 )

@@ -31,6 +31,7 @@ aktual dari response Apify run DICATAT tiap kali (bukan diasumsikan
 $0) -- transparansi biaya real per run, bukan janji di kode ini."""
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -40,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.comments.models import Comment
 from app.domain.posts.models import Post
+from app.services.sentiment.save import analyze_and_queue_lexicon
 from app.services.third_party_apis.service import get_next_available_key, mark_api_error
 
 ACTOR_RUN_URL_TEMPLATE = (
@@ -193,12 +195,14 @@ async def backfill_instagram_comments(db: AsyncSession, post_limit: int = DEFAUL
             )
             if existing:
                 continue
-            db.add(Comment(
-                post_id=post.id, external_id=c["external_id"],
+            comment_row = Comment(
+                id=uuid.uuid4(), post_id=post.id, external_id=c["external_id"],
                 content=c["content"], author=c["author"],
                 metadata_={"like_count": c["like_count"]},
                 published_at=c["published_at"],
-            ))
+            )
+            db.add(comment_row)
+            await analyze_and_queue_lexicon(db, comment_row.id, comment_row.content)
             saved_this_post += 1
 
         if saved_this_post:
