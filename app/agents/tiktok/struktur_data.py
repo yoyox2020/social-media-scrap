@@ -235,6 +235,12 @@ async def process_and_save(db: AsyncSession, run_id: uuid.UUID, topic: str, vide
                 "source_topic": topic,
                 "source_topics": source_topics,
                 "author_fans": item.get("author_fans"),
+                # audience_size (2026-07-24, permintaan user "metadata harus
+                # sama dgn platform lain") -- alias SERAGAM lintas platform
+                # thd author_fans (TikTok), followers (Facebook/Instagram),
+                # channel_subscriber_count (YouTube) -- supaya query lintas
+                # platform tidak perlu tau nama field per platform.
+                "audience_size": item.get("author_fans"),
             }
             if existing:
                 existing.title = item["title"]

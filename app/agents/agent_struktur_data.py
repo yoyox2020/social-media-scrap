@@ -130,6 +130,18 @@ def _compute_scores(item: dict, channels_by_id: dict) -> dict:
         "engagement_score": round(engagement_score, 2),
         "freshness_score": round(freshness_score, 2),
         "authority_score": round(authority_score, 2),
+        # subscriber_count DULU dihitung lalu DIBUANG (cuma dipakai internal
+        # utk authority_score) -- baru ketahuan+diperbaiki di jalur
+        # completeness_audit.py (2026-07-24), TAPI jalur discovery UTAMA
+        # ini (pipeline topic->search->coordinator) belum ikut kebawa
+        # sampai sekarang. `audience_size` BARU (2026-07-24, permintaan
+        # user "metadata harus sama dgn platform lain") -- field seragam
+        # lintas platform (TikTok=author_fans, Facebook/Instagram=followers,
+        # YouTube=channel_subscriber_count -- nama beda2 krn historis,
+        # audience_size SATU nama yg sama supaya analisis lintas-platform
+        # tidak perlu tau nama field per platform).
+        "channel_subscriber_count": subscriber_count,
+        "audience_size": subscriber_count,
     }
 
 
@@ -280,6 +292,8 @@ async def process_and_save(
                 "source_topic": topic,  # topik run TERAKHIR (backward-compat)
                 "source_topics": source_topics,  # SEMUA topik yg pernah nemuin video ini
                 "channel_id": item.get("channel_id"),
+                "channel_subscriber_count": item["scores"].get("channel_subscriber_count"),
+                "audience_size": item["scores"].get("audience_size"),
             }
             if existing:
                 existing.title = item["title"]

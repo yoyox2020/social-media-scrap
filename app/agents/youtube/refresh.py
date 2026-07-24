@@ -118,6 +118,8 @@ async def refresh_stale_youtube_posts(db: AsyncSession, limit: int = REFRESH_BAT
         meta.update({
             "trend_score": scores["trend_score"], "engagement_score": scores["engagement_score"],
             "freshness_score": scores["freshness_score"], "authority_score": scores["authority_score"],
+            "channel_subscriber_count": scores.get("channel_subscriber_count"),
+            "audience_size": scores.get("audience_size"),
         })
         post.metadata_ = meta
         post.collected_at = now

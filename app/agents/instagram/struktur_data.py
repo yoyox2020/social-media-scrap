@@ -92,6 +92,7 @@ async def process_and_save(db: AsyncSession, run_id: uuid.UUID, topic: str, post
                 "trend_score": scores["trend_score"], "engagement_score": scores["engagement_score"],
                 "freshness_score": scores["freshness_score"], "authority_score": scores["authority_score"],
                 "followers": existing_followers,  # dijaga apa adanya -- diisi metadata_backfill.py, bukan di sini
+                "audience_size": existing_followers,
                 "author_full_name": item.get("author_full_name"),
                 "source_topic": topic, "source_topics": source_topics,
                 "source": "apify_post_scraper",

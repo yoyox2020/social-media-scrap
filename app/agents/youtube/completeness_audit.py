@@ -157,6 +157,7 @@ async def audit_and_backfill_all_youtube_posts(db: AsyncSession, api_key: str | 
                     "trend_score": scores["trend_score"], "engagement_score": scores["engagement_score"],
                     "freshness_score": scores["freshness_score"], "authority_score": scores["authority_score"],
                     "channel_subscriber_count": subscriber_count,
+                    "audience_size": subscriber_count,
                 })
                 if channel_title:
                     meta["channel_title"] = channel_title

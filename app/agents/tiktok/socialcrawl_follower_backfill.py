@@ -1,7 +1,13 @@
 """Backfill follower count akun TikTok via SocialCrawl (2026-07-24,
 permintaan user "masukkan ini ke list dan gunakan untuk melengkapi
-datanya, sisakan satu agent untuk mengawasinya" -- key didaftarkan ke
-agent_youtube05 sbg "pengawas" khusus integrasi ini).
+datanya, sisakan satu agent untuk mengawasinya" -- key AWALNYA
+didaftarkan ke agent_youtube05, TAPI itu SALAH -- agen platform TikTok
+harusnya dipegang agent_tiktok0X sendiri, bukan pinjam nama agent
+platform lain (ditemukan+diperbaiki 2026-07-24 saat audit "apakah tiap
+platform sudah py agent update sendiri"). Sekarang: `agent_tiktok03`
+(slot kosong, key-nya SALINAN persis dari SocialCrawl yg sama -- akun
+SocialCrawl cuma 1, kredit tetap dibagi dgn Instagram/agent_instagram02,
+BUKAN kuota terpisah).
 
 Gap NYATA (dicek ke DB sebelum dibangun): 111 post TikTok, 82 author
 unik, 0 yg py data follower tersimpan -- field ini genuinely tidak ada
@@ -44,7 +50,7 @@ async def _get_authors_missing_followers(db: AsyncSession, limit: int) -> list[s
             Post.platform == "tiktok",
             Post.author.is_not(None),
             Post.author != "",
-            Post.metadata_["author_followers"].astext.is_(None),
+            Post.metadata_["author_fans"].astext.is_(None),
         )
         .distinct()
         .limit(limit)
@@ -54,9 +60,9 @@ async def _get_authors_missing_followers(db: AsyncSession, limit: int) -> list[s
 
 async def backfill_tiktok_author_followers(db: AsyncSession, api_key: str | None = None, limit: int = DEFAULT_LIMIT) -> dict:
     if not api_key:
-        key_info = await get_key_for_agent(db, "agent_youtube05")
+        key_info = await get_key_for_agent(db, "agent_tiktok03")
         if not key_info or not key_info.get("api_key"):
-            return {"error": "agent_youtube05 belum punya key SocialCrawl", "checked": 0}
+            return {"error": "agent_tiktok03 belum punya key SocialCrawl", "checked": 0}
         api_key = key_info["api_key"]
 
     authors = await _get_authors_missing_followers(db, limit)
@@ -109,7 +115,12 @@ async def backfill_tiktok_author_followers(db: AsyncSession, api_key: str | None
                 continue
             for post in posts:
                 meta = dict(post.metadata_ or {})
-                meta["author_followers"] = followers
+                # author_fans (BUKAN author_followers) -- disamakan dgn nama
+                # field yg SUDAH dipakai app/agents/tiktok/struktur_data.py
+                # (ditemukan 2026-07-24: 2 tempat sempat pakai nama beda utk
+                # data yg sama). audience_size = alias seragam lintas platform.
+                meta["author_fans"] = followers
+                meta["audience_size"] = followers
                 meta["author_verified"] = bool(data.get("verified"))
                 post.metadata_ = meta
                 posts_updated += 1

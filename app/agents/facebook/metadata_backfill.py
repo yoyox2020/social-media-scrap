@@ -1,33 +1,25 @@
 """Backfill follower akun + hitung skor (trend/engagement/freshness/
-authority) utk post Instagram (2026-07-24, lanjutan permintaan user
-"buatkan api instagram... lalu update data metadatanya").
+authority) utk post Facebook (2026-07-24) -- pola SAMA PERSIS dgn
+app/agents/instagram/metadata_backfill.py, melengkapi audit "apakah
+tiap platform sudah py agent update sendiri" (YouTube=agent_youtube01,
+TikTok=agent_tiktok03, Instagram=agent_instagram02, Facebook FILE INI
+= agent_facebook05).
 
-Gap NYATA (dicek ke DB sebelum dibangun): 106 post Instagram, 65 author
-unik, 0 py follower TERSIMPAN dan 0 py trend_score (belum pernah
-dihitung sama sekali -- beda dari YouTube/TikTok yg emang py agent
-struktur-data, Instagram di branch ini belum py pipeline apapun).
-`should_have_comments_but_none` = 0 (dicek: kapanpun metrics.comments>0,
-komentar SUDAH tersimpan) -- TIDAK ada gap komentar utk dibackfill
-sekarang, jadi file ini CUMA follower+skor (bukan komentar).
+Gap NYATA (dicek ke DB sebelum dibangun): 50 post Facebook, 15 author
+unik. Sebagian SUDAH py `metadata_.followers` (dari scrape awal
+Apify/apify_post_scraper era lama), TAPI TIDAK SEMUA -- file ini
+melengkapi yg kosong + hitung ulang skor kalau belum ada.
 
-Follower via SocialCrawl (`/v1/instagram/profile`, verified live
-2026-07-24: data nyata @cristiano 677.873.612 followers). Agent
-penanggung jawab: `agent_instagram02` (ditugaskan 2026-07-24, permintaan
-user "satu agen lagi utk update metadata instagram") -- key-nya SALINAN
-persis dari agent_youtube05/TikTok follower backfill (SocialCrawl cuma
-1 akun asli, third_party_apis SENGAJA 1 API = 1 agent eksklusif jadi
-tidak bisa di-link ke 2 agent sekaligus -- disimpan sbg custom_api_key
-langsung di agent_instagram02 sbg gantinya). KREDIT TETAP DIBAGI dgn
-TikTok (budget SocialCrawl sama, bukan 2 kuota terpisah) -- limit
-per-run KECIL+jadwal jarang, sama pola dgn
-app/agents/tiktok/socialcrawl_follower_backfill.py.
+Follower via SocialCrawl `/v1/facebook/profile?url=...` (BEDA param dari
+TikTok/Instagram yg pakai `handle` -- Facebook wajib URL profil penuh,
+dikonfirmasi live 2026-07-24: data nyata Mark Zuckerberg 121.000.000
+followers). URL dibangun dari `https://www.facebook.com/{author}` (author
+sudah berupa username/slug halaman, terverifikasi dari data existing).
 
-Skor dihitung TANPA views (Instagram scraper ini tidak expose views
-publik utk post foto) -- formula log-interaksi SAMA PERSIS dgn
-app/agents/facebook/struktur_data.py (bukan dobel-tulis, disalin krn
-Python tidak punya cara import lintas-platform yg elegan di sini tanpa
-bikin modul shared baru -- dicatat sbg technical debt kecil kalau nanti
-ada platform ke-3 yg butuh formula sama)."""
+KREDIT DIBAGI dgn TikTok(agent_tiktok03)+Instagram(agent_instagram02) --
+SocialCrawl 1 akun, 1 pool kredit bersama, BUKAN kuota terpisah per
+platform. Formula skor SAMA PERSIS dgn Instagram (log-interaksi, tanpa
+views krn Facebook jg tidak expose views publik)."""
 from __future__ import annotations
 
 import math
@@ -42,7 +34,7 @@ from app.services.agent_registry.service import get_key_for_agent
 
 SOCIALCRAWL_BASE_URL = "https://www.socialcrawl.dev/v1"
 MIN_CREDIT_BUFFER = 5
-DEFAULT_AUTHOR_LIMIT = 15  # kecil -- kredit dibagi dgn TikTok backfill
+DEFAULT_AUTHOR_LIMIT = 15
 
 
 def _compute_scores(likes: int, comments: int, shares: int, followers: int | None, published_at) -> dict:
@@ -68,7 +60,7 @@ async def _get_authors_missing_followers(db: AsyncSession, limit: int) -> list[s
     result = await db.execute(
         select(Post.author)
         .where(
-            Post.platform == "instagram",
+            Post.platform == "facebook",
             Post.author.is_not(None),
             Post.author != "",
             Post.metadata_["followers"].astext.is_(None),
@@ -79,11 +71,11 @@ async def _get_authors_missing_followers(db: AsyncSession, limit: int) -> list[s
     return [row[0] for row in result.all() if row[0]]
 
 
-async def backfill_instagram_metadata(db: AsyncSession, api_key: str | None = None, author_limit: int = DEFAULT_AUTHOR_LIMIT) -> dict:
+async def backfill_facebook_metadata(db: AsyncSession, api_key: str | None = None, author_limit: int = DEFAULT_AUTHOR_LIMIT) -> dict:
     if not api_key:
-        key_info = await get_key_for_agent(db, "agent_instagram02")
+        key_info = await get_key_for_agent(db, "agent_facebook05")
         if not key_info or not key_info.get("api_key"):
-            return {"error": "agent_instagram02 belum punya key SocialCrawl", "authors_checked": 0}
+            return {"error": "agent_facebook05 belum punya key SocialCrawl", "authors_checked": 0}
         api_key = key_info["api_key"]
 
     authors_to_fetch = await _get_authors_missing_followers(db, author_limit)
@@ -96,9 +88,10 @@ async def backfill_instagram_metadata(db: AsyncSession, api_key: str | None = No
             if credits_remaining is not None and credits_remaining < MIN_CREDIT_BUFFER:
                 stopped_low_credit = True
                 break
+            profile_url = f"https://www.facebook.com/{author}"
             try:
                 resp = await client.get(
-                    f"{SOCIALCRAWL_BASE_URL}/instagram/profile", params={"handle": author},
+                    f"{SOCIALCRAWL_BASE_URL}/facebook/profile", params={"url": profile_url},
                     headers={"x-api-key": api_key},
                 )
             except Exception:
@@ -118,12 +111,8 @@ async def backfill_instagram_metadata(db: AsyncSession, api_key: str | None = No
             if isinstance(followers, int) and followers >= 0:
                 followers_by_author[author] = followers
 
-    # Skor dihitung utk SEMUA post yg belum py trend_score (bukan cuma
-    # yg baru dibackfill follower-nya di run ini) -- post yg author-nya
-    # sudah py followers dari run SEBELUMNYA tetap ikut dihitung skornya
-    # sekarang kalau belum pernah, tanpa perlu panggil SocialCrawl lagi.
     result = await db.execute(
-        select(Post).where(Post.platform == "instagram", Post.metadata_["trend_score"].astext.is_(None))
+        select(Post).where(Post.platform == "facebook", Post.metadata_["trend_score"].astext.is_(None))
     )
     posts = result.scalars().all()
 

@@ -199,6 +199,7 @@ async def process_and_save(db: AsyncSession, run_id: uuid.UUID, topic: str, post
                 "source_topic": topic,
                 "source_topics": source_topics,
                 "followers": item.get("author_followers"),
+                "audience_size": item.get("author_followers"),
                 "source": "apify",
             }
             if existing:

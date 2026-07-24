@@ -44,6 +44,7 @@ def _post_to_dict(p: Post, comment_count: int) -> dict:
         "content": p.content,
         "author": p.author,
         "author_fans": meta.get("author_fans"),
+        "audience_size": meta.get("audience_size") or meta.get("author_fans"),
         "url": p.url,
         "thumbnail": thumb,
         "metrics": {
