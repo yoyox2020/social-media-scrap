@@ -147,6 +147,7 @@ async def get_post_detail(db: AsyncSession, post_id: str) -> dict | None:
             "content": c.content,
             "likes": (c.metadata_ or {}).get("like_count", 0),
             "published_at": c.published_at.isoformat() if c.published_at else None,
+            "collected_at": c.created_at.isoformat() if c.created_at else None,
         }
         for c in comments
     ]

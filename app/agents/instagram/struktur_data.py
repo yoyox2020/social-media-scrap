@@ -26,6 +26,19 @@ from app.domain.posts.models import Post
 AGENT_NAME = "agent-struktur-data"
 
 
+def _parse_comment_dt(value) -> datetime | None:
+    """Field `timestamp` per-komentar ADA di `latestComments[]` (lihat
+    docstring crawler_client.py -- BUKAN "tidak dikirim" spt yg sempat
+    diasumsikan salah di sini sebelumnya, ditemukan+diperbaiki 2026-07-24
+    saat user tanya kenapa published_at komentar selalu kosong)."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _dedupe(posts: list[dict]) -> tuple[list[dict], int]:
     seen: dict[str, dict] = {}
     duplicate_count = 0
@@ -137,7 +150,7 @@ async def process_and_save(db: AsyncSession, run_id: uuid.UUID, topic: str, post
                     content=c.get("text") or "",
                     author=c.get("ownerUsername") or "",
                     metadata_={"like_count": c.get("likesCount")},
-                    published_at=None,  # actor ini tidak kirim timestamp per-komentar (terverifikasi historis)
+                    published_at=_parse_comment_dt(c.get("timestamp")),
                 ))
 
         await db.commit()
